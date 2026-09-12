@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 3,
+  "listen": { "host": "127.0.0.1", "port": 8788 },
+  "access": { "required": true, "tokenEnv": "CODEX_LOCAL_ROUTER_TOKEN" },
+  "mode": "rules",
+  "defaultTarget": "deepseek",
+  "providers": {
+    "opencode-go": {
+      "adapter": "opencode-go",
+      "baseUrl": "https://opencode.ai/zen/go",
+      "apiKeyEnv": "OPENCODE_GO_API_KEY",
+      "concurrency": 4
+    }
+  },
+  "targets": {
+    "deepseek": {
+      "provider": "opencode-go",
+      "preset": "opencode-go/deepseek-v4.1-flash"
+    }
+  },
+  "rules": [],
+  "webSearch": {
+    "backend": "tavily",
+    "apiKeyEnv": "TAVILY_API_KEY",
+    "maxRounds": 3,
+    "maxExtractCharacters": 20000
+  },
+  "history": {
+    "maxBytes": 134217728,
+    "ttlMs": 1800000,
+    "persistent": {
+      "enabled": true,
+      "diskMaxBytes": 10737418240,
+      "warningPercent": 80
+    }
+  },
+  "timeoutMs": 180000,
+  "maxBodyBytes": 20971520,
+  "maxConnections": 64,
+  "subscription": {
+    "enabled": true,
+    "catalogPath": "/absolute/path/to/.codex/models_cache.json",
+    "models": ["gpt-catalog-placeholder"]
+  }
+}

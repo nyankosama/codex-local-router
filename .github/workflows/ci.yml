@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run audit:package
+      - name: Clean package install
+        run: |
+          npm pack
+          mkdir -p "$RUNNER_TEMP/router-prefix"
+          npm install --prefix "$RUNNER_TEMP/router-prefix" --no-save ./codex-local-router-0.2.0.tgz
+          "$RUNNER_TEMP/router-prefix/node_modules/.bin/llm-auto-gateway" --version

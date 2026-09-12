@@ -1,0 +1,41 @@
+{
+  "name": "codex-local-router",
+  "version": "0.2.0",
+  "description": "Local multi-model routing for Codex CLI and App while preserving ChatGPT subscription access",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nyankosama/codex-local-router.git"
+  },
+  "homepage": "https://github.com/nyankosama/codex-local-router#readme",
+  "bugs": "https://github.com/nyankosama/codex-local-router/issues",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "src/",
+    "scripts/gateway-admin.mjs",
+    "scripts/gateway-service.mjs",
+    "scripts/codex-app-upgrade.mjs",
+    "config/gateway.example.json",
+    "docs/public/",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test",
+    "gateway": "node scripts/gateway-admin.mjs",
+    "audit:package": "node scripts/audit-package.mjs"
+  },
+  "bin": {
+    "llm-auto-gateway": "scripts/gateway-admin.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.3"
+  }
+}

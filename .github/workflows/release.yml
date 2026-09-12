@@ -1,0 +1,28 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run audit:package
+      - run: npm pack
+      - run: shasum -a 256 codex-local-router-*.tgz > codex-local-router-0.2.0.tgz.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            codex-local-router-0.2.0.tgz
+            codex-local-router-0.2.0.tgz.sha256

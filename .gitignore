@@ -1,0 +1,11 @@
+
+config/gateway.json
+config/*.local.json
+config/*.before-*
+
+node_modules/
+.runtime/
+.DS_Store
+*.tgz
+*.sha256
+coverage/
