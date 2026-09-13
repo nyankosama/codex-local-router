@@ -28,6 +28,12 @@ import {
   inputBudget,
   isExplicitContextError,
 } from "./context.mjs";
+import {
+  applyPluginToolPolicy,
+  assertAllowedPluginToolCalls,
+  resolvePluginToolPolicy,
+} from "./tool-policy.mjs";
+import { observedOfficialResponse } from "./official-relay.mjs";
 const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value) ?? "");
 const searchFunction = {
   type: "function",
@@ -80,15 +86,17 @@ const identityHash = (value) =>
 export class Engine {
   constructor(
     config,
-    { send, log = () => {}, archive, resolveIdentity } = {},
+    { send, log = () => {}, archive, resolveIdentity, toolRegistry } = {},
   ) {
     this.config = config;
     this.send = send;
     this.log = log;
     this.archive = archive;
     this.resolveIdentity = resolveIdentity;
+    this.toolRegistry = toolRegistry ?? {};
     this.state = new StateStore(config.history, archive);
     this.summaryInflight = new Map();
+    this.officialObservations = new Map();
   }
   update(config) {
     if (
@@ -256,25 +264,12 @@ export class Engine {
           target: { ...c.targets[custom] },
           rule: "subscription-custom",
         };
-      if (c.subscription.models.includes(body.model))
-        return {
-          target: {
-            id: `official:${body.model}`,
-            provider: "chatgpt-subscription",
-            model: body.model,
-            wireApi: "responses",
-            inputModalities: ["text", "image"],
-            compression: { mode: "native" },
-            capabilities: {
-              responses: true,
-              toolCalling: true,
-              nativeWebSearch: true,
-              streaming: true,
-            },
-          },
-          rule: "subscription-gpt",
-        };
-      throw fail("unknown_model", 400);
+      return {
+        target: this.officialTarget(body.model),
+        rule: c.subscription.models.includes(body.model)
+          ? "subscription-gpt"
+          : "subscription-official-unlisted",
+      };
     }
     const d = decide(c, contextFromRequest(body, ctx.headers), body.model);
     const passthrough = d.rule === "passthrough" || d.target === "passthrough";
@@ -287,6 +282,163 @@ export class Engine {
       target: { ...target, ...(passthrough ? { model: body.model } : {}) },
       rule: d.rule,
     };
+  }
+  officialTarget(model) {
+    return {
+      id: `official:${model}`,
+      provider: "chatgpt-subscription",
+      model,
+      wireApi: "responses",
+      inputModalities: ["text", "image"],
+      compression: { mode: "native" },
+      capabilities: {
+        responses: true,
+        toolCalling: true,
+        nativeWebSearch: true,
+        streaming: true,
+      },
+    };
+  }
+  async officialRelayContext(headers, original) {
+    const body = {
+      ...original,
+      input:
+        typeof original.input === "string"
+          ? [{ role: "user", content: original.input }]
+          : (original.input ?? []),
+    };
+    const ctx = {
+      ...(await this.identify("subscription", headers, body)),
+      entry: "subscription",
+      headers,
+    };
+    const previous = body.previous_response_id
+      ? this.state.get(`response:${ctx.owner}:${body.previous_response_id}`)
+      : null;
+    return { body, ctx, previous };
+  }
+  async officialRequestNeedsEngine(headers, body) {
+    const context = await this.officialRelayContext(headers, body);
+    const virtualInput = context.body.input.some((item) =>
+      ["compaction_trigger", "compaction", "summary"].includes(item?.type),
+    );
+    return {
+      ...context,
+      needsEngine:
+        virtualInput ||
+        (context.previous && context.previous.target?.provider !== "chatgpt-subscription"),
+    };
+  }
+  async requireObservedHistory(headers, body) {
+    if (!body.previous_response_id) return;
+    let prepared = await this.officialRelayContext(headers, body);
+    const pending = this.officialObservations.get(prepared.ctx.owner);
+    if (!prepared.previous && pending) {
+      const waitMs = this.config.history?.observationWaitMs ?? 2000;
+      await Promise.race([
+        pending.catch(() => {}),
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, waitMs);
+          timer.unref?.();
+        }),
+      ]);
+      prepared = await this.officialRelayContext(headers, body);
+    }
+    const { ctx, previous } = prepared;
+    if (!previous)
+      throw fail(
+        "history_observation_incomplete",
+        409,
+        "Official history was not completely observed; continue with the official model or start a new cross-provider turn",
+      );
+    return ctx;
+  }
+  queueOfficialObservation(prepared, work) {
+    const key = prepared.ctx.owner;
+    let task;
+    task = Promise.resolve()
+      .then(work)
+      .finally(() => {
+        if (this.officialObservations.get(key) === task)
+          this.officialObservations.delete(key);
+      });
+    this.officialObservations.set(key, task);
+    return task;
+  }
+  markOfficialObservationIncomplete(ctx, reason, responseId) {
+    this.state.set(`observation-incomplete:${ctx.owner}`, {
+      at: Date.now(),
+      reason,
+      responseId,
+    }, ctx);
+  }
+  async observeOfficial(headers, request, observation) {
+    try {
+      const response = await observedOfficialResponse(
+        observation,
+        this.config.maxBodyBytes ?? 20 * 1024 * 1024,
+      );
+      return this.commitOfficialObservation(headers, request, response);
+    } catch (error) {
+      const prepared = await this.officialRelayContext(headers, request);
+      this.markOfficialObservationIncomplete(
+        prepared.ctx,
+        error.type ?? "observation-error",
+      );
+      throw error;
+    }
+  }
+  async observeOfficialEvent(headers, request, event) {
+    try {
+      if (!event?.response)
+        throw fail("history_observation_incomplete", 409);
+      return await this.commitOfficialObservation(headers, request, event.response);
+    } catch (error) {
+      const prepared = await this.officialRelayContext(headers, request);
+      this.markOfficialObservationIncomplete(
+        prepared.ctx,
+        error.type ?? "observation-error",
+        event?.response?.id,
+      );
+      throw error;
+    }
+  }
+  async commitOfficialObservation(headers, request, response) {
+    const prepared = await this.officialRelayContext(headers, request);
+    if (!response?.id || !Array.isArray(response.output))
+      throw fail("history_observation_incomplete", 409);
+    if (request.previous_response_id && !prepared.previous) {
+      this.markOfficialObservationIncomplete(
+        prepared.ctx,
+        "previous-response-unavailable",
+        response.id,
+      );
+      return { complete: false, responseId: response.id };
+    }
+    const input = prepared.previous
+      ? [...prepared.previous.input, ...prepared.body.input]
+      : prepared.body.input;
+    this.state.save(
+      prepared.ctx,
+      response,
+      input,
+      this.officialTarget(request.model),
+      input,
+    );
+    if (prepared.ctx.requestKind === "turn") {
+      this.state.set(
+        `last-target:${prepared.ctx.owner}`,
+        this.officialTarget(request.model),
+        prepared.ctx,
+      );
+      this.state.set(
+        `last-provider:${prepared.ctx.owner}`,
+        "chatgpt-subscription",
+        prepared.ctx,
+      );
+    }
+    this.state.remove(`observation-incomplete:${prepared.ctx.owner}`);
+    return { complete: true, responseId: response.id };
   }
   async *generate(entry, headers, original, signal) {
     const acceptedAt = Date.now();
@@ -545,12 +697,42 @@ export class Engine {
       const search = plan.mode === "tool_fallback";
       if (search && !config.webSearch)
         throw fail("web_search_unavailable", 503);
-      let adapted = body;
+      const toolPolicy = resolvePluginToolPolicy(config, target);
+      const filtered = applyPluginToolPolicy(
+        body,
+        toolPolicy,
+        this.toolRegistry,
+      );
+      let adapted = filtered.body;
+      if (filtered.diagnostics.removed.length)
+        this.log({
+          event: "plugin_tools_filtered",
+          ...correlation,
+          provider: target.provider,
+          model: target.model,
+          policy_reason: toolPolicy.reason,
+          allowed_plugins: toolPolicy.allowedPlugins,
+          removed_count: filtered.diagnostics.removed.length,
+          removed_plugins: [
+            ...new Set(filtered.diagnostics.removed.map((item) => item.plugin).filter(Boolean)),
+          ],
+        });
+      if (filtered.diagnostics.passedUncertain.length)
+        this.log({
+          event: "tool_source_uncertain_passthrough",
+          ...correlation,
+          provider: target.provider,
+          model: target.model,
+          count: filtered.diagnostics.passedUncertain.length,
+          kinds: [
+            ...new Set(filtered.diagnostics.passedUncertain.map((item) => item.kind)),
+          ],
+        });
       if (search)
         adapted = {
-          ...body,
+          ...adapted,
           tools: [
-            ...(body.tools ?? []).filter(
+            ...(adapted.tools ?? []).filter(
               (x) => !/^web_search/.test(x.type ?? ""),
             ),
             searchFunction,
@@ -613,6 +795,8 @@ export class Engine {
           signal,
           {
             correlation,
+            toolPolicy,
+            toolRegistry: this.toolRegistry,
             onUpstreamOutput: () => {
               upstreamOutput = true;
             },
@@ -1353,7 +1537,14 @@ export class Engine {
         !Array.isArray(response.output)
       )
         throw fail("invalid_upstream_response", 502);
-      for (const e of completedEvents(response)) yield e;
+      for (const e of completedEvents(response)) {
+        assertAllowedPluginToolCalls(
+          e,
+          hooks.toolPolicy ?? { mode: "passthrough" },
+          hooks.toolRegistry,
+        );
+        yield e;
+      }
       return;
     }
     if (target.wireApi === "responses") {
@@ -1421,6 +1612,11 @@ export class Engine {
             }),
         },
       )) {
+        assertAllowedPluginToolCalls(
+          event,
+          hooks.toolPolicy ?? { mode: "passthrough" },
+          hooks.toolRegistry,
+        );
         if (!downstreamOutputText && event.type === "response.output_text.delta") {
           downstreamOutputText = true;
           this.log({
@@ -1449,6 +1645,11 @@ export class Engine {
               .map((x) => x[1]),
           },
         };
+      assertAllowedPluginToolCalls(
+        terminal,
+        hooks.toolPolicy ?? { mode: "passthrough" },
+        hooks.toolRegistry,
+      );
       yield terminal;
     } else {
       const encoder = new ChatEncoder(body.model);
@@ -1463,10 +1664,24 @@ export class Engine {
           yield encoder.start();
           started = true;
         }
-        for (const e of events) yield e;
+        for (const e of events) {
+          assertAllowedPluginToolCalls(
+            e,
+            hooks.toolPolicy ?? { mode: "passthrough" },
+            hooks.toolRegistry,
+          );
+          yield e;
+        }
       }
       if (!started) yield encoder.start();
-      for (const e of encoder.end()) yield e;
+      for (const e of encoder.end()) {
+        assertAllowedPluginToolCalls(
+          e,
+          hooks.toolPolicy ?? { mode: "passthrough" },
+          hooks.toolRegistry,
+        );
+        yield e;
+      }
     }
   }
 }

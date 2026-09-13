@@ -3,6 +3,7 @@ import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import { evaluate, loadThresholds, verdict } from "./lib/criteria.mjs";
 import { resolveCore } from "./lib/harness.mjs";
 import { parseNodeTestSummary } from "./lib/process-output.mjs";
@@ -45,6 +46,7 @@ const EGRESS_ALLOWLIST = [
   "api.tavily.com",
   "api.exa.ai",
   "opencode.ai",
+  "ai.feei.cn",
   "example.com",
 ];
 
@@ -101,6 +103,50 @@ function sanitize(observation) {
   return lines.join("\n") + (lines.length ? "\n" : "");
 }
 
+const detailHash = (value) =>
+  createHash("sha256").update(String(value)).digest("hex").slice(0, 20);
+
+function safeEvent(event) {
+  return {
+    at: event.at,
+    type: event.type,
+    sequence_number: event.sequence_number,
+    output_index: event.output_index,
+    item: event.item ? {
+      type: event.item.type,
+      phase: event.item.phase,
+      id: event.item.id,
+      call_id: event.item.call_id,
+      status: event.item.status,
+    } : undefined,
+    response: event.response ? {
+      id: event.response.id,
+      status: event.response.status,
+      model: event.response.model,
+      outputItems: Array.isArray(event.response.output) ? event.response.output.length : undefined,
+      usage: event.response.usage,
+    } : undefined,
+  };
+}
+
+function safeAssertions(assertions = []) {
+  return assertions.map((assertion) => ({
+    name: assertion.name,
+    ok: assertion.ok,
+    ...(assertion.detail ? { detailHash: detailHash(assertion.detail) } : {}),
+  }));
+}
+
+function safeObservation(observation) {
+  return {
+    ...observation,
+    terminal: (observation.terminal ?? []).map(safeEvent),
+    clientEvents: (observation.clientEvents ?? []).map(safeEvent),
+    streams: (observation.streams ?? []).map((stream) => stream.map(safeEvent)),
+    assertions: safeAssertions(observation.assertions),
+  };
+}
+
 async function main() {
   const runDir = join(artifactsRoot, runId);
   await mkdir(join(runDir, "raw"), { recursive: true });
@@ -109,11 +155,10 @@ async function main() {
   const summary = {
     runId,
     startedAt: new Date().toISOString(),
-    projectRoot,
     group: GROUP,
     caseFilter: ONLY ?? null,
     thresholdsSha256,
-    harness: core ? { kind: core.source, path: core.path, version: core.version, sha256: core.sha256 } : null,
+    harness: core ? { kind: core.source, version: core.version, sha256: core.sha256 } : null,
     gate: null,
     cases: [],
     manual: {
@@ -175,7 +220,7 @@ async function main() {
         title: spec.title,
         verdict: finalVerdict,
         criteria,
-        assertions: observation.assertions ?? [],
+        assertions: safeAssertions(observation.assertions),
         assertionFailures: assertionFailures.map((x) => x.name),
         durationMs: Date.now() - startedAt,
         modelCalls: (observation.payloads ?? []).length,
@@ -185,7 +230,7 @@ async function main() {
         },
         detail: observation.detail ?? {},
       };
-      await writeFile(join(runDir, `${id}.json`), JSON.stringify(observation, null, 2) + "\n");
+      await writeFile(join(runDir, `${id}.json`), JSON.stringify(safeObservation(observation), null, 2) + "\n");
       await writeFile(join(runDir, "raw", `${id}.jsonl`), sanitize(observation));
     } catch (error) {
       record = {

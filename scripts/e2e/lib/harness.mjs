@@ -10,11 +10,12 @@ import { monitorEventLoopDelay } from "node:perf_hooks";
 import { WebSocket } from "ws";
 import { loadConfig, validate } from "../../../src/config.mjs";
 import { createGateway } from "../../../src/server.mjs";
-import { request } from "../../../src/transport.mjs";
+import { request, requestRaw } from "../../../src/transport.mjs";
 import { Archive } from "../../../src/archive.mjs";
 import { identityHash } from "./criteria.mjs";
 import { createLocalIdentityResolver } from "../../../src/local-identity.mjs";
 import { buildModelCatalog } from "../../../src/model-catalog.mjs";
+import { discoverToolSources } from "../../../src/tool-sources.mjs";
 
 const exec = promisify(execFile);
 export const APP_CORE = "/Applications/ChatGPT.app/Contents/Resources/codex";
@@ -40,13 +41,22 @@ export async function resolveCore() {
   throw Error("no usable codex core binary found");
 }
 
-export async function isolatedCodexHome({ home, baseUrl, catalogPath, authSource, model, reasoningEffort = "low", extra = "" }) {
+export async function isolatedCodexHome({
+  home,
+  baseUrl,
+  catalogPath,
+  authSource,
+  model,
+  reasoningEffort = "low",
+  webSearch = "disabled",
+  extra = "",
+}) {
   await mkdir(home, { recursive: true, mode: 0o700 });
   await rm(`${home}/auth.json`, { force: true });
   await symlink(authSource, `${home}/auth.json`);
   const toml =
     `model_provider = "openai"\nmodel = "${model}"\nmodel_reasoning_effort = "${reasoningEffort}"\n` +
-    `web_search = "disabled"\nopenai_base_url = "${baseUrl}"\nmodel_catalog_json = "${catalogPath}"\n${extra}`;
+    `web_search = "${webSearch}"\nopenai_base_url = "${baseUrl}"\nmodel_catalog_json = "${catalogPath}"\n${extra}`;
   await writeFile(`${home}/config.toml`, toml, { mode: 0o600 });
   return home;
 }
@@ -59,7 +69,17 @@ export async function writeCatalog({ sourceCatalogPath, config, targetPath }) {
 }
 
 // 隔离 Gateway：随机端口、独立历史库、独立访问令牌；记录出站契约与阶段耗时。
-export async function startIsolatedGateway({ configPath, authSource, tokenFile, archivePath, archiveKey, seed = 0, mutate }) {
+export async function startIsolatedGateway({
+  configPath,
+  authSource,
+  tokenFile,
+  archivePath,
+  archiveKey,
+  seed = 0,
+  mutate,
+  toolCodexHome,
+  beforeOutbound,
+}) {
   const base = structuredClone(await loadConfig(configPath));
   base.listen = { host: "127.0.0.1", port: 0 };
   base.history = { ...(base.history ?? {}), persistent: { enabled: false } };
@@ -69,6 +89,9 @@ export async function startIsolatedGateway({ configPath, authSource, tokenFile, 
   const accessToken = createHash("sha256").update(`e2e-token-${seed}`).digest("hex");
   await writeFile(tokenFile, accessToken, { mode: 0o600 });
   const subscriptionToken = JSON.parse(await readFile(authSource, "utf8")).tokens.access_token;
+  const toolRegistry = await discoverToolSources(
+    toolCodexHome ? { codexHome: toolCodexHome } : undefined,
+  );
 
   const logs = [];
   const outbound = [];
@@ -87,56 +110,92 @@ export async function startIsolatedGateway({ configPath, authSource, tokenFile, 
     });
     return saved;
   };
+  const recordOutbound = (url, options) => {
+    const host = new URL(url).host;
+    const headers = options.headers ?? {};
+    const authorization = headers.authorization ?? "";
+    let body = options.body;
+    if (Buffer.isBuffer(body) && !headers["content-encoding"])
+      try { body = JSON.parse(body.toString("utf8")); } catch { body = null; }
+    const input = Array.isArray(body?.input) ? body.input : [];
+    const messages = Array.isArray(body?.messages) ? body.messages : [];
+    const metadata = {
+      host,
+      official: host === "chatgpt.com",
+      headerNames: Object.keys(headers).sort(),
+      subscriptionBearer: Boolean(subscriptionToken) && authorization === `Bearer ${subscriptionToken}`,
+      accountHeader: Boolean(headers["chatgpt-account-id"]),
+      opencodeSession: Boolean(headers["x-opencode-session"]),
+      path: new URL(url).pathname,
+    };
+    beforeOutbound?.({
+      ...metadata,
+      model: body?.model,
+      generate: body?.generate,
+    });
+    outbound.push(metadata);
+    payloads.push({
+      host,
+      model: body?.model,
+      bytes: Buffer.isBuffer(options.body)
+        ? options.body.length
+        : Buffer.byteLength(JSON.stringify(options.body ?? "")),
+      items: [
+        ...input.map((x) => x.type ?? x.role),
+        ...messages.map((x) => `${x.role}${x.tool_calls ? "+tool_calls" : ""}`),
+      ],
+      contentTypes: [
+        ...input
+          .filter((x) => Array.isArray(x.content))
+          .map((x) => (x.content ?? []).map((part) => part?.type)),
+        ...messages
+          .filter((x) => Array.isArray(x.content))
+          .map((x) => (x.content ?? []).map((part) => part?.type)),
+      ],
+      tools: (body?.tools ?? []).map((x) => x.name ?? x.function?.name ?? x.type),
+      toolSizes: (body?.tools ?? []).map((x) => ({
+        name: x.name ?? x.function?.name ?? x.type,
+        type: x.type ?? null,
+        bytes: Buffer.byteLength(JSON.stringify(x)),
+      })),
+      callIds: [
+        ...input
+          .filter((x) => ["function_call", "function_call_output"].includes(x.type))
+          .map((x) => `${x.type}:${x.call_id ?? ""}`),
+        ...messages.flatMap((x) => [
+          ...(x.role === "tool" ? [`function_call_output:${x.tool_call_id ?? ""}`] : []),
+          ...((x.tool_calls ?? []).map((call) => `function_call:${call.id ?? ""}`)),
+        ]),
+      ],
+    });
+    return metadata;
+  };
   const gateway = createGateway(config, {
     archive,
     closeArchive: true,
     resolveIdentity: createLocalIdentityResolver(authSource),
-    send: (url, options) => {
-      const host = new URL(url).host;
-      const headers = options.headers ?? {};
-      const authorization = headers.authorization ?? "";
-      outbound.push({
-        host,
-        official: host === "chatgpt.com",
-        headerNames: Object.keys(headers).sort(),
-        subscriptionBearer: Boolean(subscriptionToken) && authorization === `Bearer ${subscriptionToken}`,
-        accountHeader: Boolean(headers["chatgpt-account-id"]),
-        opencodeSession: Boolean(headers["x-opencode-session"]),
-      });
-      payloads.push({
-        host,
-        model: options.body?.model,
-        bytes: Buffer.byteLength(JSON.stringify(options.body ?? "")),
-        items: [
-          ...(options.body?.input ?? []).map((x) => x.type ?? x.role),
-          ...(options.body?.messages ?? []).map((x) => `${x.role}${x.tool_calls ? "+tool_calls" : ""}`),
-        ],
-        contentTypes: [
-          ...(options.body?.input ?? [])
-            .filter((x) => Array.isArray(x.content))
-            .map((x) => (x.content ?? []).map((part) => part?.type)),
-          ...(options.body?.messages ?? [])
-            .filter((x) => Array.isArray(x.content))
-            .map((x) => (x.content ?? []).map((part) => part?.type)),
-        ],
-        tools: (options.body?.tools ?? []).map((x) => x.name ?? x.function?.name ?? x.type),
-        // 逐工具字节数（仅元数据：名称 + 大小，不含 schema 内容）。
-        toolSizes: (options.body?.tools ?? []).map((x) => ({
-          name: x.name ?? x.function?.name ?? x.type,
-          type: x.type ?? null,
-          bytes: Buffer.byteLength(JSON.stringify(x)),
-        })),
-        callIds: [
-          ...(options.body?.input ?? [])
-            .filter((x) => ["function_call", "function_call_output"].includes(x.type))
-            .map((x) => `${x.type}:${x.call_id ?? ""}`),
-          ...(options.body?.messages ?? []).flatMap((x) => [
-            ...(x.role === "tool" ? [`function_call_output:${x.tool_call_id ?? ""}`] : []),
-            ...((x.tool_calls ?? []).map((call) => `function_call:${call.id ?? ""}`)),
-          ]),
-        ],
-      });
-      return request(url, options);
+    toolRegistry,
+    send: async (url, options) => {
+      const metadata = recordOutbound(url, options);
+      try {
+        const response = await request(url, options);
+        metadata.status = response.status;
+        return response;
+      } catch (error) {
+        metadata.error = error?.type ?? "transport_error";
+        throw error;
+      }
+    },
+    officialRequest: async (url, options) => {
+      const metadata = recordOutbound(url, options);
+      try {
+        const response = await requestRaw(url, options);
+        metadata.status = response.status;
+        return response;
+      } catch (error) {
+        metadata.error = error?.type ?? "transport_error";
+        throw error;
+      }
     },
     log: (event) => logs.push(event),
   });
@@ -235,7 +294,16 @@ export function monitorEventLoop() {
 }
 
 // A harness：App 包内 core 的 exec（或 PATH 回退）。返回 JSONL 事件与退出码。
-export async function runCliExec({ corePath, home, cwd, args, env = {}, timeoutMs = 600000, prompt }) {
+export async function runCliExec({
+  corePath,
+  home,
+  cwd,
+  args,
+  env = {},
+  timeoutMs = 600000,
+  prompt,
+  signal,
+}) {
   const child = spawn(corePath, ["exec", "--json", ...args, prompt], {
     cwd,
     env: { ...process.env, CODEX_HOME: home, ...env },
@@ -245,9 +313,13 @@ export async function runCliExec({ corePath, home, cwd, args, env = {}, timeoutM
   let stderr = "";
   child.stdout.on("data", (x) => (stdout += x));
   child.stderr.on("data", (x) => (stderr += x));
-  const timer = setTimeout(() => child.kill(), timeoutMs);
+  const abort = () => child.kill();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
+  const timer = setTimeout(abort, timeoutMs);
   const code = await new Promise((resolve) => child.on("close", resolve));
   clearTimeout(timer);
+  signal?.removeEventListener("abort", abort);
   const rows = stdout
     .split("\n")
     .filter(Boolean)
@@ -294,8 +366,15 @@ export function startAppServer({ corePath, home, cwd }) {
     }
     if (message.method === "item/completed") {
       const item = message.params.item ?? {};
-      if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(item.type)) {
-        record.items.push({ type: item.type, id: item.id, status: item.status ?? "completed", at: Date.now() });
+      if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)) {
+        record.items.push({
+          type: item.type,
+          id: item.id,
+          status: item.status ?? "completed",
+          tool: item.tool ?? item.name ?? item.server ?? item.serverLabel ?? null,
+          resultCount: Array.isArray(item.results) ? item.results.length : null,
+          at: Date.now(),
+        });
       }
       if (item.type === "contextCompaction") record.compactions++;
     }

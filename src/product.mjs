@@ -10,7 +10,8 @@ export const PRODUCT_NAME = "Codex Local Router";
 export const PRODUCT_ID = "codex-local-router";
 export const PACKAGE_VERSION = packageJson.version;
 export const CONFIG_SCHEMA_VERSION = 3;
-export const INTEGRATION_SCHEMA_VERSION = 3;
+export const INTEGRATION_SCHEMA_VERSION = 4;
+export const SPACE_SCHEMA_VERSION = 1;
 
 export function dataDir(env = process.env) {
   return (
@@ -28,6 +29,12 @@ export function runtimePaths(env = process.env) {
     runtime: join(root, "run"),
     logs: join(root, "logs"),
     integration: join(root, "integration"),
+    spaces: join(root, "spaces"),
+    spaceIndex: join(root, "spaces", "index.json"),
+    spaceLock: join(root, "spaces", ".lock"),
+    spaceTransaction: join(root, "transactions", "space-switch.json"),
+    spaceTransactionLock: join(root, "transactions", ".space-switch.lock"),
+    spaceSwitcherInstall: join(root, "run", "space-switcher.json"),
     history: join(root, "state", "history.sqlite"),
     serviceState: join(root, "run", "service.json"),
     serviceInstall: join(root, "run", "installation.json"),

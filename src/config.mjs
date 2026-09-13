@@ -1,6 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { applyPreset } from "./presets.mjs";
 import { CONFIG_SCHEMA_VERSION, runtimePaths } from "./product.mjs";
+import {
+  effectiveThirdPartyGptAllowlist,
+  normalizePluginPolicy,
+} from "./tool-policy.mjs";
 const loopback = (h) => ["127.0.0.1", "localhost", "[::1]"].includes(h);
 const conditions = new Set([
   "modelID",
@@ -17,6 +21,7 @@ const responsesMessagePhasePolicies = new Set([
 ]);
 const compressionModes = new Set(["native", "summary", "unsupported"]);
 const wireApis = new Set(["responses", "chat_completions"]);
+const modelFamilies = new Set(["openai-gpt", "other"]);
 const reasoningEfforts = new Set([
   "none",
   "minimal",
@@ -83,6 +88,23 @@ export function validate(input) {
     throw Error("invalid route mode");
   if (!c.providers || !c.targets || !c.defaultTarget)
     throw Error("config requires providers, targets and defaultTarget");
+  c.pluginTools ??= {};
+  c.pluginTools.thirdPartyGpt ??= {
+    additionalAllowedPlugins: [],
+    excludedDefaultPlugins: [],
+  };
+  for (const key of ["additionalAllowedPlugins", "excludedDefaultPlugins"]) {
+    c.pluginTools.thirdPartyGpt[key] ??= [];
+    if (
+      !Array.isArray(c.pluginTools.thirdPartyGpt[key]) ||
+      c.pluginTools.thirdPartyGpt[key].some(
+        (name) => typeof name !== "string" || !name.trim(),
+      )
+    )
+      throw Error(`invalid pluginTools.thirdPartyGpt.${key}`);
+  }
+  // Also validates alias-normalized add/remove conflicts.
+  effectiveThirdPartyGptAllowlist(c);
   for (const [id, target] of Object.entries(c.targets)) {
     const provider = c.providers[target.provider];
     if (!provider) continue;
@@ -146,6 +168,10 @@ export function validate(input) {
     t.outputReserveTokens ??= 16384;
     t.inputModalities ??= ["text"];
     t.compression ??= { mode: "unsupported" };
+    if (t.modelFamily != null && !modelFamilies.has(t.modelFamily))
+      throw Error(`invalid model family for target ${name}`);
+    if (t.pluginToolPolicy != null)
+      t.pluginToolPolicy = normalizePluginPolicy(t.pluginToolPolicy);
     if (c.schemaVersion >= 2 && !t.contextWindow)
       throw Error(`target ${name} requires an explicit context window`);
     if (!compressionModes.has(t.compression.mode))
@@ -235,6 +261,11 @@ export function validate(input) {
       t.capabilities?.freeformTools !== true
     )
       throw Error(`target ${name} declares freeform apply patch without freeform tool support`);
+    if (
+      t.app?.supportsSearchTool != null &&
+      typeof t.app.supportsSearchTool !== "boolean"
+    )
+      throw Error(`invalid App search tool support for target ${name}`);
   }
   const target = (x) => !!c.targets[x];
   if (c.defaultTarget === "passthrough") {
@@ -293,7 +324,7 @@ export function validate(input) {
   for (const key of ["timeoutMs", "maxBodyBytes", "maxConnections"])
     if (c[key] != null && (!Number.isFinite(c[key]) || c[key] <= 0))
       throw Error(`invalid ${key}`);
-  for (const key of ["maxBytes", "ttlMs"])
+  for (const key of ["maxBytes", "ttlMs", "observationWaitMs"])
     if (
       c.history?.[key] != null &&
       (!Number.isFinite(c.history[key]) || c.history[key] <= 0)

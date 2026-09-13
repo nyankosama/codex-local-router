@@ -15,7 +15,11 @@ Codex Local Router（仅监听本机回环地址）
        └─ 自定义模型 ID ───> 用户配置的第三方渠道
 ```
 
-它保留 Codex 原有登录，隔离订阅凭证和第三方凭证，在本机保存可恢复的跨模型历史，并提供不依赖 Gateway 进程的订阅救援路径。不修改 Codex 二进制。
+它保留 Codex 原有登录，隔离订阅凭证和第三方凭证，在本机保存可恢复的跨模型历史，并提供不依赖 Gateway 进程的订阅救援路径。版本化“配置空间”把 Provider、模型、路由与策略作为一个组合管理，但不复制账号、用户 MCP、Skills、Hooks、提示或历史。不修改 Codex 二进制。
+
+官方订阅流量使用独立透明通道。只有显式配置的自定义模型，或必须恢复 Router 虚拟历史的请求，才进入模型 Engine。这样 `/models`、独立搜索和未来官方辅助接口可以继续兼容，同时不会把订阅身份开放给 `/v1`。
+
+第三方 GPT target 默认采用保守的 Plugin 白名单，以减少 Codex 客户端携带的大体积 Plugin 工具定义；Codex 核心工具和用户自行配置的 MCP 不受裁剪。非 GPT 与未声明模型家族的旧 target 默认仍原样转发。
 
 ## 支持范围
 
@@ -23,17 +27,17 @@ Codex Local Router（仅监听本机回环地址）
 - Node.js 22 或更高版本
 - [兼容矩阵](docs/public/compatibility.md)列出的 Codex CLI / App 版本
 - Responses 与 Chat Completions
-- ChatGPT 订阅、OpenCode Go 和通用 OpenAI 兼容渠道
+- ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设和通用 OpenAI 兼容渠道
 
-v0.2.1 不声明 Linux、Windows 或未知供应商私有协议已受支持。
+v0.3.0 不声明 Linux、Windows 或未知供应商私有协议已受支持。
 
 ## 从 GitHub Release 安装
 
-下载 `v0.2.1` Release 中的 `.tgz` 与 SHA-256 文件：
+下载 `v0.3.0` Release 中的 `.tgz` 与 SHA-256 文件：
 
 ```bash
-shasum -a 256 -c codex-local-router-0.2.1.tgz.sha256
-npm install -g ./codex-local-router-0.2.1.tgz
+shasum -a 256 -c codex-local-router-0.3.0.tgz.sha256
+npm install -g ./codex-local-router-0.3.0.tgz
 codex-local-router --version
 ```
 
@@ -55,11 +59,23 @@ printf '%s' "$OPENCODE_GO_API_KEY" | codex-local-router setup --credential-stdin
 
 前台运行仍可使用环境变量凭证。受管 LaunchAgent 不继承 Shell 环境变量；`doctor` 会报告这一问题并建议改用 Keychain。
 
-`setup` 会发现 Codex home、配置、模型目录和凭证存储方式；展示差异；写入可恢复事务；安装 LaunchAgent；分别报告配置、服务、目录和 App 加载状态。若 Codex App 正在运行，只准备接入文件并标记待应用。正常退出 App 后运行：
+`setup` 会发现 Codex home、配置、模型目录和凭证存储方式，创建受保护的 `official@1` 与首个 `default@1`，再启动可恢复的激活事务。若 Codex App 正在运行，不修改 Codex 配置和服务文件；一次性切换器只等待 App 正常退出，应用一次后退出，不强退也不自动重开。也可以显式恢复执行：
 
 ```bash
 codex-local-router integration sync
 ```
+
+完整配置组合可以创建、查看、切换、比较与回滚：
+
+```bash
+codex-local-router space list
+codex-local-router space create work --from default --yes
+codex-local-router space use work --yes
+codex-local-router space diff default work
+codex-local-router space rollback --yes
+```
+
+每次确认修改 Provider、模型、路由、Plugin、搜索、压缩或默认模型都会生成不可变 revision。用 `--space NAME` 修改非活动 Router 空间。若手工改动当前 `config.json` 的空间字段，系统报告 drift；需先审阅并用 `space capture` 接纳，不会在下次切换时静默覆盖。
 
 日常诊断不调用模型：
 
@@ -75,6 +91,8 @@ codex-local-router model list
 codex-local-router model probe --id deepseek --live
 ```
 
+内置的 `feei/gpt-5.6-sol`、`feei/gpt-6-astra` 预设分别使用 `feei-gpt-5.6-sol`、`feei-gpt-6-astra` 作为 App 模型 ID，采用标准 Responses、保守的 272,000 token 配置窗口和第三方 GPT Plugin 策略。API Key 必须由用户通过 Keychain 或 `FEEI_API_KEY` 单独提供，项目不包含任何凭证。具体配置见[配置说明](docs/public/configuration.zh-CN.md)。
+
 ## 恢复与历史
 
 Codex 配置使用受管区块和三方比较事务。禁用时只撤销仍等于 Router 上次写入值的字段，保留用户后续增加的无关设置。
@@ -82,8 +100,10 @@ Codex 配置使用受管区块和三方比较事务。禁用时只撤销仍等�
 Gateway 不可用时，可在不连接 Gateway 的情况下恢复官方订阅直连：
 
 ```bash
-codex-local-router rescue --subscription
+codex-local-router rescue --subscription --yes
 ```
+
+救援命令要求 Codex App 已关闭，直接恢复永久保留的 `official@1` 并停止 Router，不依赖正常切换协调器。
 
 历史正文使用 AES-256-GCM 加密，密钥保存在 macOS Keychain。默认导出也加密并要求口令；只有显式指定才允许明文导出。
 
@@ -92,7 +112,7 @@ codex-local-router history export --thread THREAD_ID --output history.clr.json -
 codex-local-router history inspect --thread THREAD_ID
 ```
 
-更多信息见 [CLI 说明](docs/public/cli.md)、[配置说明](docs/public/configuration.md)、[架构](docs/public/architecture.md)、[数据流向](docs/public/data-flow.md)与[验收工具链](docs/public/acceptance.md)。
+更多信息见[配置空间指南](docs/public/configuration-spaces.zh-CN.md)、[CLI 说明](docs/public/cli.zh-CN.md)、[配置说明](docs/public/configuration.zh-CN.md)、[架构](docs/public/architecture.zh-CN.md)、[数据流向](docs/public/data-flow.zh-CN.md)、[兼容性](docs/public/compatibility.zh-CN.md)与[验收工具链](docs/public/acceptance.zh-CN.md)。
 
 ## 压缩边界
 

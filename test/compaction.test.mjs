@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
+import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -451,7 +452,7 @@ test("a migration summary is generated once and a second explicit overflow fails
   assert.equal(summaries, 1);
 });
 
-test("pending tools cannot be compacted away; config snapshot is shared across phases and retry stays deterministic", async () => {
+test("pending tools cannot be compacted away; config snapshot is shared and unlisted official models pass", async () => {
   const e = new Engine(config(), {
     send: async () => json(result([msg("assistant", "ok")])),
   });
@@ -489,11 +490,36 @@ test("pending tools cannot be compacted away; config snapshot is shared across p
   next.subscription.models = [];
   e.update(next);
   await call(e, GPT, "two", c.output);
-  await assert.rejects(call(e, GPT, "three", c.output), /unknown_model/);
+  await call(e, GPT, "three", c.output);
 });
 
 test("production reused WebSocket accepts same-turn compaction and model switch, with per-frame turn IDs", async (t) => {
-  const seen = [];
+  const seen = [], officialSeen = [];
+  class FakeOfficialSocket extends EventEmitter {
+    constructor() {
+      super();
+      this.readyState = 0;
+      queueMicrotask(() => { this.readyState = 1; this.emit("open"); });
+    }
+    send(data, _options, callback) {
+      const request = JSON.parse(Buffer.from(data).toString());
+      officialSeen.push(request.model);
+      callback();
+      const response = result([msg("assistant", "WS_MEMORY_503")]);
+      queueMicrotask(() => {
+        this.emit("message", Buffer.from(JSON.stringify({
+          type: "response.created",
+          response: { ...response, status: "in_progress", output: [] },
+        })), false);
+        this.emit("message", Buffer.from(JSON.stringify({
+          type: "response.completed",
+          response,
+        })), false);
+      });
+    }
+    close() { this.readyState = 3; this.emit("close"); }
+    terminate() { this.close(); }
+  }
   const gw = createGateway(config(), {
     log: () => {},
     send: async (u, o) => {
@@ -506,6 +532,7 @@ test("production reused WebSocket accepts same-turn compaction and model switch,
         ),
       );
     },
+    createOfficialWebSocket: () => new FakeOfficialSocket(),
   });
   await new Promise((r) => gw.server.listen(0, "127.0.0.1", r));
   t.after(() => gw.close());
@@ -549,8 +576,9 @@ test("production reused WebSocket accepts same-turn compaction and model switch,
   await request(GPT, "c", [msg("user", "WS_MEMORY_503")]);
   assert.deepEqual(
     seen.map((x) => x.model),
-    [GPT, GPT, DS, GPT],
+    [GPT, DS],
   );
+  assert.deepEqual(officialSeen, [GPT, GPT]);
   ws.close();
 });
 
@@ -601,7 +629,7 @@ test("Responses Lite per-frame protocol header is isolated and tool declarations
   assert.ok(JSON.stringify(seen.at(-1).body.input).includes("PORTABLE_LITE"));
 });
 
-test("prewarm retains Lite tool definitions for incremental first inference without calling upstream", async (t) => {
+test("custom prewarm retains Lite tool definitions for incremental first inference without calling upstream", async (t) => {
   const seen = [];
   const gw = createGateway(config(), {
     log: () => {},
@@ -630,7 +658,7 @@ test("prewarm retains Lite tool definitions for incremental first inference with
         }
       };
       ws.on("message", fn);
-      ws.send(JSON.stringify({ type: "response.create", model: GPT, ...body }));
+      ws.send(JSON.stringify({ type: "response.create", model: DS, ...body }));
     });
   const prefix = {
     type: "additional_tools",

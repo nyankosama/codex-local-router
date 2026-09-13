@@ -10,15 +10,38 @@
       "baseUrl": "https://opencode.ai/zen/go",
       "apiKeyEnv": "OPENCODE_GO_API_KEY",
       "concurrency": 4
+    },
+    "feei": {
+      "adapter": "openai-compatible",
+      "baseUrl": "https://ai.feei.cn/v1",
+      "keychain": {
+        "service": "codex-local-router-provider",
+        "account": "feei"
+      },
+      "concurrency": 4
     }
   },
   "targets": {
     "deepseek": {
       "provider": "opencode-go",
       "preset": "opencode-go/deepseek-v4.1-flash"
+    },
+    "feei-sol": {
+      "provider": "feei",
+      "preset": "feei/gpt-5.6-sol"
+    },
+    "feei-astra": {
+      "provider": "feei",
+      "preset": "feei/gpt-6-astra"
     }
   },
   "rules": [],
+  "pluginTools": {
+    "thirdPartyGpt": {
+      "additionalAllowedPlugins": [],
+      "excludedDefaultPlugins": []
+    }
+  },
   "webSearch": {
     "backend": "tavily",
     "apiKeyEnv": "TAVILY_API_KEY",

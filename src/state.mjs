@@ -11,6 +11,7 @@ const durablePrefixes = [
   "summary:",
   "prepared:",
   "image-description:",
+  "observation-incomplete:",
 ];
 
 export function identity(entry, headers, body, trustedAccount) {

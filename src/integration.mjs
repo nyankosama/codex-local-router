@@ -17,12 +17,13 @@ const BEGIN = "# BEGIN codex-local-router managed settings";
 const END = "# END codex-local-router managed settings";
 const LEGACY_BEGIN = "# BEGIN llm-auto-gateway Codex App probe";
 const LEGACY_END = "# END llm-auto-gateway Codex App probe";
-const MANAGED_KEYS = [
+export const MANAGED_CODEX_KEYS = [
   "model_provider",
   "model",
   "openai_base_url",
   "model_catalog_json",
 ];
+const MANAGED_KEYS = MANAGED_CODEX_KEYS;
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 
 function tomlValue(value) {
@@ -33,12 +34,118 @@ function splitLines(text) {
   return text.replace(/\r\n/g, "\n").split("\n");
 }
 
+function structuralTomlLines(lines) {
+  let multiline = null;
+  let squareDepth = 0, curlyDepth = 0;
+  return lines.map((line) => {
+    const structural = multiline == null && squareDepth === 0 && curlyDepth === 0;
+    let single = false, double = false;
+    const escaped = (at) => {
+      let count = 0;
+      for (let index = at - 1; index >= 0 && line[index] === "\\"; index--) count++;
+      return count % 2 === 1;
+    };
+    for (let index = 0; index < line.length;) {
+      if (multiline) {
+        const quote = multiline[0];
+        let run = 0;
+        while (line[index + run] === quote) run++;
+        const closingRun = run - (quote === '"' && escaped(index) ? 1 : 0);
+        if (closingRun >= 3) {
+          multiline = null;
+          index += run;
+        } else index += Math.max(1, run);
+        continue;
+      }
+      if (!single && !double && line[index] === "#") break;
+      if (
+        !single && !double &&
+        (line.startsWith('"""', index) || line.startsWith("'''", index))
+      ) {
+        multiline = line.slice(index, index + 3);
+        index += 3;
+        continue;
+      }
+      if (!single && line[index] === '"' && !escaped(index)) double = !double;
+      else if (!double && line[index] === "'") single = !single;
+      else if (!single && !double) {
+        if (line[index] === "[") squareDepth++;
+        else if (line[index] === "]") squareDepth = Math.max(0, squareDepth - 1);
+        else if (line[index] === "{") curlyDepth++;
+        else if (line[index] === "}") curlyDepth = Math.max(0, curlyDepth - 1);
+      }
+      index++;
+    }
+    return structural;
+  });
+}
+
+function decodeTomlBasic(value) {
+  return value.replace(
+    /\\(?:[btnfr"\\]|u[0-9a-fA-F]{4}|U[0-9a-fA-F]{8})/g,
+    (escape) => {
+      const simple = { b: "\b", t: "\t", n: "\n", f: "\f", r: "\r", '"': '"', "\\": "\\" };
+      if (escape[1] in simple) return simple[escape[1]];
+      return String.fromCodePoint(Number.parseInt(escape.slice(2), 16));
+    },
+  );
+}
+
+function tomlAssignment(statement) {
+  const match = statement.match(
+    /^\s*(?:"((?:\\.|[^"\\])*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*=\s*([\s\S]*?)\s*$/,
+  );
+  if (!match) return null;
+  return {
+    key: match[1] != null
+      ? decodeTomlBasic(match[1])
+      : (match[2] ?? match[3]),
+    value: match[4],
+  };
+}
+
+function withoutTomlComment(value) {
+  let multiline = null, single = false, double = false;
+  const escaped = (at) => {
+    let count = 0;
+    for (let index = at - 1; index >= 0 && value[index] === "\\"; index--) count++;
+    return count % 2 === 1;
+  };
+  for (let index = 0; index < value.length;) {
+    if (multiline) {
+      const quote = multiline[0];
+      let run = 0;
+      while (value[index + run] === quote) run++;
+      const closingRun = run - (quote === '"' && escaped(index) ? 1 : 0);
+      if (closingRun >= 3) {
+        multiline = null;
+        index += run;
+      } else index += Math.max(1, run);
+      continue;
+    }
+    if (!single && !double && value[index] === "#") return value.slice(0, index).trimEnd();
+    if (
+      !single && !double &&
+      (value.startsWith('"""', index) || value.startsWith("'''", index))
+    ) {
+      multiline = value.slice(index, index + 3);
+      index += 3;
+      continue;
+    }
+    if (!single && value[index] === '"' && !escaped(index)) double = !double;
+    else if (!double && value[index] === "'") single = !single;
+    index++;
+  }
+  return value.trimEnd();
+}
+
 function removeManagedBlock(lines) {
+  const structural = structuralTomlLines(lines);
   const starts = [];
   const ends = [];
   for (let index = 0; index < lines.length; index++) {
-    if ([BEGIN, LEGACY_BEGIN].includes(lines[index])) starts.push(index);
-    if ([END, LEGACY_END].includes(lines[index])) ends.push(index);
+    if (structural[index] && [BEGIN, LEGACY_BEGIN].includes(lines[index])) starts.push(index);
+    if (structural[index] && [END, LEGACY_END].includes(lines[index])) ends.push(index);
   }
   if (!starts.length && !ends.length) return { lines, block: [] };
   if (starts.length !== 1 || ends.length !== 1 || ends[0] <= starts[0])
@@ -51,29 +158,48 @@ function removeManagedBlock(lines) {
   };
 }
 
-function blockValues(block) {
+export function blockValues(block) {
   const values = {};
   for (const line of block) {
-    const match = line.match(/^([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$/);
-    if (!match || !MANAGED_KEYS.includes(match[1])) continue;
+    const assignment = tomlAssignment(line);
+    if (!assignment || !MANAGED_KEYS.includes(assignment.key)) continue;
+    const value = withoutTomlComment(assignment.value);
     try {
-      values[match[1]] = JSON.parse(match[2]);
+      values[assignment.key] = JSON.parse(value);
     } catch {
-      values[match[1]] = match[2];
+      const raw = value.trim();
+      if (raw.startsWith("'''") && raw.endsWith("'''")) {
+        values[assignment.key] = raw.slice(3, -3).replace(/^\r?\n/, "");
+      } else if (raw.startsWith('"""') && raw.endsWith('"""')) {
+        let body = raw.slice(3, -3).replace(/^\r?\n/, "");
+        body = body.replace(/\\[ \t]*\r?\n[ \t\r\n]*/g, "");
+        values[assignment.key] = decodeTomlBasic(body);
+      } else if (raw.startsWith('"') && raw.endsWith('"')) {
+        values[assignment.key] = decodeTomlBasic(raw.slice(1, -1));
+      } else if (raw.startsWith("'") && raw.endsWith("'")) {
+        values[assignment.key] = raw.slice(1, -1);
+      } else {
+        values[assignment.key] = raw;
+      }
     }
   }
   return values;
 }
 
-function removeTopLevelKeys(lines) {
+export function removeTopLevelKeys(lines) {
+  const structural = structuralTomlLines(lines);
   let inTable = false;
   const baseline = {};
   const kept = [];
-  for (const line of lines) {
-    if (/^\s*\[/.test(line)) inTable = true;
-    const match = !inTable && line.match(/^\s*([A-Za-z0-9_]+)\s*=/);
-    if (match && MANAGED_KEYS.includes(match[1])) {
-      baseline[match[1]] ??= line;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (structural[index] && /^\s*\[/.test(line)) inTable = true;
+    const assignment = structural[index] && !inTable ? tomlAssignment(line) : null;
+    if (assignment && MANAGED_KEYS.includes(assignment.key)) {
+      let end = index + 1;
+      while (end < lines.length && !structural[end]) end++;
+      baseline[assignment.key] ??= lines.slice(index, end).join("\n");
+      index = end - 1;
       continue;
     }
     kept.push(line);
@@ -82,15 +208,15 @@ function removeTopLevelKeys(lines) {
 }
 
 function insertBeforeTables(lines, block) {
-  const index = lines.findIndex((line) => /^\s*\[/.test(line));
+  const structural = structuralTomlLines(lines);
+  const index = lines.findIndex((line, at) => structural[at] && /^\s*\[/.test(line));
   const at = index < 0 ? lines.length : index;
   const prefix = lines.slice(0, at);
   while (prefix.at(-1) === "") prefix.pop();
   const suffix = lines.slice(at);
-  return [...prefix, ...(prefix.length ? [""] : []), ...block, "", ...suffix]
-    .join("\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/\s*$/, "\n");
+  const rendered = [...prefix, ...(prefix.length ? [""] : []), ...block, "", ...suffix]
+    .join("\n");
+  return rendered.endsWith("\n") ? rendered : `${rendered}\n`;
 }
 
 function renderBlock(managed) {
@@ -134,7 +260,25 @@ export function restoreCodexConfig(text, state) {
   };
 }
 
-function integrationPaths(env, home = defaultCodexHome(env)) {
+export function inspectCodexBaseline(text) {
+  const removed = removeManagedBlock(splitLines(text));
+  if (removed.block.length)
+    throw Object.assign(Error("Codex config is currently managed by the router"), {
+      code: "official_baseline_managed",
+    });
+  const cleaned = removeTopLevelKeys(removed.lines);
+  const values = blockValues(Object.values(cleaned.baseline));
+  if (
+    (values.model_provider != null && values.model_provider !== "openai") ||
+    values.openai_base_url != null
+  )
+    throw Object.assign(Error("Codex config is not an unambiguous official direct configuration"), {
+      code: "official_baseline_ambiguous",
+    });
+  return { managed: cleaned.baseline, values };
+}
+
+export function integrationPaths(env, home = defaultCodexHome(env)) {
   const root = join(dataDir(env), "integration");
   return {
     root,
@@ -235,12 +379,18 @@ export async function discoverCodex(env = process.env) {
   };
 }
 
-function desired(config, paths, baseUrl) {
+function desired(config, paths, baseUrl, selectedModel = null) {
   const models = Object.keys(config.subscription?.customModels ?? {});
   if (!models.length) throw Object.assign(Error("no App-enabled custom model is configured"), { code: "integration_no_models" });
+  const model = selectedModel ?? models[0];
+  const allowed = new Set([...(config.subscription?.models ?? []), ...models]);
+  if (!allowed.has(model))
+    throw Object.assign(Error(`default Codex model is not available in this space: ${model}`), {
+      code: "space_default_model_unavailable",
+    });
   return {
     model_provider: "openai",
-    model: models[0],
+    model,
     openai_base_url: baseUrl,
     model_catalog_json: paths.catalog,
   };
@@ -261,14 +411,23 @@ export async function syncIntegration(config, options = {}) {
     const stored = await readJSON(paths.state, null);
     let previous = stored ?? (await migrateLegacyState(paths, env));
     const configText = await readFile(paths.config, "utf8");
-    let managed = desired(config, paths, baseUrl);
+    if (
+      Object.hasOwn(options, "expectedCodexConfigHash") &&
+      digest(Buffer.from(configText)) !== options.expectedCodexConfigHash
+    ) throw Object.assign(Error("Codex config changed before integration could be applied"), {
+      code: "integration_conflict",
+      conflicts: ["file_hash"],
+    });
+    let managed = desired(config, paths, baseUrl, options.selectedModel);
     const allowedModels = new Set([
       ...(config.subscription?.models ?? []),
       ...Object.keys(config.subscription?.customModels ?? {}),
     ]);
     const removed = removeManagedBlock(splitLines(configText));
     const current = blockValues(removed.block);
-    if (allowedModels.has(current.model)) {
+    if (options.selectedModel) {
+      managed = { ...managed, model: options.selectedModel };
+    } else if (allowedModels.has(current.model)) {
       managed = { ...managed, model: current.model };
     } else if (stored && allowedModels.has(stored.managed?.model)) {
       managed = { ...managed, model: stored.managed.model };
@@ -293,7 +452,16 @@ export async function syncIntegration(config, options = {}) {
     const catalog = await buildCatalog(config, paths);
     let catalogCurrent = null;
     try { catalogCurrent = await readFile(paths.catalog); } catch (error) { if (error.code !== "ENOENT") throw error; }
-    if (previous?.catalogHash && catalogCurrent && digest(catalogCurrent) !== previous.catalogHash && !options.force)
+    if (
+      Object.hasOwn(options, "expectedCatalogHash") &&
+      (catalogCurrent ? digest(catalogCurrent) : null) !== options.expectedCatalogHash
+    ) throw Object.assign(Error("Codex model catalog changed before integration could be applied"), {
+      code: "integration_catalog_conflict",
+    });
+    if (
+      previous?.status === "applied" && previous.catalogHash && catalogCurrent &&
+      digest(catalogCurrent) !== previous.catalogHash && !options.force
+    )
       throw Object.assign(Error("Codex model catalog changed after the last router sync"), { code: "integration_catalog_conflict" });
     const state = {
       schemaVersion: INTEGRATION_SCHEMA_VERSION,
@@ -305,11 +473,14 @@ export async function syncIntegration(config, options = {}) {
       catalogPath: paths.catalog,
       sourceCatalogPath: paths.sourceCatalog,
       managed,
-      baseline: previous?.baseline ?? edited.baseline,
-      baselineCatalogBackup: previous?.baselineCatalogBackup ?? null,
+      baseline: options.officialBaseline?.managed ?? previous?.baseline ?? edited.baseline,
+      baselineCatalog: options.officialBaseline?.catalog ?? previous?.baselineCatalog ?? null,
+      baselineCatalogBackup: options.officialBaseline ? null : previous?.baselineCatalogBackup ?? null,
       configHash: digest(edited.text),
       catalogHash: digest(catalog),
       gatewayConfigPath: options.gatewayConfigPath,
+      officialSpaceRef: options.officialSpaceRef ?? previous?.officialSpaceRef ?? null,
+      materializedSpaceRef: options.spaceRef ?? previous?.materializedSpaceRef ?? null,
       updatedAt: Date.now(),
     };
     if (!previous && catalogCurrent) {
@@ -324,7 +495,8 @@ export async function syncIntegration(config, options = {}) {
     if (filesUnchanged && previous?.status === "applied") {
       const stateUnchanged = MANAGED_KEYS.every(
         (key) => previous.managed?.[key] === managed[key],
-      );
+      ) && previous.officialSpaceRef === state.officialSpaceRef &&
+        previous.materializedSpaceRef === state.materializedSpaceRef;
       if (!stateUnchanged) await atomicJSON(paths.state, state);
       return {
         changed: !stateUnchanged,
@@ -390,6 +562,8 @@ export async function integrationStatus(config, options = {}) {
     catalogCurrent: !!catalog && digest(Buffer.from(JSON.stringify(catalog, null, 2) + "\n")) === state.catalogHash,
     appRunning: await appIsRunning(env),
     clients: state.clients,
+    officialSpaceRef: state.officialSpaceRef ?? null,
+    materializedSpaceRef: state.materializedSpaceRef ?? null,
     targets,
   };
 }
@@ -398,34 +572,95 @@ export async function disableIntegration(options = {}) {
   const env = options.env ?? process.env;
   const paths = integrationPaths(env, options.codexHome ?? defaultCodexHome(env));
   return withFileLock(paths.lock, async () => {
-    const state = (await readJSON(paths.state, null)) ?? (await migrateLegacyState(paths, env));
-    if (!state) return { changed: false, conflicts: [] };
-    if (state.status === "disabled") return { changed: false, conflicts: [] };
+    let state = (await readJSON(paths.state, null)) ?? (await migrateLegacyState(paths, env));
+    if (!state) {
+      if (!options.officialBaseline) return { changed: false, conflicts: [] };
+      const current = await readFile(paths.config, "utf8");
+      const removed = removeManagedBlock(splitLines(current));
+      if (removed.block.length && !options.trustedCurrentFiles)
+        throw Object.assign(Error("Codex integration state is missing for a managed configuration"), {
+          code: "integration_state_missing",
+        });
+      state = {
+        schemaVersion: INTEGRATION_SCHEMA_VERSION,
+        product: "codex-local-router",
+        status: "disabled",
+        clients: [],
+        configPath: paths.config,
+        catalogPath: paths.catalog,
+        sourceCatalogPath: paths.sourceCatalog,
+        managed: options.trustedCurrentFiles ? blockValues(removed.block) : {},
+        baseline: options.officialBaseline.managed ?? {},
+        baselineCatalog: options.officialBaseline.catalog ?? null,
+        updatedAt: Date.now(),
+      };
+    }
+    const requestedOfficialRef = options.officialSpaceRef ?? state.officialSpaceRef ?? null;
+    if (
+      state.status === "disabled" &&
+      !options.officialBaseline
+    ) return { changed: false, conflicts: [] };
     if ((await appIsRunning(env)) && state.clients?.includes("app") && !options.applyWhileRunning)
       throw Object.assign(Error("Codex App is running; quit it before disabling integration"), { code: "app_running" });
     const current = await readFile(state.configPath, "utf8");
-    const restored = restoreCodexConfig(current, state);
-    let catalog;
+    if (
+      Object.hasOwn(options, "expectedCodexConfigHash") &&
+      digest(Buffer.from(current)) !== options.expectedCodexConfigHash
+    ) throw Object.assign(Error("Codex config changed before integration could be disabled"), {
+      code: "integration_conflict",
+      conflicts: ["file_hash"],
+    });
+    const baseline = options.officialBaseline?.managed ?? state.baseline;
+    const restored = restoreCodexConfig(current, { ...state, baseline });
+    let catalog, catalogBytes = null;
     try {
-      const bytes = await readFile(state.catalogPath);
-      if (digest(bytes) === state.catalogHash) catalog = JSON.parse(bytes);
+      catalogBytes = await readFile(state.catalogPath);
     } catch {}
+    if (
+      Object.hasOwn(options, "expectedCatalogHash") &&
+      (catalogBytes ? digest(catalogBytes) : null) !== options.expectedCatalogHash
+    ) throw Object.assign(Error("Codex model catalog changed before integration could be disabled"), {
+      code: "integration_catalog_conflict",
+    });
+    if (catalogBytes && digest(catalogBytes) === state.catalogHash)
+      catalog = JSON.parse(catalogBytes);
     const selectedModelAllowed = catalog?.models?.some(
       (model) => model.slug === restored.current.model,
     );
-    const conflicts = restored.conflicts.filter(
-      (key) => key !== "model" || !selectedModelAllowed,
-    );
+    const conflicts = state.status === "disabled" && !Object.keys(restored.current).length
+      ? []
+      : restored.conflicts.filter(
+          (key) => key !== "model" || !selectedModelAllowed,
+        );
     if (conflicts.length && !options.force)
       throw Object.assign(Error(`Codex managed settings changed: ${conflicts.join(", ")}`), {
         code: "integration_conflict",
         conflicts,
       });
     await atomicWrite(state.configPath, restored.text);
-    if (state.baselineCatalogBackup)
+    if (options.officialBaseline?.catalog?.present) {
+      const bytes = Buffer.from(options.officialBaseline.catalog.bytesBase64, "base64");
+      if (digest(bytes) !== options.officialBaseline.catalog.sha256)
+        throw Object.assign(Error("official catalog snapshot hash mismatch"), {
+          code: "official_catalog_tampered",
+        });
+      await atomicWrite(state.catalogPath, bytes);
+    } else if (options.officialBaseline?.catalog) {
+      await rm(state.catalogPath, { force: true });
+    } else if (state.baselineCatalog?.present) {
+      const bytes = Buffer.from(state.baselineCatalog.bytesBase64, "base64");
+      if (digest(bytes) !== state.baselineCatalog.sha256)
+        throw Object.assign(Error("official catalog snapshot hash mismatch"), {
+          code: "official_catalog_tampered",
+        });
+      await atomicWrite(state.catalogPath, bytes);
+    } else if (state.baselineCatalogBackup)
       await copyFile(state.baselineCatalogBackup, state.catalogPath);
     else await rm(state.catalogPath, { force: true });
+    state.schemaVersion = INTEGRATION_SCHEMA_VERSION;
     state.status = "disabled";
+    state.officialSpaceRef = requestedOfficialRef;
+    state.materializedSpaceRef = requestedOfficialRef;
     state.disabledAt = Date.now();
     await atomicJSON(paths.state, state);
     return { changed: true, conflicts };
