@@ -57,7 +57,8 @@ test("setup reports pending App integration and core query commands are JSON-saf
   assert.equal(providers[0].id, "opencode-go");
   await exec(process.execPath, [
     cli, "provider", "add", "--id", "feei", "--base-url", "https://ai.feei.cn/v1",
-    "--api-key-env", "FEEI_API_KEY", "--yes", "--json",
+    "--api-key-env", "FEEI_API_KEY", "--standalone-search-endpoint", "alpha/search",
+    "--yes", "--json",
   ], { env: stoppedEnvironment });
   await exec(process.execPath, [
     cli, "model", "add", "--id", "feei-sol", "--provider", "feei",
@@ -71,6 +72,10 @@ test("setup reports pending App integration and core query commands are JSON-saf
   const feei = modelList.find((model) => model.id === "feei-sol");
   assert.equal(feei.modelFamily, "openai-gpt");
   assert.equal(feei.pluginToolPolicy.reason, "third-party-openai-gpt-default");
+  assert.equal(feei.standaloneSearch.source, "subscription");
+  assert.equal(feei.standaloneSearch.reason, "third-party-gpt-default");
+  assert.equal(feei.standaloneSearch.advertised, true);
+  assert.equal(feei.standaloneSearch.credentialReady, true);
   assert.deepEqual(feei.pluginToolPolicy.allowedPlugins, [
     "github", "figma", "sites", "connected_documents",
   ]);
@@ -82,6 +87,62 @@ test("setup reports pending App integration and core query commands are JSON-saf
   )).stdout);
   assert.equal(probe.live, false);
   assert.equal(probe.pluginToolPolicy.reason, "third-party-openai-gpt-default");
+  assert.equal(probe.standaloneSearch.source, "subscription");
+
+  await exec(process.execPath, [
+    cli, "model", "add", "--id", "generic-gpt", "--provider", "feei",
+    "--upstream-model", "gpt-5.6-sol", "--protocol", "responses",
+    "--context-window", "272000", "--compression", "summary",
+    "--model-family", "openai-gpt", "--app-model", "generic-gpt",
+    "--yes", "--json",
+  ], { env: stoppedEnvironment });
+  assert.equal(
+    JSON.parse(await readFile(config, "utf8")).targets["generic-gpt"].app.useResponsesLite,
+    true,
+  );
+  await assert.rejects(
+    exec(process.execPath, [
+      cli, "model", "edit", "--id", "generic-gpt", "--no-responses-lite",
+      "--yes", "--json",
+    ], { env: stoppedEnvironment }),
+    (error) => /standalone search requires Responses Lite/.test(error.stderr),
+  );
+
+  await assert.rejects(
+    exec(process.execPath, [
+      cli, "model", "edit", "--id", "feei-sol", "--search-source", "provider",
+      "--supports-search-tool", "--yes", "--json",
+    ], { env: stoppedEnvironment }),
+    (error) => JSON.parse(error.stderr).code === "usage_error",
+  );
+  await exec(process.execPath, [
+    cli, "model", "edit", "--id", "feei-sol", "--no-supports-search-tool",
+    "--yes", "--json",
+  ], { env: stoppedEnvironment });
+  let aliasModel = JSON.parse((await exec(
+    process.execPath,
+    [cli, "model", "list", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout).find((model) => model.id === "feei-sol");
+  assert.equal(aliasModel.standaloneSearch.source, "disabled");
+  const searchStatus = JSON.parse((await exec(
+    process.execPath,
+    [cli, "status", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(
+    searchStatus.standaloneSearch.find((search) => search.target === "feei-sol").source,
+    "disabled",
+  );
+  const searchDoctor = JSON.parse((await exec(
+    process.execPath,
+    [cli, "doctor", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(
+    searchDoctor.standaloneSearch.find((search) => search.target === "feei-sol").reason,
+    "target-explicit",
+  );
 
   const spaces = JSON.parse((await exec(process.execPath, [cli, "space", "list", "--json"], { env: stoppedEnvironment })).stdout);
   assert.deepEqual(spaces.map((space) => space.name).sort(), ["default", "official"]);
@@ -89,6 +150,13 @@ test("setup reports pending App integration and core query commands are JSON-saf
   assert.equal(current.active.space, "default");
   assert.equal(current.drift, false);
   await exec(process.execPath, [cli, "space", "create", "alternate", "--from", "default", "--yes", "--json"], { env: stoppedEnvironment });
+  await exec(process.execPath, [
+    cli, "space", "set-search-source", "disabled", "--space", "alternate", "--yes", "--json",
+  ], { env: stoppedEnvironment });
+  await exec(process.execPath, [
+    cli, "model", "edit", "--id", "feei-sol", "--space", "alternate",
+    "--search-source", "provider", "--yes", "--json",
+  ], { env: stoppedEnvironment });
   const defaultChanged = JSON.parse((await exec(process.execPath, [
     cli, "space", "set-default-model", "feei-gpt-5.6-sol", "--space", "alternate", "--yes", "--json",
   ], { env: stoppedEnvironment })).stdout);
@@ -96,6 +164,9 @@ test("setup reports pending App integration and core query commands are JSON-saf
   assert.equal(defaultChanged.switch, null);
   const alternate = JSON.parse((await exec(process.execPath, [cli, "space", "show", "alternate", "--json"], { env: stoppedEnvironment })).stdout);
   assert.equal(alternate.defaultCodexModel, "feei-gpt-5.6-sol");
+  assert.equal(alternate.config.standaloneSearch.thirdPartyGpt.defaultSource, "disabled");
+  assert.equal(alternate.config.targets["feei-sol"].standaloneSearch.source, "provider");
+  assert.equal(alternate.config.targets["feei-sol"].app.supportsSearchTool, undefined);
   const history = JSON.parse((await exec(process.execPath, [cli, "space", "history", "default", "--json"], { env: stoppedEnvironment })).stdout);
   assert.ok(history.length >= 3);
   const diff = JSON.parse((await exec(process.execPath, [cli, "space", "diff", "default@1", `default@${history[0].revision}`, "--json"], { env: stoppedEnvironment })).stdout);

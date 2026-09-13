@@ -176,7 +176,9 @@ test("space revisions are immutable, cloneable, comparable and detect runtime dr
   index.active = { space: "default", revision: 1 };
   await writeFile(indexPath, JSON.stringify(index));
   assert.equal((await detectSpaceDrift({ env: f.env })).drift, false);
-  materialized.providers.provider.concurrency = 9;
+  materialized.standaloneSearch = {
+    thirdPartyGpt: { defaultSource: "disabled" },
+  };
   await writeFile(f.configPath, JSON.stringify(materialized));
   assert.equal((await detectSpaceDrift({ env: f.env })).drift, true);
 });

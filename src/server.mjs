@@ -26,6 +26,7 @@ import {
   validateOfficialRelayPath,
 } from "./official-relay.mjs";
 import { OfficialWebSocketSession } from "./official-websocket.mjs";
+import { relayProviderSearchHttp } from "./provider-search-relay.mjs";
 export function createGateway(config, options = {}) {
   const log =
     options.log ??
@@ -168,6 +169,34 @@ export function createGateway(config, options = {}) {
       }
 
       if (entry === "subscription") {
+        if (pathname === "/subscription/v1/alpha/search") {
+          phase = "standalone_search_relay";
+          const route = await engine.resolveStandaloneSearchRoute(req.headers);
+          if (route.source === "provider") {
+            const result = await relayProviderSearchHttp({
+              req,
+              res,
+              wire,
+              route,
+              config: engine.config,
+              signal: c.signal,
+              send: options.providerSearchRequest,
+            });
+            log({
+              event: "standalone_search_relay_completed",
+              request_id: requestId,
+              source: "provider",
+              target: route.target,
+              provider: route.provider,
+              matched_by: route.matchedBy,
+              status: result.status,
+              request_bytes: bodyStats.wire_bytes,
+              response_bytes: result.bytes,
+              duration_ms: Date.now() - startedAt,
+            });
+            return;
+          }
+        }
         const custom = isResponses && engine.config.subscription.customModels?.[body.model];
         let managed = false, officialClassification;
         if (custom) {
@@ -178,6 +207,12 @@ export function createGateway(config, options = {}) {
           managed = officialClassification.needsEngine;
         }
         if (!managed) {
+          if (isResponses)
+            await engine.recordOfficialStandaloneSearchRoute(
+              req.headers,
+              body,
+              officialClassification,
+            );
           phase = "official_relay";
           const requestWire = wire.length || req.headers["content-length"] || req.headers["transfer-encoding"]
             ? wire
@@ -412,6 +447,11 @@ export function createGateway(config, options = {}) {
               managed = officialClassification.needsEngine;
             }
             if (!managed) {
+              await engine.recordOfficialStandaloneSearchRoute(
+                headers,
+                body,
+                officialClassification,
+              );
               phase = "official_relay";
               await officialSession.run(data, isBinary, {
                 signal: active.signal,
@@ -428,7 +468,7 @@ export function createGateway(config, options = {}) {
             delete body.generate;
             if (message.generate === false) {
               // Local protocol prewarm only; route/auth validation still applies.
-              engine.route(engine.config, entry, body, { headers });
+              const routed = engine.route(engine.config, entry, body, { headers });
               const response = {
                 id: `warmup_${randomUUID()}`,
                 object: "response",
@@ -436,6 +476,13 @@ export function createGateway(config, options = {}) {
                 output: [],
               };
               const ctx = await engine.identify(entry, headers, body);
+              engine.recordStandaloneSearchRoute(
+                engine.config,
+                routed.target,
+                headers,
+                body,
+                ctx,
+              );
               const warmInput =
                 typeof body.input === "string"
                   ? [{ role: "user", content: body.input }]

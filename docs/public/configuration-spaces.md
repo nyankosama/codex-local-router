@@ -45,6 +45,14 @@ codex-local-router space diff default work
 
 Each confirmed Provider, model, route, Plugin, search, compression, or default-model change creates a new immutable revision only when content changed. Editing a dormant space appends a revision without changing the active installation. Choosing another model temporarily in Codex does not create a revision.
 
+The standalone-search default is part of the revision and drift boundary:
+
+```bash
+codex-local-router space set-search-source subscription --space work --yes
+```
+
+Per-target overrides and Provider search endpoints are versioned with the target/Provider. This never copies a search query, result, ChatGPT token, or Provider key into the space.
+
 Only credential references are versioned. Hidden input stores a Provider secret in macOS Keychain; the revision contains its service/account reference, not the secret. Environment references store only the variable name.
 
 ## Switch without interrupting Codex App

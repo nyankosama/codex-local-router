@@ -9,6 +9,7 @@ import {
   resolveCore,
   runCliExec,
   startIsolatedGateway,
+  verifyAcceptanceRevision,
   writeCatalog,
 } from "./lib/harness.mjs";
 import { FocusedAcceptanceBudget } from "./lib/focused-budget.mjs";
@@ -114,6 +115,13 @@ async function runCase({ name, marker, live }) {
     const searchItems = run.rows.filter((row) =>
       row.type === "item.completed" && ["web_search", "webSearch"].includes(row.item?.type),
     );
+    const clientItems = run.rows
+      .filter((row) => row.type?.startsWith("item.") && row.item?.type !== "agent_message")
+      .map((row) => ({
+        event: row.type,
+        type: row.item?.type ?? null,
+        status: row.item?.status ?? null,
+      }));
     const outbound = gateway.outbound.slice(beforeOutbound);
     const searchRequests = outbound.filter((event) => event.path.endsWith("/alpha/search"));
     const responseRequests = outbound.filter((event) => event.path.endsWith("/responses"));
@@ -149,8 +157,10 @@ async function runCase({ name, marker, live }) {
         official: event.official,
         subscriptionBearer: event.subscriptionBearer,
         accountHeader: event.accountHeader,
+        bodyShape: event.bodyShape,
         error: event.error ?? null,
       })),
+      clientItems,
     });
   } finally {
     budget.activeAbort = null;
@@ -159,7 +169,12 @@ async function runCase({ name, marker, live }) {
 
 let core;
 let harnessError = null;
+let implementation = { commit: "working-tree" };
 try {
+  implementation = await verifyAcceptanceRevision(
+    projectRoot,
+    process.env.ACCEPTANCE_COMMIT,
+  );
   await mkdir(work, { recursive: true, mode: 0o700 });
   const baseConfig = JSON.parse(
     await readFile(join(projectRoot, "config", "gateway.example.json"), "utf8"),
@@ -227,9 +242,7 @@ const summary = {
     cases.length === 2 && cases.every((entry) => entry.passed)
     ? "PASS"
     : "FAIL",
-  implementation: {
-    commit: process.env.ACCEPTANCE_COMMIT ?? "working-tree",
-  },
+  implementation,
   driver: core ? {
     source: core.source,
     version: core.version,

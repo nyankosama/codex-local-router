@@ -5,6 +5,11 @@ import {
   effectiveThirdPartyGptAllowlist,
   normalizePluginPolicy,
 } from "./tool-policy.mjs";
+import {
+  normalizeProviderSearchEndpoint,
+  resolveStandaloneSearchPolicy,
+  validateStandaloneSearchSource,
+} from "./standalone-search.mjs";
 const loopback = (h) => ["127.0.0.1", "localhost", "[::1]"].includes(h);
 const conditions = new Set([
   "modelID",
@@ -105,6 +110,24 @@ export function validate(input) {
   }
   // Also validates alias-normalized add/remove conflicts.
   effectiveThirdPartyGptAllowlist(c);
+  if (c.standaloneSearch != null) {
+    if (
+      !c.standaloneSearch ||
+      typeof c.standaloneSearch !== "object" ||
+      Array.isArray(c.standaloneSearch) ||
+      Object.keys(c.standaloneSearch).some((key) => key !== "thirdPartyGpt") ||
+      !c.standaloneSearch.thirdPartyGpt ||
+      typeof c.standaloneSearch.thirdPartyGpt !== "object" ||
+      Array.isArray(c.standaloneSearch.thirdPartyGpt) ||
+      Object.keys(c.standaloneSearch.thirdPartyGpt).some(
+        (key) => key !== "defaultSource",
+      )
+    ) throw Error("invalid standaloneSearch configuration");
+    validateStandaloneSearchSource(
+      c.standaloneSearch.thirdPartyGpt.defaultSource,
+      "standaloneSearch.thirdPartyGpt.defaultSource",
+    );
+  }
   for (const [id, target] of Object.entries(c.targets)) {
     const provider = c.providers[target.provider];
     if (!provider) continue;
@@ -145,6 +168,17 @@ export function validate(input) {
       throw Error("inline credentials forbidden");
     if (p.keychain && (!p.keychain.service || !p.keychain.account))
       throw Error("invalid keychain reference");
+    if (p.standaloneSearch != null) {
+      if (
+        !p.standaloneSearch ||
+        typeof p.standaloneSearch !== "object" ||
+        Array.isArray(p.standaloneSearch) ||
+        Object.keys(p.standaloneSearch).some((key) => key !== "endpoint")
+      ) throw Error(`invalid standalone search configuration for provider ${name}`);
+      p.standaloneSearch.endpoint = normalizeProviderSearchEndpoint(
+        p.standaloneSearch.endpoint,
+      );
+    }
     p.endpoints ??= {};
     if (Object.keys(p.endpoints).some((key) => !endpointKeys.has(key)))
       throw Error(`invalid endpoint key for provider ${name}`);
@@ -266,6 +300,37 @@ export function validate(input) {
       typeof t.app.supportsSearchTool !== "boolean"
     )
       throw Error(`invalid App search tool support for target ${name}`);
+    if (t.standaloneSearch != null) {
+      if (
+        !t.standaloneSearch ||
+        typeof t.standaloneSearch !== "object" ||
+        Array.isArray(t.standaloneSearch) ||
+        Object.keys(t.standaloneSearch).some((key) => key !== "source")
+      ) throw Error(`invalid standalone search configuration for target ${name}`);
+      validateStandaloneSearchSource(
+        t.standaloneSearch.source,
+        `standalone search source for target ${name}`,
+      );
+      if (t.app?.supportsSearchTool != null) {
+        const legacy = t.app.supportsSearchTool ? "subscription" : "disabled";
+        if (legacy !== t.standaloneSearch.source)
+          throw Error(`conflicting standalone search policy for target ${name}`);
+      }
+    }
+    const search = resolveStandaloneSearchPolicy(c, t);
+    const requiresStandaloneLite =
+      search.advertised && search.reason !== "legacy-native-search-compatibility";
+    if (requiresStandaloneLite && t.app?.enabled === true) {
+      if (t.app.useResponsesLite === false)
+        throw Error(`standalone search requires Responses Lite for target ${name}`);
+      t.app.useResponsesLite ??= true;
+    }
+    if (search.source === "provider") {
+      if (t.wireApi !== "responses" || t.app?.enabled !== true)
+        throw Error(`provider standalone search requires an App-enabled Responses target ${name}`);
+      if (!c.providers[t.provider].standaloneSearch?.endpoint)
+        throw Error(`provider standalone search endpoint is missing for target ${name}`);
+    }
   }
   const target = (x) => !!c.targets[x];
   if (c.defaultTarget === "passthrough") {

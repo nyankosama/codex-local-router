@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-09-13
+
+- Added a general standalone-search policy for third-party OpenAI GPT targets: subscription search by default, explicit Provider or disabled overrides, configuration-space versioning, CLI management, and effective catalog/diagnostic reporting while keeping embedded hosted search separate.
+- Added correlation-scoped search-route leases for HTTP and WebSocket turns plus an explicit Provider search relay that preserves response bytes and status while replacing subscription identity with the Provider credential; unavailable, disabled, or ambiguous routes now fail without cross-source fallback or retry.
+- Replaced the ai.feei-specific search boolean with the shared `openai-gpt` default, and added deterministic safety coverage plus a two-turn, privacy-preserving live acceptance harness with hard generation/search budgets and hashed search-result correlation evidence.
+- Switched standalone-search targets to the Codex Responses Lite `web.run` carrier, rejected mismatched hosted-search requests instead of silently changing the selected source, and live-validated the split path: Sol/Astra generation to ai.feei with search only through the user's OpenAI subscription.
+
 ## 0.3.1 - 2026-09-13
 
 - Made the official subscription WebSocket relay honor WebSocket, HTTP(S), generic proxy, and `NO_PROXY` environment settings instead of bypassing the machine proxy while HTTP relay traffic used it.

@@ -36,9 +36,13 @@ export function decide(config, ctx, requestedModel) {
   return { target: config.defaultTarget, rule: "default" };
 }
 
-export function planCapabilities(target, ctx) {
+export function planCapabilities(target, ctx, { standaloneSearchSource = null } = {}) {
   if (!ctx.requestedWebSearch) return { mode: "none" };
   if (target.capabilities?.nativeWebSearch) return { mode: "native" };
+  if (["subscription", "provider"].includes(standaloneSearchSource))
+    return { mode: "unsupported", reason: "standalone_search_protocol_mismatch" };
+  if (standaloneSearchSource === "disabled")
+    return { mode: "unsupported", reason: "standalone_search_disabled" };
   if (target.capabilities?.toolCalling) return { mode: "tool_fallback" };
   return { mode: "unsupported" };
 }

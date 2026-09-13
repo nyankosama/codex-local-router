@@ -1,14 +1,17 @@
 const exhausted = (code) => Object.assign(Error(code), { code });
 
 export class FocusedAcceptanceBudget {
-  constructor({ maxTurns = 5, maxGenerations = 10 } = {}) {
+  constructor({ maxTurns = 5, maxGenerations = 10, maxSearchRequests = Infinity } = {}) {
     this.maxTurns = maxTurns;
     this.maxGenerations = maxGenerations;
+    this.maxSearchRequests = maxSearchRequests;
     this.turns = 0;
     this.generations = 0;
     this.generationAttempts = 0;
     this.blockedGenerations = 0;
+    this.implicitRetries = 0;
     this.searchRequests = 0;
+    this.blockedSearchRequests = 0;
     this.activeAbort = null;
   }
 
@@ -22,6 +25,11 @@ export class FocusedAcceptanceBudget {
   beforeOutbound(event) {
     if (event.path.endsWith("/alpha/search")) {
       if (!event.official) throw exhausted("search_destination_rejected");
+      if (this.searchRequests >= this.maxSearchRequests) {
+        this.blockedSearchRequests++;
+        this.activeAbort?.();
+        throw exhausted("search_budget_exhausted");
+      }
       this.searchRequests++;
       return;
     }
@@ -30,6 +38,15 @@ export class FocusedAcceptanceBudget {
     if (!event.path.endsWith("/responses") || event.generate === false)
       return;
     this.generationAttempts++;
+    if (event.requestFingerprint && this.generationFingerprints?.has(event.requestFingerprint)) {
+      this.implicitRetries++;
+      this.blockedGenerations++;
+      this.activeAbort?.();
+      throw exhausted("implicit_model_retry_detected");
+    }
+    this.generationFingerprints ??= new Set();
+    if (event.requestFingerprint)
+      this.generationFingerprints.add(event.requestFingerprint);
     if (this.generations >= this.maxGenerations) {
       this.blockedGenerations++;
       this.activeAbort?.();
@@ -46,7 +63,12 @@ export class FocusedAcceptanceBudget {
       maxGenerations: this.maxGenerations,
       generationAttempts: this.generationAttempts,
       blockedGenerations: this.blockedGenerations,
+      implicitRetries: this.implicitRetries,
       searchRequests: this.searchRequests,
+      maxSearchRequests: Number.isFinite(this.maxSearchRequests)
+        ? this.maxSearchRequests
+        : null,
+      blockedSearchRequests: this.blockedSearchRequests,
     };
   }
 }

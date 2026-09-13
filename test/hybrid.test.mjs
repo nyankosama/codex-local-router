@@ -135,6 +135,81 @@ test("OpenCode session header is adapter-scoped", async () => {
   assert.equal(seen.headers["x-opencode-session"], undefined);
   assert.equal(seen.headers.authorization, undefined);
 });
+test("third-party GPT forwards only non-identity Codex compatibility headers", async (t) => {
+  const c = cfg();
+  c.providers.feei = {
+    adapter: "openai-compatible",
+    baseUrl: "https://ai.feei.cn/v1",
+    apiKeyEnv: "ROUTER_TEST_FEEI_KEY",
+  };
+  c.targets.feei = {
+    provider: "feei",
+    model: "gpt-5.6-sol",
+    modelFamily: "openai-gpt",
+    wireApi: "responses",
+    capabilities: { toolCalling: true },
+    app: { enabled: true, modelId: "feei-gpt" },
+  };
+  c.subscription.customModels["feei-gpt"] = "feei";
+  process.env.ROUTER_TEST_FEEI_KEY = "provider-only";
+  t.after(() => delete process.env.ROUTER_TEST_FEEI_KEY);
+  let seen;
+  const engine = new Engine(validate(c), {
+    send: async (_, options) => {
+      seen = options;
+      return json(result());
+    },
+  });
+  await collect(
+    engine,
+    {
+      model: "feei-gpt",
+      input: "hi",
+      client_metadata: {
+        session_id: "body-session",
+        "x-codex-installation-id": "installation-secret",
+      },
+      prompt_cache_key: "private-cache-key",
+    },
+    "subscription",
+    {
+      authorization: "Bearer official-test",
+      "chatgpt-account-id": "account-secret",
+      cookie: "cookie-secret",
+      "user-agent": "Codex Desktop/test",
+      originator: "Codex Desktop",
+      "x-codex-beta-features": "feature-a",
+      "x-openai-internal-codex-responses-lite": "false",
+      "x-client-request-id": "client-request-secret",
+      "x-codex-window-id": "window-secret",
+      "thread-id": "thread-secret",
+      "turn-id": "turn-secret",
+      "x-codex-turn-metadata": JSON.stringify({
+        thread_id: "thread-secret",
+        turn_id: "turn-secret",
+      }),
+    },
+  );
+  assert.equal(seen.headers.authorization, "Bearer provider-only");
+  assert.equal(seen.headers["user-agent"], "Codex Desktop/test");
+  assert.equal(seen.headers.originator, "Codex Desktop");
+  assert.equal(seen.headers["x-codex-beta-features"], "feature-a");
+  assert.equal(
+    seen.headers["x-openai-internal-codex-responses-lite"],
+    "false",
+  );
+  for (const name of [
+    "chatgpt-account-id",
+    "cookie",
+    "x-client-request-id",
+    "x-codex-window-id",
+    "thread-id",
+    "turn-id",
+    "x-codex-turn-metadata",
+  ]) assert.equal(seen.headers[name], undefined);
+  assert.equal(seen.body.client_metadata, undefined);
+  assert.equal(seen.body.prompt_cache_key, undefined);
+});
 test("Chat targets omit Codex namespace definitions but keep JSON functions", async () => {
   const c = cfg();
   c.defaultTarget = "chat";
@@ -369,6 +444,33 @@ test("native search passthrough and unavailable fallback errors", async () => {
       tools: [{ type: "web_search" }],
     }),
     /web_search_unavailable/,
+  );
+});
+test("third-party GPT standalone search rejects the hosted-search carrier", async () => {
+  const c = cfg();
+  c.targets.go.modelFamily = "openai-gpt";
+  c.standaloneSearch = { thirdPartyGpt: { defaultSource: "subscription" } };
+  delete c.webSearch;
+  c.targets.go.app = {
+    enabled: true,
+    modelId: "deepseek-v4.1-flash",
+    useResponsesLite: true,
+  };
+  await assert.rejects(
+    collect(new Engine(validate(c)), {
+      model: "deepseek-v4.1-flash",
+      tools: [{ type: "web_search" }],
+    }),
+    /standalone_search_protocol_mismatch/,
+  );
+
+  c.targets.go.standaloneSearch = { source: "disabled" };
+  await assert.rejects(
+    collect(new Engine(validate(c)), {
+      model: "deepseek-v4.1-flash",
+      tools: [{ type: "web_search" }],
+    }),
+    /standalone_search_disabled/,
   );
 });
 test("turn leases survive reload and reject mid-turn changes; next turn changes route", async () => {

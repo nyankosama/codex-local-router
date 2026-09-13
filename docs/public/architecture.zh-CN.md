@@ -31,6 +31,8 @@ Relay 保留 query、HTTP 方法、响应状态、实体字节、压缩、错误
 
 官方订阅不裁剪。第三方 GPT 默认只保留标准 Plugin 白名单，同时保留核心和用户 MCP。未知/冲突来源放行。筛选覆盖普通函数、namespace 和 `input[].additional_tools.tools`；被禁止的显式 `tool_choice` 返回 `tool_policy_conflict`，禁止的直接调用在交给客户端前返回 `disallowed_plugin_tool_call`。
 
+第三方 `openai-gpt` Responses target 会为 Codex 感知型中转保留不含身份的客户端协商 Header（`User-Agent`、`originator`、beta feature 和 Responses-Lite 声明）；订阅 Authorization、账号、Cookie、request/session/thread/turn/window/install 标识、turn metadata 及正文 client metadata 仍全部剥离。模型 target 确定后，Engine 会按账号哈希及 turn、thread、session 关联冻结独立搜索租约。官方模型强制选择订阅搜索；第三方 GPT 默认使用订阅，也可逐 target 显式选择兼容的 Provider endpoint 或禁用。当前 Codex 通过 Responses Lite 的 `web.run` namespace 暴露独立搜索；启用独立来源的 App target 因此使用 Lite，对未声明原生 hosted search 的 target，若仍收到顶层 hosted-search 载体则返回 `standalone_search_protocol_mismatch`，不会静默交给模型 Provider 执行。`/subscription/v1/alpha/search` 先验证订阅身份，再解析租约：订阅走固定官方 Relay；Provider 模式剥离全部 ChatGPT/Codex 身份 Header，只注入对应 Provider Key，并保留方法、query、实体字节、状态、压缩、SSE 与错误正文。来源不自动重试或切换；关联不唯一返回 `standalone_search_route_unresolved`，禁用返回 `standalone_search_disabled`。其他订阅路径继续透明转发，`/v1/alpha/search` 不开放。
+
 官方空间仅保存四个 Router 受管 Codex 字段及本地 catalog 的哈希快照。离开官方前比较当前受管投影，有变化就追加 official revision，永不替换 `official@1`。Router revision 保存归一化策略与凭证引用，不包含 Codex 账号或扩展数据。
 
 英文完整架构见 [architecture.md](architecture.md)。

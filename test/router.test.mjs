@@ -63,6 +63,33 @@ test("plans native, tool fallback and unsupported search", () => {
     "unsupported",
   );
 });
+test("rejects hosted search when a standalone search route is selected", () => {
+  const c = contextFromRequest({ tools: [{ type: "web_search" }] });
+  assert.deepEqual(
+    planCapabilities(config.targets.cheap, c, {
+      standaloneSearchSource: "subscription",
+    }),
+    { mode: "unsupported", reason: "standalone_search_protocol_mismatch" },
+  );
+  assert.deepEqual(
+    planCapabilities(config.targets.cheap, c, {
+      standaloneSearchSource: "provider",
+    }),
+    { mode: "unsupported", reason: "standalone_search_protocol_mismatch" },
+  );
+  assert.deepEqual(
+    planCapabilities(config.targets.cheap, c, {
+      standaloneSearchSource: "disabled",
+    }),
+    { mode: "unsupported", reason: "standalone_search_disabled" },
+  );
+  assert.equal(
+    planCapabilities(config.targets.strong, c, {
+      standaloneSearchSource: "disabled",
+    }).mode,
+    "native",
+  );
+});
 test("rejects invalid target references", () => {
   assert.throws(() => validate({ ...config, defaultTarget: "missing" }));
 });

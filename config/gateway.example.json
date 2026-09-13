@@ -42,6 +42,11 @@
       "excludedDefaultPlugins": []
     }
   },
+  "standaloneSearch": {
+    "thirdPartyGpt": {
+      "defaultSource": "subscription"
+    }
+  },
   "webSearch": {
     "backend": "tavily",
     "apiKeyEnv": "TAVILY_API_KEY",

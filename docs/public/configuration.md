@@ -5,7 +5,7 @@ The default configuration is stored under `~/Library/Application Support/Codex L
 Runtime configuration remains schema 3. Configuration-space storage is schema 1 and integration state is schema 4. Ownership is explicit:
 
 - global machine layer: `listen`, `access`, `history`, `maxBodyBytes`, `maxConnections`, `timeoutMs`, and the official catalog source path;
-- versioned space layer: route mode and target choice, `providers`, `targets`, `rules`, `pluginTools`, `webSearch`, subscription routing, available App models, and the default Codex model.
+- versioned space layer: route mode and target choice, `providers`, `targets`, `rules`, `pluginTools`, `webSearch`, `standaloneSearch`, subscription routing, available App models, and the default Codex model.
 
 `config.json` is the authority for global fields plus the materialized active Router-space fields. A manual change to the latter is drift and blocks switching until it is captured or reverted.
 
@@ -25,9 +25,9 @@ Within a Router space, schema 3 keeps three model-routing layers:
 
 - `providers`: base URL, adapter, endpoint paths, credential reference, message-phase policy, timeout, and concurrency.
 - `targets`: unique target ID, provider, upstream model, protocol, context window, input modalities, tools, reasoning levels, search, compression, and Codex catalog metadata.
-- global policy: routing, local access, history, request limits, subscription routing, and search fallback.
+- global policy: routing, local access, history, request limits, subscription routing, and standalone-search defaults.
 
-A target can name a versioned `preset`. Presets fill missing values; explicit target and provider values win. `opencode-go/deepseek-v4.1-flash` currently declares a 400,000-token configured window, image input, Responses, tools, streaming, summary compression, and reasoning levels through `max`. `feei/gpt-5.6-sol` and `feei/gpt-6-astra` declare standard Responses, text and image input, freeform tools, summary compression, and a conservative 272,000-token configured window. These declarations are specific to each provider-model pair and do not prove a provider's larger capacity.
+A target can name a versioned `preset`. Presets fill missing values; explicit target and provider values win. `opencode-go/deepseek-v4.1-flash` currently declares a 400,000-token configured window, image input, Responses, tools, streaming, summary compression, and reasoning levels through `max`. `feei/gpt-5.6-sol` and `feei/gpt-6-astra` declare Responses Lite tool transport, text and image input, freeform tools, summary compression, and a conservative 272,000-token configured window. These declarations are specific to each provider-model pair and do not prove a provider's larger capacity.
 
 ## Third-party GPT Plugin policy
 
@@ -63,6 +63,36 @@ There is one standard allowlist: `github`, `figma`, `sites`, and `connected_docu
 An alias-normalized name cannot be present in both arrays. Codex built-ins, `codex_app`, `cua_repl`, router search tools, and MCP servers configured by the user always pass. Skills, Hooks, and prompt/history text are never rewritten. A confirmed Plugin outside the list is removed; an unknown or colliding source passes with a metadata-only diagnostic.
 
 The filter covers ordinary functions, namespace tools, and `input[].additional_tools.tools`. An explicit `tool_choice` that selects a removed Plugin fails with `tool_policy_conflict`. If an upstream nevertheless emits a confirmed forbidden Plugin call, the router ends the turn with `disallowed_plugin_tool_call` before the call reaches the client; this policy failure never triggers model fallback.
+
+## Standalone search routing
+
+Standalone client search is separate from `capabilities.nativeWebSearch`, which still means an embedded provider-hosted Responses tool. Current Codex exposes standalone search as the Responses Lite `web.run` namespace, so an App-enabled target with an active standalone source uses Responses Lite; an explicit `useResponsesLite: false` combination is rejected. Official models always use the fixed ChatGPT subscription backend. A third-party `modelFamily: "openai-gpt"` target defaults to the user's subscription search, provided the user is signed in to Codex and the runtime search setting allows it. Other and legacy targets keep their prior behavior.
+
+The source precedence is: official model, explicit target policy, legacy explicit `app.supportsSearchTool`, third-party GPT space default, then unchanged legacy behavior. Sources are `subscription`, `provider`, and `disabled`:
+
+```json
+{
+  "standaloneSearch": {
+    "thirdPartyGpt": { "defaultSource": "subscription" }
+  },
+  "providers": {
+    "my-provider": {
+      "baseUrl": "https://api.example.com/v1",
+      "standaloneSearch": { "endpoint": "alpha/search" }
+    }
+  },
+  "targets": {
+    "my-gpt": {
+      "modelFamily": "openai-gpt",
+      "standaloneSearch": { "source": "provider" }
+    }
+  }
+}
+```
+
+Provider search is opt-in: it requires an App-enabled Responses target and an explicit endpoint. The endpoint is joined to `baseUrl`; absolute URLs, query/fragment components, traversal, encoded traversal, and cross-origin destinations are rejected. The router never falls back between subscription, Provider, Tavily, or Exa when the selected source is unavailable. A disabled route returns `standalone_search_disabled`; a search that cannot be associated uniquely with a model turn returns `standalone_search_route_unresolved`.
+
+The old `app.supportsSearchTool` field and CLI flags remain input compatibility aliases. `true` maps to subscription and `false` to disabled. New CLI writes remove the old field, and a conflicting old/new declaration is invalid. The generated catalog's `supports_search_tool` is derived from the effective policy.
 
 `history.observationWaitMs` optionally sets the bounded wait for an in-flight official-history observation when the very next turn switches providers; the default is 2,000 ms. Ordinary official responses finish without waiting for observation parsing or disk I/O.
 
@@ -146,14 +176,14 @@ codex-local-router model add --id feei-astra --provider feei \
   --preset feei/gpt-6-astra --yes
 ```
 
-The App-visible IDs intentionally remain `feei-gpt-5.6-sol` and `feei-gpt-6-astra`; they do not impersonate official catalog IDs. The presets set `modelFamily: "openai-gpt"`, `useResponsesLite: false`, and `app.supportsSearchTool: true`. The last field advertises the App's standalone search path. It is independent from `capabilities.nativeWebSearch`, which remains false because the presets do not claim that ai.feei implements an embedded hosted-search tool. Codex still honors the user's runtime search setting; the router does not force search on.
+The App-visible IDs intentionally remain `feei-gpt-5.6-sol` and `feei-gpt-6-astra`; they do not impersonate official catalog IDs. The presets set `modelFamily: "openai-gpt"` and `useResponsesLite: true`, so Codex exposes standalone `web.run` while the target inherits the third-party GPT subscription-search default instead of carrying an ai.feei-specific search boolean. `capabilities.nativeWebSearch` remains false because the presets do not claim that ai.feei implements an embedded hosted-search tool. Codex still honors the user's runtime search setting; the router does not force search on. A top-level hosted-search request is rejected when a standalone source is selected, preventing silent execution by the wrong provider. For Codex-aware relay compatibility, third-party GPT Responses sends retain only the non-identity client negotiation headers; subscription credentials and all account/session/request/install correlation remain local. OpenAI's custom-provider documentation likewise requires a compatible endpoint and model/runtime support for standalone search: [Web search](https://learn.chatgpt.com/docs/web-search).
 
 Declarations are validated rather than guessed:
 
 - `--context-window` is required by schema 3. Too small a value causes premature summarization; too large a value defers the failure to the upstream.
 - `--compression` states what the channel can do with a full history: `native` (the channel accepts the stored original directly and an explicit same-account compatibility target set is required), `summary` (one source-model summary is allowed after an explicit context-limit rejection), or `unsupported` (never lossy).
 - `--input-modalities` must match the channel. `chat_completions` targets cannot accept images. An image sent to a text-only target is described by a configured source model when one exists, otherwise the request is rejected with `image_migration_unavailable`.
-- `--no-tools`, `--no-streaming`, `--freeform-tools`, and `--native-search` (Responses only) keep the declared capabilities honest. `--supports-search-tool` controls the separate App standalone-search declaration. A chat_completions target cannot declare `--native-search`.
+- `--no-tools`, `--no-streaming`, `--freeform-tools`, and `--native-search` (Responses only) keep the declared capabilities honest. `--search-source subscription|provider|disabled` controls standalone search; `--supports-search-tool` and `--no-supports-search-tool` remain compatibility aliases and conflict with the new flag. An active standalone source defaults to Responses Lite; explicitly combining it with `--no-responses-lite` is invalid. A chat_completions target cannot declare `--native-search` or Provider standalone search.
 - `--model-family openai-gpt|other` opts a target into the corresponding default. `--plugin-policy passthrough|third-party-gpt-default|allowlist` selects an explicit policy; `--allowed-plugins` is required with `allowlist`.
 - Credentials are never inline. `--credential-prompt` or `--credential-stdin` stores the value in macOS Keychain; `--api-key-env` works for foreground runs, but the managed LaunchAgent does not import your shell environment, so Keychain is the reliable choice for a service.
 - A target appears in the Codex App menu only when it is App-enabled; `--no-app` keeps it routable but hidden. `model remove` refuses while a target is selected by `defaultTarget`, `fixedTarget`, or `passthroughTarget`.

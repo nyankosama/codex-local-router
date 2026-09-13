@@ -1,6 +1,7 @@
 # 验收说明
 
 本次配置空间候选记录见[配置空间候选验收报告](configuration-spaces-acceptance.zh-CN.md)。
+v0.4.0 第三方独立搜索记录见[第三方 OpenAI 搜索验收报告](third-party-openai-search-acceptance.zh-CN.md)。隔离 CLI/App 协议真实门禁已通过；App UI 和本机安装生效仍需单独确认。
 
 PR 门禁使用 A1-A10 十组等价类：策略解析、来源/名单、工具载体、调用闭环、HTTP 透明性、WS 生命周期、身份边界、历史兼容、产品/隔离、证据/预算。它们由纯函数和本地模拟上游完成，不调用真实模型。
 
@@ -22,6 +23,16 @@ npm run e2e:official-search -- --run
 
 它先通过 Router 的生产级官方 WebSocket 客户端执行一次零生成握手探针并要求 HTTP 101，然后只运行两个隔离的官方订阅短 turn：第一轮不设置 `web_search`、不要求用户增加参数，验证 Codex 正常的 cached 默认模式；第二轮使用单次 `--search` 覆盖，验证 live 模式。两轮都必须看到当前 Codex 版本所选择的官方 Responses 传输成功、固定 OpenAI 目的地的 `/alpha/search` 成功、客户端 `web_search` 完成事件、回答中的来源 hostname，以及不存在第三方出站。预算固定为两个 turn、最多六次生成（一次搜索 turn 可能包含多次模型与工具续接），不保存提示或回答正文。
 
+第三方 GPT 搜索路由使用独立的两轮 canary：
+
+```bash
+npm run e2e:third-party-search -- --run
+```
+
+第一轮在隔离 CLI 中选择 ai.feei Sol，不传 `--search`、不写 `web_search`，验证 Codex 的 cached 默认；第二轮通过 `app-server` 选择 ai.feei Astra，并仅在隔离配置设置 `web_search = "live"`。硬预算是两个 turn、十二次模型生成、八次搜索，无重试循环；完全相同的生成 payload 会在第二次发送前被 fail-fast 拦截。该上限覆盖真实观察到的 Responses Lite search/open/read 阶段，同时仍能阻断异常循环。
+
+每轮必须同时看到：客户端搜索 item 完成；搜索请求全部到 `chatgpt.com`；第三方生成全部到 `ai.feei.cn`；订阅凭证和 Provider Key 只出现在各自链路；成功搜索响应中至少一个 URL 的内存哈希能在后续第三方请求中匹配；最终回答包含来源。证据只落 URL/响应哈希、数量、host、状态、字节、耗时和布尔值，不落查询、结果、URL、提示、回答或凭证。Provider Key 可来自 `FEEI_API_KEY` 或只读 Keychain 引用，均不会打印或复制。
+
 最终候选另有显式真实验收：
 
 ```bash
@@ -32,7 +43,7 @@ FEEI_API_KEY=... npm run e2e:focused -- --run
 
 每个 App 用例必须同时看到：裁剪前存在禁止 Plugin、裁剪后消失；GitHub 与用户 MCP 定义仍在；用户 MCP 返回的随机合成 marker 出现在最终回答；至少两个工具调用完成；独立搜索成功且只到 OpenAI。缺少证据就是 FAIL。
 
-所有过程使用隔离的 `CODEX_HOME`、Router 状态、实例、临时工作区、随机端口和临时加密历史。证据只保存模型/工具类型、来源标识、哈希、状态、数量、字节和耗时，不保存提示、回答、工具 schema、凭证、图片或本地绝对路径。
+所有过程使用隔离的 `CODEX_HOME`、Router 状态、实例、临时工作区、随机端口和临时加密历史。证据只保存模型/工具类型、来源标识、哈希、状态、数量、字节和耗时，不保存提示、回答、搜索查询/结果/URL、工具 schema、凭证、图片或本地绝对路径。
 
 自动 app-server 验收不能替代 UI。最终报告必须把“实现完成”“自动验收通过”“本机已生效”“App UI 已确认”分开列出。
 
