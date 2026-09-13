@@ -14,6 +14,14 @@ npm run audit:package
 npm run e2e:l0
 ```
 
+官方搜索另有一个窄范围真实 canary：
+
+```bash
+npm run e2e:official-search -- --run
+```
+
+它先通过 Router 的生产级官方 WebSocket 客户端执行一次零生成握手探针并要求 HTTP 101，然后只运行两个隔离的官方订阅短 turn：第一轮不设置 `web_search`、不要求用户增加参数，验证 Codex 正常的 cached 默认模式；第二轮使用单次 `--search` 覆盖，验证 live 模式。两轮都必须看到当前 Codex 版本所选择的官方 Responses 传输成功、固定 OpenAI 目的地的 `/alpha/search` 成功、客户端 `web_search` 完成事件、回答中的来源 hostname，以及不存在第三方出站。预算固定为两个 turn、最多六次生成（一次搜索 turn 可能包含多次模型与工具续接），不保存提示或回答正文。
+
 最终候选另有显式真实验收：
 
 ```bash

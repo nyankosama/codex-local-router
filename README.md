@@ -19,6 +19,8 @@ The router preserves the user's Codex login, keeps subscription and third-party 
 
 Official subscription traffic uses a dedicated transparent relay. Only an explicitly configured custom model, or a request that must restore router-owned virtual history, enters the model engine. This keeps current and future official auxiliary APIs such as model discovery and standalone search compatible without opening the same identity on `/v1`.
 
+The relay does not enable or disable search. Codex keeps its normal search mode (cached by default, or live when the user selects it), while the router forwards official HTTP and WebSocket traffic through the configured `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `WS_PROXY`, or `WSS_PROXY` environment and honors `NO_PROXY`.
+
 Third-party GPT targets can use a conservative Plugin allowlist to reduce the large client-supplied Plugin surface. Codex built-ins and user-configured MCP servers are not filtered. Non-GPT and legacy targets remain passthrough unless the user explicitly selects a policy.
 
 ## Supported scope
@@ -29,15 +31,15 @@ Third-party GPT targets can use a conservative Plugin allowlist to reduce the la
 - Responses and Chat Completions providers
 - ChatGPT subscription routing, OpenCode Go, ai.feei GPT presets, and generic OpenAI-compatible providers
 
-Other operating systems and vendor-specific protocols are not claimed as supported in v0.3.0.
+Other operating systems and vendor-specific protocols are not claimed as supported in v0.3.1.
 
 ## Install from a GitHub Release
 
-Download the `.tgz` and SHA-256 file from the `v0.3.0` release, verify it, and install it locally:
+Download the `.tgz` and SHA-256 file from the `v0.3.1` release, verify it, and install it locally:
 
 ```bash
-shasum -a 256 -c codex-local-router-0.3.0.tgz.sha256
-npm install -g ./codex-local-router-0.3.0.tgz
+shasum -a 256 -c codex-local-router-0.3.1.tgz.sha256
+npm install -g ./codex-local-router-0.3.1.tgz
 codex-local-router --version
 ```
 

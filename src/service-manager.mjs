@@ -39,8 +39,8 @@ export function renderLaunchAgent({
 }) {
   const variables = { GATEWAY_CONFIG: config, GATEWAY_STATE_PATH: state };
   for (const key of [
-    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "WS_PROXY", "WSS_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy", "ws_proxy", "wss_proxy",
   ]) if (env[key]) variables[key] = env[key];
   const environment = Object.entries(variables)
     .map(([key, value]) => `    <key>${key}</key><string>${xml(value)}</string>`)

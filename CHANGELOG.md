@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-09-13
+
+- Made the official subscription WebSocket relay honor WebSocket, HTTP(S), generic proxy, and `NO_PROXY` environment settings instead of bypassing the machine proxy while HTTP relay traffic used it.
+- Added redacted official-WebSocket transport attribution and a two-turn official-only search canary covering the normal cached default and the explicit live override without changing user search settings.
+- Updated the focused acceptance driver for Codex CLI versions where `--search` is a top-level one-run option.
+
 ## 0.3.0 - 2026-09-13
 
 - Added immutable, content-addressed configuration spaces containing providers, models, default model, routing, Plugin, search, compression, and subscription-routing policy, while machine listener/access/history/resource settings remain global.

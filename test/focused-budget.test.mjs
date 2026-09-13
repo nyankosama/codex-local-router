@@ -39,3 +39,14 @@ test("A10 focused acceptance permits official search only and ignores non-genera
   );
   assert.equal(budget.searchRequests, 1);
 });
+
+test("A10 focused acceptance counts compressed official Responses without decoded model metadata", () => {
+  const budget = new FocusedAcceptanceBudget();
+  budget.beforeOutbound({ path: "/backend-api/codex/responses", official: true });
+  budget.beforeOutbound({
+    path: "/backend-api/codex/responses",
+    official: true,
+    generate: false,
+  });
+  assert.equal(budget.generations, 1);
+});

@@ -48,8 +48,11 @@ npm run e2e:l1     # isolated cases E2E-1/2/3/5
 npm run e2e:l2     # pre-release capacity case E2E-4
 npm run e2e:live   # concurrency against a running service (E2E-6)
 npm run e2e        # gate plus every case, pre-release last
+npm run e2e:official-search -- --run  # two-turn official cached-default + explicit-live search
 npm run e2e:focused -- --run  # explicit five-turn official + ai.feei candidate acceptance
 ```
+
+`e2e:official-search` is the narrow official-only canary. It first makes a zero-generation handshake probe through the Router's production official-WebSocket client and requires HTTP 101. Its first isolated CLI turn then leaves `web_search` unset and verifies the normal cached default without requiring a new user flag. Its second turn passes the one-run `--search` override to verify live search. Both turns require a successful official Responses exchange over the transport selected by the current Codex build, a successful fixed-origin `/alpha/search` request, a completed `web_search` client item, a source hostname in the answer, and no non-OpenAI outbound destination. The runner allows exactly two turns and at most six generation requests because one search turn can require multiple model/tool continuations; it stores no prompt or response body.
 
 The live case only runs outside your own usage window, requires `activeTurns == 0` before it starts, uses four short sessions, and can be aborted at any time. It does not restart the service and does not change configuration.
 

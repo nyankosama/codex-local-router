@@ -1,6 +1,6 @@
 # Compatibility matrix
 
-| Component | v0.3.0 status |
+| Component | v0.3.1 status |
 |---|---|
 | macOS | Supported |
 | Node.js 22 | Supported; Node currently labels built-in SQLite experimental |
@@ -11,7 +11,7 @@
 | ai.feei GPT 5.6 Sol / GPT 6 Astra Responses | Built-in configuration presets; live result belongs to each candidate report |
 | Generic OpenAI-compatible Responses | Configuration support; provider capability requires live probe |
 | Generic OpenAI-compatible Chat Completions | Configuration support with JSON function tools |
-| Linux / Windows | Not supported in v0.3.0 |
+| Linux / Windows | Not supported in v0.3.1 |
 | Runtime configuration schema 3 | Preserved; active Router space materializes into the existing format |
 | Configuration-space schema 1 | Local immutable revisions and one switch transaction |
 | Integration state schema 4 | Links protected official and materialized Router revisions |
@@ -38,3 +38,5 @@ Consequences and limits:
 `app.supportsSearchTool` controls whether the generated Codex catalog advertises the client's standalone search capability. It is intentionally separate from `capabilities.nativeWebSearch`, which declares a provider-hosted tool embedded in model generation. The ai.feei presets enable the former and leave the latter disabled.
 
 Search only works when the Codex runtime, selected catalog model, and user search setting all allow it. The router does not override a user-disabled setting. Under `/subscription/v1`, standalone search is relayed to the fixed OpenAI backend and is not subject to the Plugin allowlist. `/v1/alpha/search` remains unavailable, so a local API key cannot acquire subscription identity.
+
+Official HTTP and secure WebSocket relays share the machine's proxy boundary. WebSocket-specific `WS_PROXY` / `WSS_PROXY` take precedence when present; `HTTP_PROXY` / `HTTPS_PROXY` are compatible fallbacks, `ALL_PROXY` remains the generic fallback, and `NO_PROXY` is honored. Proxy credentials are handled by the proxy agent and are never copied into the official end-to-end header set or Router logs.

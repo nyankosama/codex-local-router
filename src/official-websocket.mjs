@@ -1,4 +1,6 @@
 import WebSocket from "ws";
+import { ProxyAgent } from "proxy-agent";
+import { getProxyForUrl } from "proxy-from-env";
 import { fail } from "./errors.mjs";
 import { relayRequestHeaders } from "./official-relay.mjs";
 
@@ -8,9 +10,57 @@ export const OFFICIAL_RESPONSES_WEBSOCKET =
 const terminal = (event) =>
   ["response.completed", "response.incomplete", "error"].includes(event?.type);
 
+const connectionFailureCategory = (error) => {
+  const code = error?.code ?? error?.cause?.code;
+  const message = String(error?.message ?? error?.cause?.message ?? "");
+  if (code === "ETIMEDOUT" || /timed?\s*out/i.test(message)) return "timeout";
+  if (["ENOTFOUND", "EAI_AGAIN"].includes(code) || /getaddrinfo/i.test(message)) return "dns";
+  if (code === "ECONNREFUSED") return "connect";
+  if (["ECONNRESET", "EPIPE"].includes(code)) return "receive";
+  if (/\b407\b|proxy authentication/i.test(message)) return "proxy_auth";
+  if (/proxy|tunnel/i.test(message)) return "proxy_connect";
+  if (/certificate|ssl|tls/i.test(message)) return "tls";
+  return "other";
+};
+
+const connectionFailure = (error) => {
+  const failure = fail("upstream_connection_error", 502);
+  failure.transportCategory = connectionFailureCategory(error);
+  return failure;
+};
+
+export function officialWebSocketProxyForUrl(
+  url,
+  resolve = getProxyForUrl,
+  env = process.env,
+) {
+  const compatible = new URL(url);
+  let websocketVariable;
+  if (compatible.protocol === "wss:") {
+    websocketVariable = env.wss_proxy ?? env.WSS_PROXY;
+    compatible.protocol = "https:";
+  } else if (compatible.protocol === "ws:") {
+    websocketVariable = env.ws_proxy ?? env.WS_PROXY;
+    compatible.protocol = "http:";
+  } else return "";
+  if (websocketVariable) return resolve(url);
+  return resolve(compatible.href);
+}
+
+export const createOfficialWebSocketAgent = ({
+  resolveProxy = getProxyForUrl,
+  env = process.env,
+  ...options
+} = {}) => new ProxyAgent({
+  ...options,
+  getProxyForUrl: (url) => officialWebSocketProxyForUrl(url, resolveProxy, env),
+});
+
 export class OfficialWebSocketSession {
   constructor(headers, options = {}) {
     this.headers = relayRequestHeaders(headers, { websocket: true });
+    this.agent = options.agent ?? createOfficialWebSocketAgent(options.proxyAgentOptions);
+    this.ownsAgent = options.agent == null;
     this.createSocket =
       options.createSocket ??
       ((url, socketOptions) => new WebSocket(url, socketOptions));
@@ -28,12 +78,25 @@ export class OfficialWebSocketSession {
       return this.socket;
     if (this.connecting) return this.connecting;
     this.connecting = new Promise((resolve, reject) => {
-      const socket = this.createSocket(this.url, {
-        headers: this.headers,
-        perMessageDeflate: false,
-        followRedirects: false,
-        maxPayload: this.maxPayload,
-      });
+      let socket;
+      try {
+        socket = this.createSocket(this.url, {
+          agent: this.agent,
+          headers: this.headers,
+          perMessageDeflate: false,
+          followRedirects: false,
+          maxPayload: this.maxPayload,
+        });
+      } catch (error) {
+        const failure = connectionFailure(error);
+        this.log({
+          event: "official_ws_connect_failed",
+          transport: "websocket",
+          transport_category: failure.transportCategory,
+        });
+        reject(failure);
+        return;
+      }
       this.socket = socket;
       const abort = () => {
         socket.terminate?.();
@@ -46,9 +109,15 @@ export class OfficialWebSocketSession {
         socket.on("error", (error) => this.failed(error));
         resolve(socket);
       };
-      const failed = () => {
+      const failed = (error) => {
         cleanup();
-        reject(fail("upstream_connection_error", 502));
+        const failure = connectionFailure(error);
+        this.log({
+          event: "official_ws_connect_failed",
+          transport: "websocket",
+          transport_category: failure.transportCategory,
+        });
+        reject(failure);
       };
       const cleanup = () => {
         signal?.removeEventListener("abort", abort);
@@ -123,11 +192,11 @@ export class OfficialWebSocketSession {
     }
   }
 
-  failed() {
+  failed(error) {
     if (this.active) {
       const active = this.active;
       this.active = null;
-      active.reject(fail("upstream_connection_error", 502));
+      active.reject(connectionFailure(error));
     }
   }
 
@@ -165,7 +234,7 @@ export class OfficialWebSocketSession {
         if (!error) return;
         signal?.removeEventListener("abort", abort);
         if (this.active === active) this.active = null;
-        rejectTurn(fail("upstream_connection_error", 502));
+        rejectTurn(connectionFailure(error));
       };
       socket.send(data, { binary: !!isBinary }, done);
     });
@@ -174,5 +243,6 @@ export class OfficialWebSocketSession {
   close() {
     this.socket?.close?.(1000);
     this.socket = null;
+    if (this.ownsAgent) this.agent?.destroy?.();
   }
 }

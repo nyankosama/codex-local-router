@@ -222,7 +222,7 @@ async function captureCurrentToolShape() {
   }
 }
 
-async function cliCase(name, model, prompt, image) {
+async function cliCase(name, model, prompt, image, options = {}) {
   budget.beginTurn();
   const controller = new AbortController();
   budget.activeAbort = () => controller.abort();
@@ -232,6 +232,7 @@ async function cliCase(name, model, prompt, image) {
       home: codexHome,
       cwd: work,
       prompt,
+      globalArgs: options.liveSearch ? ["--search"] : [],
       args: [
         "--ephemeral", "--skip-git-repo-check", "-C", work, "-s", "read-only",
         "-c", 'approval_policy="never"', "-m", model,
@@ -316,6 +317,8 @@ try {
     "official-cli-search",
     "gpt-5.6-sol",
     "Use standalone web search on the public OpenAI Codex web-search documentation, mention one source host, then end with OFFICIAL_SEARCH_OK. Do not use any other tool.",
+    undefined,
+    { liveSearch: true },
   );
   const officialSearches = gateway.outbound.filter((event) => event.path.endsWith("/alpha/search"));
   const officialSearchCompleted = officialSearches.some(
