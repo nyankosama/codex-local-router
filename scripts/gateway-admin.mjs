@@ -8,8 +8,9 @@ import { loadConfig, upgradeConfig, validate } from "../src/config.mjs";
 import { buildModelCatalog } from "../src/model-catalog.mjs";
 import { readRollout, importRollout } from "../src/rollout.mjs";
 import { loadCodexAuth } from "../src/local-identity.mjs";
-import { createConfig, rawConfig, writeConfigTransaction } from "../src/config-store.mjs";
+import { configDiff, createConfig, rawConfig, writeConfigTransaction } from "../src/config-store.mjs";
 import {
+  appIsRunning,
   discoverCodex,
   disableIntegration,
   integrationStatus,
@@ -20,6 +21,7 @@ import {
   installService,
   serviceStatus,
   stopService,
+  uninstallSpaceSwitcher,
   uninstallService,
 } from "../src/service-manager.mjs";
 import {
@@ -28,9 +30,41 @@ import {
   encryptHistoryPayload,
   historyResumePrompt,
 } from "../src/history-package.mjs";
-import { atomicJSON, atomicWrite } from "../src/files.mjs";
+import { atomicJSON, atomicWrite, withFileLock } from "../src/files.mjs";
 import { PACKAGE_VERSION, PRODUCT_NAME, runtimePaths } from "../src/product.mjs";
 import { credential } from "../src/providers.mjs";
+import {
+  resolvePluginToolPolicy,
+  toolSourceStatus,
+} from "../src/tool-policy.mjs";
+import { discoverToolSources } from "../src/tool-sources.mjs";
+import {
+  DEFAULT_SPACE,
+  OFFICIAL_SPACE,
+  SPACE_CONFIG_KEYS,
+  appendSpaceRevision,
+  availableCodexModels,
+  captureRouterSpace,
+  commitSpaceActivation,
+  composeRuntimeConfig,
+  createSpace,
+  detectSpaceDrift,
+  diffSpaceRevisions,
+  initializeSpaces,
+  listConfigurationSpaces,
+  materializeRuntimeConfig,
+  parseSpaceRef,
+  readSpaceIndex,
+  readSpaceTransaction,
+  resolveSpace,
+  spaceHistory,
+} from "../src/config-spaces.mjs";
+import {
+  beginSpaceSwitch,
+  cancelSpaceSwitch,
+  configurationSpaceStatus,
+  resumeSpaceSwitch,
+} from "../src/space-switch.mjs";
 
 const args = process.argv.slice(2);
 const positional = [];
@@ -49,6 +83,21 @@ const env = process.env;
 const paths = runtimePaths(env);
 const configPath = resolve(value("config") ?? paths.config);
 const jsonMode = flag("json");
+
+function requestedPluginPolicy(current) {
+  const mode = value("plugin-policy");
+  if (!mode) return current;
+  if (["passthrough", "third-party-gpt-default"].includes(mode)) return mode;
+  if (mode !== "allowlist")
+    throw Object.assign(Error("--plugin-policy must be passthrough, third-party-gpt-default or allowlist"), { code: "usage_error" });
+  const allowed = value("allowed-plugins");
+  if (allowed == null)
+    throw Object.assign(Error("allowlist policy requires --allowed-plugins"), { code: "usage_error" });
+  return {
+    mode: "allowlist",
+    allowedPlugins: allowed.split(",").map((item) => item.trim()).filter(Boolean),
+  };
+}
 
 function emit(value, human) {
   console.log(jsonMode || !human ? JSON.stringify(value, null, 2) : human(value));
@@ -190,12 +239,161 @@ const describeDiff = (diff) => diff
   .map((item) => `${item.path}: ${JSON.stringify(item.before)} -> ${JSON.stringify(item.after)}`)
   .join("\n");
 
+async function routerSpaceContext(explicit = value("space")) {
+  const index = await readSpaceIndex(env);
+  if (!index)
+    throw Object.assign(Error("configuration spaces are not initialized; run `space init` or `setup`"), {
+      code: "spaces_not_initialized",
+    });
+  const name = explicit ?? index.active?.space;
+  if (name === OFFICIAL_SPACE)
+    throw Object.assign(Error("official is not a Router space; specify --space NAME"), {
+      code: "official_space_read_only",
+    });
+  const parsed = parseSpaceRef(name);
+  if (parsed.revision != null)
+    throw Object.assign(Error("space edits target the latest revision; omit @REV"), {
+      code: "space_revision_read_only",
+    });
+  const entry = index.spaces[parsed.space];
+  if (!entry || entry.kind !== "router")
+    throw Object.assign(Error(`Router space does not exist: ${parsed.space}`), {
+      code: "space_not_found",
+    });
+  const revision = await resolveSpace(`${parsed.space}@${entry.latestRevision}`, env);
+  const global = await rawConfig(configPath);
+  return {
+    index,
+    name: parsed.space,
+    revision,
+    config: await materializeRuntimeConfig(global, revision),
+  };
+}
+
+async function loadCommandConfig() {
+  const index = await readSpaceIndex(env);
+  if (!index) return loadConfig(configPath);
+  return (await routerSpaceContext()).config;
+}
+
+async function mutateSpaceConfig(mutator, label, options = {}) {
+  const context = await routerSpaceContext();
+  if (context.index.active?.space === context.name) {
+    const pending = await readSpaceTransaction(env);
+    if (pending)
+      throw Object.assign(Error(`a switch to ${pending.target.space}@${pending.target.revision} is already pending`), {
+        code: "space_switch_pending",
+      });
+    const drift = await detectSpaceDrift({ env, configPath });
+    if (drift.drift)
+      throw Object.assign(Error("the active Router config has drift; run `space capture` first"), {
+        code: "space_config_drift",
+      });
+  }
+  const after = structuredClone(context.config);
+  await mutator(after);
+  const normalized = structuredClone(validate(after));
+  const diff = configDiff(context.config, normalized);
+  const nextDefaultModel = options.defaultCodexModel ?? context.revision.defaultCodexModel;
+  if (nextDefaultModel !== context.revision.defaultCodexModel)
+    diff.unshift({
+      path: "defaultCodexModel",
+      before: context.revision.defaultCodexModel,
+      after: nextDefaultModel,
+    });
+  const apply = await confirm(`${label}:\n${describeDiff(diff)}`);
+  if (!apply)
+    return emit({ changed: diff.length > 0, applied: false, diff }, () =>
+      `${label} preview only; re-run with --yes to apply.`);
+  await options.beforeApply?.();
+  const appended = await appendSpaceRevision(context.name, {
+    kind: "router",
+    source: options.source ?? label,
+    config: normalized,
+    defaultCodexModel: nextDefaultModel,
+  }, { env, expectedLatestRevision: context.revision.revision });
+  let switching = null;
+  if (appended.changed && context.index.active?.space === context.name)
+    switching = await beginSpaceSwitch(
+      `${context.name}@${appended.revision.revision}`,
+      { env, configPath },
+    );
+  const result = {
+    changed: appended.changed,
+    applied: true,
+    diff,
+    space: context.name,
+    revision: appended.revision.revision,
+    switch: switching,
+  };
+  emit(result, (x) => x.switch?.pending
+    ? `${label} saved as ${x.space}@${x.revision}; activation is pending Codex App quit.`
+    : x.changed
+      ? `${label} saved as ${x.space}@${x.revision}.`
+      : `${label} made no content change.`);
+  return result;
+}
+
+async function upgradeSpaceConfig() {
+  const context = await routerSpaceContext();
+  const upgraded = upgradeConfig(context.config);
+  if (!upgraded.changes.length)
+    return emit({ applied: false, changes: [], space: context.name }, () =>
+      "Configuration space is already current.");
+  const diff = configDiff(context.config, upgraded.config);
+  if (!flag("apply"))
+    return emit({ applied: false, changes: upgraded.changes, diff, space: context.name }, () =>
+      "Configuration space upgrade preview only; add --apply --yes to apply.");
+  const apply = await confirm(`Upgrade ${context.name}:\n${describeDiff(diff)}`);
+  if (!apply) return emit({ applied: false, changes: upgraded.changes, diff }, () => "No changes applied.");
+
+  const currentRaw = await rawConfig(configPath);
+  const managed = new Set(SPACE_CONFIG_KEYS);
+  const globalAfter = structuredClone(currentRaw);
+  for (const [key, next] of Object.entries(upgraded.config)) {
+    if (managed.has(key) || key === "subscription") continue;
+    globalAfter[key] = structuredClone(next);
+  }
+  globalAfter.subscription ??= {};
+  if (upgraded.config.subscription?.catalogPath)
+    globalAfter.subscription.catalogPath = upgraded.config.subscription.catalogPath;
+  if (JSON.stringify(currentRaw) !== JSON.stringify(globalAfter))
+    await writeConfigTransaction(configPath, currentRaw, globalAfter, { apply: true, env });
+
+  const appended = await appendSpaceRevision(context.name, {
+    kind: "router",
+    source: "config-upgrade",
+    config: upgraded.config,
+    defaultCodexModel: context.revision.defaultCodexModel,
+  }, { env });
+  let switching = null;
+  if (appended.changed && context.index.active.space === context.name)
+    switching = await beginSpaceSwitch(`${context.name}@${appended.revision.revision}`, {
+      env,
+      configPath,
+    });
+  return emit({
+    applied: true,
+    changes: upgraded.changes,
+    diff,
+    space: context.name,
+    revision: appended.revision.revision,
+    switch: switching,
+  }, (x) => x.switch?.pending
+    ? `Configuration upgraded as ${x.space}@${x.revision}; activation is pending App quit.`
+    : `Configuration upgraded as ${x.space}@${x.revision}.`);
+}
+
 async function setup() {
   const discovery = await discoverCodex(env);
   if (!discovery.configExists || !discovery.catalogSourceExists)
     throw Object.assign(Error("Codex config or model catalog was not found"), { code: "codex_not_found" });
   let before = null;
   try { before = await rawConfig(configPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  if (await readSpaceIndex(env))
+    throw Object.assign(Error("configuration spaces are already initialized; use space and config commands"), {
+      code: "spaces_already_initialized",
+    });
   const after = before ? upgradeConfig(before).config : baseConfig(discovery);
   if (!before) validate(after);
   const preview = before
@@ -229,15 +427,18 @@ async function setup() {
     await writeConfigTransaction(configPath, latest, revised, { apply: true });
   }
   const config = await loadConfig(configPath);
-  const integration = await syncIntegration(config, { env, gatewayConfigPath: configPath });
-  const currentService = await serviceStatus(configPath, env);
-  const service = currentService.running
-    ? await gracefulRestart(configPath, { env })
-    : await installService(configPath, { env });
+  const spaces = await initializeSpaces({ env, config, configPath, codexHome: discovery.home });
+  const activation = await beginSpaceSwitch(`${DEFAULT_SPACE}@1`, { env, configPath });
+  const integration = {
+    pending: activation.pending === true,
+    active: activation.pending !== true,
+    transaction: activation.transaction ?? null,
+  };
+  const service = await serviceStatus(configPath, env);
   const credentials = await inspectCredentials(config);
-  emit({ applied: true, discovery, integration, service, credentials }, (result) => [
+  emit({ applied: true, discovery, spaces, activation, integration, service, credentials }, (result) => [
     result.integration.pending
-      ? "Configuration saved and service started. Codex App integration is prepared and pending App quit."
+      ? "Configuration space saved; activation is pending Codex App quit."
       : "Codex Local Router is configured, integrated, and started.",
     result.credentials.providers.some((provider) => !provider.launchAgentReady)
       ? "Store environment-only provider credentials in Keychain before using the LaunchAgent."
@@ -246,24 +447,13 @@ async function setup() {
 }
 
 async function mutateConfig(mutator, label, options = {}) {
-  const before = await rawConfig(configPath);
-  const after = structuredClone(before);
-  await mutator(after);
-  const preview = await writeConfigTransaction(configPath, before, after);
-  const apply = await confirm(`${label}:\n${describeDiff(preview.diff)}`);
-  let result = preview;
-  if (apply) {
-    await options.beforeApply?.();
-    result = await writeConfigTransaction(configPath, before, after, { apply: true });
-  }
-  emit(result, (x) => x.applied ? `${label} applied.` : `${label} preview only; re-run with --yes to apply.`);
-  return result;
+  return mutateSpaceConfig(mutator, label, options);
 }
 
 async function providerCommand() {
   const id = value("id") ?? positional[2];
   if (command === "list") {
-    const config = await loadConfig(configPath);
+    const config = await loadCommandConfig();
     return emit(Object.entries(config.providers).map(([name, provider]) => ({ id: name, ...provider })),
       (rows) => rows.map((row) => `${row.id}\t${row.adapter}\t${row.baseUrl}`).join("\n"));
   }
@@ -311,19 +501,33 @@ async function providerCommand() {
 async function modelCommand() {
   const id = value("id") ?? positional[2];
   if (command === "list") {
-    const config = await loadConfig(configPath);
+    const config = await loadCommandConfig();
+    const registry = await discoverToolSources();
     return emit(Object.values(config.targets).map((target) => ({
       id: target.id, provider: target.provider, model: target.model,
       protocol: target.wireApi, contextWindow: target.contextWindow,
       modalities: target.inputModalities, compression: target.compression.mode,
       reasoningLevels: target.app?.reasoningLevels ?? [],
+      modelFamily: target.modelFamily ?? null,
+      pluginToolPolicy: resolvePluginToolPolicy(config, target),
+      toolSourceRecognition: toolSourceStatus(registry),
     })), (rows) => rows.map((row) => `${row.id}\t${row.provider}\t${row.model}\t${row.contextWindow}`).join("\n"));
   }
   if (command === "probe") {
     if (!id) throw Object.assign(Error("model probe requires --id"), { code: "usage_error" });
-    const config = await loadConfig(configPath), target = config.targets[id];
+    const config = await loadCommandConfig(), target = config.targets[id];
     if (!target) throw Object.assign(Error(`model does not exist: ${id}`), { code: "model_not_found" });
-    const configured = { id, provider: target.provider, protocol: target.wireApi, capabilities: target.capabilities, live: false };
+    const registry = await discoverToolSources();
+    const configured = {
+      id,
+      provider: target.provider,
+      protocol: target.wireApi,
+      capabilities: target.capabilities,
+      modelFamily: target.modelFamily ?? null,
+      pluginToolPolicy: resolvePluginToolPolicy(config, target),
+      toolSourceRecognition: toolSourceStatus(registry),
+      live: false,
+    };
     if (!flag("live")) return emit(configured, () => `Model ${id} configuration is valid. Use --live to spend model quota on an end-to-end probe.`);
     const { auth } = await loadCodexAuth();
     const model = target.app?.modelId;
@@ -365,6 +569,8 @@ async function modelCommand() {
       maxContextWindow: Number(value("max-context-window") ?? value("context-window") ?? current.maxContextWindow ?? current.contextWindow),
       inputModalities: (value("input-modalities") ?? current.inputModalities?.join(",") ?? "text").split(","),
       compression: { mode: value("compression") ?? current.compression?.mode ?? "unsupported" },
+      modelFamily: value("model-family") ?? current.modelFamily,
+      pluginToolPolicy: requestedPluginPolicy(current.pluginToolPolicy),
       capabilities: {
         ...current.capabilities,
         responses: (value("protocol") ?? current.wireApi) === "responses",
@@ -379,6 +585,16 @@ async function modelCommand() {
         modelId: value("app-model") ?? current.app?.modelId ?? value("upstream-model"),
         displayName: value("display-name") ?? current.app?.displayName,
         reasoningLevels: (value("reasoning-levels") ?? current.app?.reasoningLevels?.join(",") ?? "low,medium,high,xhigh").split(","),
+        supportsSearchTool: flag("supports-search-tool")
+          ? true
+          : flag("no-supports-search-tool")
+            ? false
+            : current.app?.supportsSearchTool,
+        useResponsesLite: flag("responses-lite")
+          ? true
+          : flag("no-responses-lite")
+            ? false
+            : (current.app?.useResponsesLite ?? false),
       },
     };
   }, `model ${command} ${id}`);
@@ -386,7 +602,7 @@ async function modelCommand() {
 
 async function modelsLegacy() {
   if (command === "check") {
-    const config = await loadConfig(configPath);
+    const config = await loadCommandConfig();
     let catalog = null;
     if (config.subscription?.catalogPath) {
       const source = JSON.parse(await readFile(config.subscription.catalogPath, "utf8"));
@@ -398,7 +614,7 @@ async function modelsLegacy() {
   if (command === "catalog") {
     const output = value("output");
     if (!output) throw Object.assign(Error("models catalog requires --output PATH"), { code: "usage_error" });
-    const config = await loadConfig(configPath);
+    const config = await loadCommandConfig();
     const source = JSON.parse(await readFile(config.subscription.catalogPath, "utf8"));
     await atomicWrite(resolve(output), JSON.stringify(buildModelCatalog(source, config), null, 2) + "\n");
     return emit({ ok: true, output: resolve(output) }, (x) => `Catalog written: ${x.output}`);
@@ -406,17 +622,222 @@ async function modelsLegacy() {
   throw Object.assign(Error("use models check|catalog"), { code: "usage_error" });
 }
 
+async function spaceCommand() {
+  if (command === "init") {
+    const result = await initializeSpaces({ env, configPath });
+    return emit(result, (x) => x.changed
+      ? `Initialized official@1 and default@1; active is ${x.index.active.space}@${x.index.active.revision}.`
+      : "Configuration spaces are already initialized.");
+  }
+  const index = await readSpaceIndex(env);
+  if (!index)
+    throw Object.assign(Error("configuration spaces are not initialized"), {
+      code: "spaces_not_initialized",
+    });
+  if (command === "list") {
+    const rows = await listConfigurationSpaces(env);
+    return emit(rows, (items) => items.map((item) =>
+      `${item.active ? "*" : " "} ${item.name}@${item.latestRevision}\t${item.kind}\t${item.defaultCodexModel ?? "-"}`,
+    ).join("\n"));
+  }
+  if (command === "current") {
+    const status = await configurationSpaceStatus({ env, configPath });
+    const active = status.active ? await resolveSpace(
+      `${status.active.space}@${status.active.revision}`,
+      env,
+    ) : null;
+    const result = {
+      ...status,
+      defaultCodexModel: active?.defaultCodexModel ?? null,
+      latestRevision: active ? index.spaces[active.space].latestRevision : null,
+    };
+    return emit(result, (x) =>
+      `Current: ${x.active.space}@${x.active.revision}; default model ${x.defaultCodexModel ?? "-"}; drift ${x.drift ? "yes" : "no"}.`);
+  }
+  if (command === "show") {
+    const input = positional[2] ?? `${index.active.space}@${index.active.revision}`;
+    const revision = await resolveSpace(input, env);
+    return emit(revision, (x) =>
+      `${x.space}@${x.revision} (${x.kind}), default model ${x.defaultCodexModel ?? "-"}, ${x.contentHash}`);
+  }
+  if (command === "history") {
+    const name = positional[2];
+    if (!name) throw Object.assign(Error("space history requires NAME"), { code: "usage_error" });
+    const rows = await spaceHistory(name, env);
+    return emit(rows, (items) => items.map((item) =>
+      `${item.space}@${item.revision}\t${item.source}\t${item.defaultCodexModel ?? "-"}`,
+    ).join("\n"));
+  }
+  if (command === "diff") {
+    const leftInput = positional[2], rightInput = positional[3];
+    if (!leftInput || !rightInput)
+      throw Object.assign(Error("space diff requires LEFT RIGHT"), { code: "usage_error" });
+    const left = await resolveSpace(leftInput, env);
+    const right = await resolveSpace(rightInput, env);
+    const changes = diffSpaceRevisions(left, right);
+    return emit({ left: `${left.space}@${left.revision}`, right: `${right.space}@${right.revision}`, changes },
+      (x) => x.changes.length ? describeDiff(x.changes) : "No differences.");
+  }
+  if (command === "create") {
+    const name = positional[2];
+    const from = value("from") ?? (index.active.space === OFFICIAL_SPACE
+      ? DEFAULT_SPACE
+      : `${index.active.space}@${index.active.revision}`);
+    if (!name) throw Object.assign(Error("space create requires NAME"), { code: "usage_error" });
+    const apply = await confirm(`Create configuration space ${name} from ${from}.`);
+    if (!apply) return emit({ applied: false }, () => "No space created.");
+    const result = await createSpace(name, from, { env });
+    return emit({ applied: true, ...result }, () => `Created ${name}@1.`);
+  }
+  if (command === "capture") {
+    const name = positional[2] ?? index.active.space;
+    if (name === OFFICIAL_SPACE)
+      throw Object.assign(Error("official revisions are captured automatically when leaving official"), {
+        code: "official_space_read_only",
+      });
+    const entry = index.spaces[name];
+    if (!entry || entry.kind !== "router")
+      throw Object.assign(Error(`Router space does not exist: ${name}`), { code: "space_not_found" });
+    const captureRevision = index.active.space === name
+      ? index.active.revision
+      : entry.latestRevision;
+    const currentRevision = await resolveSpace(`${name}@${captureRevision}`, env);
+    const current = await rawConfig(configPath);
+    const proposed = structuredClone(validate(current));
+    const diff = configDiff(
+      composeRuntimeConfig(current, currentRevision),
+      proposed,
+    );
+    const apply = await confirm(`Capture current Router-owned fields into ${name}:\n${describeDiff(diff)}`);
+    if (!apply) return emit({ applied: false, diff }, () => "Capture preview only.");
+    const result = await captureRouterSpace(name, {
+      env,
+      configPath,
+      config: current,
+      defaultCodexModel: currentRevision.defaultCodexModel,
+      expectedLatestRevision: entry.latestRevision,
+    });
+    if (
+      index.active.space === name &&
+      index.active.revision !== result.revision.revision
+    )
+      await commitSpaceActivation({ space: name, revision: result.revision.revision }, {
+        env,
+        expectedActive: index.active,
+      });
+    return emit({ applied: true, ...result }, (x) => x.changed
+      ? `Captured ${name}@${x.revision.revision}.`
+      : `${name} already matches its latest revision.`);
+  }
+  if (command === "set-default-model") {
+    const model = positional[2] ?? value("model");
+    if (!model)
+      throw Object.assign(Error("space set-default-model requires MODEL"), { code: "usage_error" });
+    const context = await routerSpaceContext();
+    if (!availableCodexModels(context.config).has(model))
+      throw Object.assign(Error(`model is not available in ${context.name}: ${model}`), {
+        code: "space_default_model_unavailable",
+      });
+    return mutateSpaceConfig(() => {}, `set default model ${model}`, {
+      defaultCodexModel: model,
+      source: "default-model-edit",
+    });
+  }
+  if (command === "use") {
+    const target = positional[2];
+    if (!target) throw Object.assign(Error("space use requires NAME[@REV]"), { code: "usage_error" });
+    const revision = await resolveSpace(target, env);
+    const apply = await confirm(`Switch from ${index.active.space}@${index.active.revision} to ${revision.space}@${revision.revision}.`);
+    if (!apply) return emit({ applied: false }, () => "No switch started.");
+    const result = await beginSpaceSwitch(`${revision.space}@${revision.revision}`, { env, configPath });
+    return emit({ applied: true, ...result }, (x) => x.pending
+      ? `Switch to ${revision.space}@${revision.revision} is pending Codex App quit.`
+      : `Active configuration space is ${revision.space}@${revision.revision}.`);
+  }
+  if (command === "rollback") {
+    if (!index.previous)
+      throw Object.assign(Error("there is no previous successful activation"), {
+        code: "space_rollback_unavailable",
+      });
+    const target = `${index.previous.space}@${index.previous.revision}`;
+    const apply = await confirm(`Roll back to the previous successful activation ${target}.`);
+    if (!apply) return emit({ applied: false }, () => "No rollback started.");
+    const result = await beginSpaceSwitch(target, { env, configPath });
+    return emit({ applied: true, target, ...result }, (x) => x.pending
+      ? `Rollback to ${target} is pending Codex App quit.`
+      : `Rolled back to ${target}.`);
+  }
+  if (command === "resume") {
+    const result = await resumeSpaceSwitch({
+      env,
+      configPath,
+      coordinator: flag("coordinator"),
+    });
+    return emit(result, (x) => x.pending
+      ? "Space switch is still pending Codex App quit."
+      : x.changed ? `Space switch completed: ${x.active.space}@${x.active.revision}.` : "No switch is pending.");
+  }
+  if (command === "cancel") {
+    const pending = await readSpaceTransaction(env);
+    if (!pending) return emit({ changed: false }, () => "No switch is pending.");
+    const apply = await confirm(`Cancel pending switch to ${pending.target.space}@${pending.target.revision}.`);
+    if (!apply) return emit({ applied: false }, () => "Pending switch retained.");
+    return emit(await cancelSpaceSwitch({ env }), () => "Pending switch cancelled.");
+  }
+  throw Object.assign(Error("use space init|list|current|show|history|diff|create|capture|set-default-model|use|rollback|resume|cancel"), {
+    code: "usage_error",
+  });
+}
+
 async function integrationCommand() {
   const config = await loadConfig(configPath);
-  if (command === "status") return emit(await integrationStatus(config, { env }), (s) => `Integration: ${s.pending ? "pending App quit" : s.active ? "active" : "inactive"}; catalog ${s.catalogCurrent ? "current" : "not current"}.`);
+  const spaceStatus = await configurationSpaceStatus({ env, configPath });
+  if (command === "status") {
+    const integration = await integrationStatus(config, { env });
+    return emit({ ...integration, space: spaceStatus }, (s) =>
+      `Integration: ${s.space.pending ? "space switch pending" : s.active ? "active" : "inactive"}; space ${s.space.active?.space ?? "uninitialized"}.`);
+  }
   if (["enable", "sync", "upgrade"].includes(command)) {
-    const result = await syncIntegration(config, { env, gatewayConfigPath: configPath, force: flag("force") });
-    return emit(result, (x) => x.pending ? "Integration prepared; quit Codex App and run integration sync again." : x.changed ? "Integration synchronized." : "Integration already current.");
+    if (spaceStatus.pending) {
+      const result = await resumeSpaceSwitch({ env, configPath });
+      return emit(result, (x) => x.pending
+        ? "Integration activation is pending Codex App quit."
+        : "Pending configuration space activation completed.");
+    }
+    const index = await readSpaceIndex(env);
+    let target = index.active?.space !== OFFICIAL_SPACE ? index.active : index.previous;
+    if (!target || index.spaces[target.space]?.kind !== "router")
+      target = { space: DEFAULT_SPACE, revision: index.spaces[DEFAULT_SPACE].latestRevision };
+    let result;
+    if (index.active.space === target.space && index.active.revision === target.revision) {
+      const activeRevision = await resolveSpace(`${target.space}@${target.revision}`, env);
+      const activeConfig = await materializeRuntimeConfig(
+        await rawConfig(configPath),
+        activeRevision,
+      );
+      result = await syncIntegration(activeConfig, {
+        env,
+        gatewayConfigPath: configPath,
+        selectedModel: activeRevision.defaultCodexModel,
+        spaceRef: `${target.space}@${target.revision}`,
+        force: flag("force"),
+      });
+    } else {
+      result = await beginSpaceSwitch(`${target.space}@${target.revision}`, { env, configPath });
+    }
+    return emit(result, (x) => x.pending
+      ? "Integration activation is pending Codex App quit."
+      : x.changed ? "Integration synchronized." : "Integration already current.");
   }
   if (["disable", "restore"].includes(command)) {
-    const apply = await confirm("Remove Codex Local Router managed integration fields and restore their baseline values.");
+    const index = await readSpaceIndex(env);
+    const target = `official@${index.spaces.official.latestRevision}`;
+    const apply = await confirm(`Switch to ${target} and restore its exact official settings.`);
     if (!apply) return emit({ applied: false }, () => "No changes applied. Re-run with --yes after reviewing.");
-    return emit(await disableIntegration({ env, force: flag("force") }), () => "Integration disabled; unrelated Codex settings were preserved.");
+    const result = await beginSpaceSwitch(target, { env, configPath });
+    return emit(result, (x) => x.pending
+      ? `Switch to ${target} is pending Codex App quit.`
+      : `Integration disabled through ${target}; unrelated Codex settings were preserved.`);
   }
   throw Object.assign(Error("use integration enable|sync|status|disable"), { code: "usage_error" });
 }
@@ -511,6 +932,7 @@ async function doctor() {
     config: { path: configPath, valid: !!config, error: configError },
     service: await serviceStatus(configPath, env),
     integration: config ? await integrationStatus(config, { env }) : null,
+    configurationSpace: await configurationSpaceStatus({ env, configPath }),
     credentials,
     warnings,
     issues,
@@ -523,16 +945,48 @@ async function doctor() {
 
 async function status() {
   const config = await loadConfig(configPath);
-  emit({ product: PRODUCT_NAME, cliVersion: PACKAGE_VERSION, configPath, configVersion: config.schemaVersion, service: await serviceStatus(configPath, env), integration: await integrationStatus(config, { env }), targets: Object.keys(config.targets) },
-    (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nModels: ${x.targets.join(", ")}`);
+  const configurationSpace = await configurationSpaceStatus({ env, configPath });
+  let defaultModel = null, latestRevision = null;
+  if (configurationSpace.active) {
+    const active = await resolveSpace(
+      `${configurationSpace.active.space}@${configurationSpace.active.revision}`,
+      env,
+    );
+    defaultModel = active.defaultCodexModel;
+    latestRevision = (await readSpaceIndex(env)).spaces[active.space].latestRevision;
+  }
+  emit({
+    product: PRODUCT_NAME,
+    cliVersion: PACKAGE_VERSION,
+    configPath,
+    configVersion: config.schemaVersion,
+    service: await serviceStatus(configPath, env),
+    integration: await integrationStatus(config, { env }),
+    configurationSpace: { ...configurationSpace, defaultModel, latestRevision },
+    targets: Object.keys(config.targets),
+  },
+  (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nSpace: ${x.configurationSpace.active ? `${x.configurationSpace.active.space}@${x.configurationSpace.active.revision}` : "uninitialized"}\nModels: ${x.targets.join(", ")}`);
+}
+
+async function requireRouterServiceSpace() {
+  const index = await readSpaceIndex(env);
+  if (index?.active?.space === OFFICIAL_SPACE)
+    throw Object.assign(Error("Router service cannot start while the official space is active"), {
+      code: "official_space_service_dormant",
+    });
+  return index;
 }
 
 async function serviceCommand() {
   if (command === "start") {
+    await requireRouterServiceSpace();
     const current = await serviceStatus(configPath, env);
     return emit(current.running ? current : await installService(configPath, { env }), (x) => x.running ? "Service is already running." : "Service start requested.");
   }
-  if (command === "restart") return emit(await gracefulRestart(configPath, { env }), (x) => x.upgraded ? "Service restarted after draining active turns." : "Service restart deferred because active turns did not finish.");
+  if (command === "restart") {
+    await requireRouterServiceSpace();
+    return emit(await gracefulRestart(configPath, { env }), (x) => x.upgraded ? "Service restarted after draining active turns." : "Service restart deferred because active turns did not finish.");
+  }
   if (command === "stop") return emit(await stopService({ env, ignoreMissing: true }), () => "Service stopped.");
   if (command === "status") return emit(await serviceStatus(configPath, env), (x) => x.running ? `Service running (${x.health.version}, ${x.health.activeTurns} active turn(s)).` : "Service stopped.");
   throw Object.assign(Error("use service start|stop|restart|status"), { code: "usage_error" });
@@ -540,12 +994,13 @@ async function serviceCommand() {
 
 async function main() {
   if (flag("version") || group === "version") return console.log(`${PRODUCT_NAME} ${PACKAGE_VERSION}`);
-  if (!group || flag("help") || group === "help") return console.log("Usage: codex-local-router <command> [subcommand] [options]\n\nCommands: setup, status, provider, model, models, integration, doctor, logs, service, upgrade, rescue, history, uninstall");
+  if (!group || flag("help") || group === "help") return console.log("Usage: codex-local-router <command> [subcommand] [options]\n\nCommands: setup, status, space, provider, model, models, integration, doctor, logs, service, upgrade, rescue, history, uninstall");
   if (group === "setup") return setup();
   if (group === "status") return status();
   if (group === "provider") return providerCommand();
   if (group === "model") return modelCommand();
   if (group === "models") return modelsLegacy();
+  if (group === "space") return spaceCommand();
   if (group === "integration") return integrationCommand();
   if (group === "doctor") return doctor();
   if (group === "service") return serviceCommand();
@@ -556,17 +1011,61 @@ async function main() {
     return emit({ path: paths.serviceLog, lines: result }, (x) => x.lines.join("\n"));
   }
   if (group === "upgrade") {
+    await requireRouterServiceSpace();
     const result = await gracefulRestart(configPath, { env, waitMs: Number(value("wait-seconds") ?? 300) * 1000, serverPath: value("server") });
     return emit(result, (x) => x.upgraded ? "Gateway upgraded after candidate health and drain checks." : "Gateway upgrade deferred because active turns did not finish before the timeout.");
   }
   if (group === "rescue" && flag("subscription")) {
     const apply = await confirm("Restore Codex official subscription direct settings without contacting the Gateway.");
     if (!apply) return emit({ applied: false }, () => "Rescue preview only; re-run with --yes to apply.");
-    await disableIntegration({ env, force: flag("force") });
-    return emit({ applied: true }, () => "Official subscription baseline restored for new Codex sessions.");
+    const result = await withFileLock(paths.spaceTransactionLock, async () => {
+      if (await appIsRunning(env))
+        throw Object.assign(Error("quit Codex App before using the subscription rescue path"), {
+          code: "app_running",
+        });
+      const index = await readSpaceIndex(env);
+      if (!index)
+        throw Object.assign(Error("configuration spaces are not initialized"), {
+          code: "spaces_not_initialized",
+        });
+      const official = await resolveSpace("official@1", env);
+      await disableIntegration({
+        env,
+        force: flag("force"),
+        applyWhileRunning: true,
+        officialBaseline: official.codexBaseline,
+        officialSpaceRef: "official@1",
+      });
+      await uninstallService({ env });
+      await rm(paths.spaceTransaction, { force: true });
+      await uninstallSpaceSwitcher({ env }).catch(() => {});
+      await commitSpaceActivation({ space: OFFICIAL_SPACE, revision: 1 }, { env });
+      return { applied: true, active: { space: OFFICIAL_SPACE, revision: 1 } };
+    });
+    return emit(result, () =>
+      "Protected official@1 was restored and the Router service was stopped.");
   }
   if (group === "history") return historyCommand();
   if (group === "config" && command === "upgrade") {
+    if (await readSpaceIndex(env)) {
+      if (!flag("apply")) {
+        const context = await routerSpaceContext();
+        const upgraded = upgradeConfig(context.config);
+        return emit({
+          applied: false,
+          changes: upgraded.changes,
+          diff: configDiff(context.config, upgraded.config),
+          space: context.name,
+        }, () => upgraded.changes.length
+          ? "Configuration space upgrade preview only; add --apply --yes to apply."
+          : "Configuration space is already current.");
+      }
+      return mutateSpaceConfig((config) => {
+        const upgraded = upgradeConfig(config);
+        for (const key of Object.keys(config)) delete config[key];
+        Object.assign(config, upgraded.config);
+      }, "upgrade configuration space", { source: "config-upgrade" });
+    }
     const before = await rawConfig(configPath), upgraded = upgradeConfig(before);
     if (!upgraded.changes.length) return emit({ applied: false, changes: [] }, () => "Configuration is already current.");
     const apply = flag("apply") && await confirm(`Upgrade configuration:\n${upgraded.changes.join("\n")}`);
@@ -576,9 +1075,26 @@ async function main() {
   if (group === "uninstall") {
     const apply = await confirm("Remove Codex integration and LaunchAgent. History and credentials will be retained.");
     if (!apply) return emit({ applied: false }, () => "Uninstall preview only; re-run with --yes to apply.");
+    const index = await readSpaceIndex(env);
+    if (index && index.active?.space !== OFFICIAL_SPACE && await appIsRunning(env))
+      throw Object.assign(Error("quit Codex App before uninstalling an active Router space"), {
+        code: "app_running",
+      });
+    await cancelSpaceSwitch({ env });
+    await uninstallSpaceSwitcher({ env });
+    let active = index?.active ?? null;
+    if (index && index.active?.space !== OFFICIAL_SPACE) {
+      const target = `official@${index.spaces.official.latestRevision}`;
+      const switched = await beginSpaceSwitch(target, { env, configPath });
+      if (switched.pending)
+        throw Object.assign(Error("uninstall cannot remain pending after Codex App is closed"), {
+          code: "space_switch_pending",
+        });
+      active = switched.active;
+    }
     await disableIntegration({ env, force: flag("force") }).catch((error) => { if (error.code !== "ENOENT") throw error; });
     await uninstallService({ env });
-    return emit({ applied: true, historyRetained: true, credentialsRetained: true }, () => "Integration and service removed. History and credentials were retained.");
+    return emit({ applied: true, active, historyRetained: true, credentialsRetained: true }, () => "Integration and service removed. History and credentials were retained.");
   }
   throw Object.assign(Error("unknown command"), { code: "usage_error" });
 }

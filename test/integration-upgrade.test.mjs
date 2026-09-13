@@ -73,7 +73,7 @@ test("legacy probe state migrates to idempotent product integration without bloc
   assert.match(upgradedConfig, /projects\."\/unrelated\/project"/);
   const statePath = join(data, "integration", "codex.json");
   const state = JSON.parse(await readFile(statePath, "utf8"));
-  assert.equal(state.schemaVersion, 3);
+  assert.equal(state.schemaVersion, 4);
   assert.equal(state.migratedFrom, legacyState);
 
   const second = JSON.parse((await exec(process.execPath, [script, gatewayPath], { env: environment })).stdout);

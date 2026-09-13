@@ -72,7 +72,9 @@ function customModel(target, source) {
     effective_context_window_percent: target.effectiveContextWindowPercent,
     experimental_supported_tools: [],
     input_modalities: target.inputModalities,
-    supports_search_tool: target.capabilities?.nativeWebSearch === true,
+    supports_search_tool:
+      target.app.supportsSearchTool ??
+      (target.capabilities?.nativeWebSearch === true),
     use_responses_lite: target.app.useResponsesLite ?? false,
   };
 }

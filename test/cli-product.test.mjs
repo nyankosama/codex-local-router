@@ -5,6 +5,7 @@ import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { composeRuntimeConfig, resolveSpace } from "../src/config-spaces.mjs";
 
 const exec = promisify(execFile);
 const cli = resolve("scripts/gateway-admin.mjs");
@@ -33,6 +34,7 @@ test("setup reports pending App integration and core query commands are JSON-saf
     CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL: "1",
     CODEX_APP_RUNNING: "1",
     OPENCODE_GO_API_KEY: "test",
+    FEEI_API_KEY: "test-feei",
   };
   const setup = JSON.parse((await exec(process.execPath, [cli, "setup", "--yes", "--json", "--port", "58991"], { env: environment })).stdout);
   assert.equal(setup.applied, true);
@@ -41,6 +43,7 @@ test("setup reports pending App integration and core query commands are JSON-saf
   assert.doesNotMatch(await readFile(join(home, "config.toml"), "utf8"), /codex-local-router/);
   const synced = JSON.parse((await exec(process.execPath, [cli, "integration", "sync", "--json"], { env: { ...environment, CODEX_APP_RUNNING: "0" } })).stdout);
   assert.equal(synced.pending, false);
+  const stoppedEnvironment = { ...environment, CODEX_APP_RUNNING: "0" };
   assert.match(await readFile(join(home, "config.toml"), "utf8"), /codex-local-router managed settings/);
   const status = JSON.parse((await exec(process.execPath, [cli, "status", "--json"], { env: { ...environment, CODEX_APP_RUNNING: "0" } })).stdout);
   assert.equal(status.product, "Codex Local Router");
@@ -52,15 +55,141 @@ test("setup reports pending App integration and core query commands are JSON-saf
   assert.equal(doctor.warnings.length, 1);
   const providers = JSON.parse((await exec(process.execPath, [cli, "provider", "list", "--json"], { env: environment })).stdout);
   assert.equal(providers[0].id, "opencode-go");
+  await exec(process.execPath, [
+    cli, "provider", "add", "--id", "feei", "--base-url", "https://ai.feei.cn/v1",
+    "--api-key-env", "FEEI_API_KEY", "--yes", "--json",
+  ], { env: stoppedEnvironment });
+  await exec(process.execPath, [
+    cli, "model", "add", "--id", "feei-sol", "--provider", "feei",
+    "--preset", "feei/gpt-5.6-sol", "--yes", "--json",
+  ], { env: stoppedEnvironment });
+  const modelList = JSON.parse((await exec(
+    process.execPath,
+    [cli, "model", "list", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  const feei = modelList.find((model) => model.id === "feei-sol");
+  assert.equal(feei.modelFamily, "openai-gpt");
+  assert.equal(feei.pluginToolPolicy.reason, "third-party-openai-gpt-default");
+  assert.deepEqual(feei.pluginToolPolicy.allowedPlugins, [
+    "github", "figma", "sites", "connected_documents",
+  ]);
+  assert.equal(typeof feei.toolSourceRecognition.status, "string");
+  const probe = JSON.parse((await exec(
+    process.execPath,
+    [cli, "model", "probe", "--id", "feei-sol", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(probe.live, false);
+  assert.equal(probe.pluginToolPolicy.reason, "third-party-openai-gpt-default");
 
-  const legacy = JSON.parse(await readFile(config, "utf8"));
-  legacy.schemaVersion = 2;
-  delete legacy.access;
-  delete legacy.subscription.models;
-  await writeFile(config, JSON.stringify(legacy));
-  await rm(join(data, "state", "access-token"), { force: true });
-  await exec(process.execPath, [cli, "setup", "--yes", "--json"], { env: environment });
-  const migrated = JSON.parse(await readFile(config, "utf8"));
-  assert.equal(migrated.access.required, true);
-  assert.match(await readFile(migrated.access.tokenFile, "utf8"), /^[a-f0-9]{64}\n$/);
+  const spaces = JSON.parse((await exec(process.execPath, [cli, "space", "list", "--json"], { env: stoppedEnvironment })).stdout);
+  assert.deepEqual(spaces.map((space) => space.name).sort(), ["default", "official"]);
+  const current = JSON.parse((await exec(process.execPath, [cli, "space", "current", "--json"], { env: stoppedEnvironment })).stdout);
+  assert.equal(current.active.space, "default");
+  assert.equal(current.drift, false);
+  await exec(process.execPath, [cli, "space", "create", "alternate", "--from", "default", "--yes", "--json"], { env: stoppedEnvironment });
+  const defaultChanged = JSON.parse((await exec(process.execPath, [
+    cli, "space", "set-default-model", "feei-gpt-5.6-sol", "--space", "alternate", "--yes", "--json",
+  ], { env: stoppedEnvironment })).stdout);
+  assert.equal(defaultChanged.space, "alternate");
+  assert.equal(defaultChanged.switch, null);
+  const alternate = JSON.parse((await exec(process.execPath, [cli, "space", "show", "alternate", "--json"], { env: stoppedEnvironment })).stdout);
+  assert.equal(alternate.defaultCodexModel, "feei-gpt-5.6-sol");
+  const history = JSON.parse((await exec(process.execPath, [cli, "space", "history", "default", "--json"], { env: stoppedEnvironment })).stdout);
+  assert.ok(history.length >= 3);
+  const diff = JSON.parse((await exec(process.execPath, [cli, "space", "diff", "default@1", `default@${history[0].revision}`, "--json"], { env: stoppedEnvironment })).stdout);
+  assert.ok(diff.changes.length > 0);
+  await exec(process.execPath, [cli, "space", "use", "default@1", "--yes", "--json"], { env: stoppedEnvironment });
+  await exec(process.execPath, [cli, "integration", "sync", "--json"], { env: stoppedEnvironment });
+  const historicalState = JSON.parse(await readFile(join(data, "integration", "codex.json"), "utf8"));
+  assert.equal(historicalState.materializedSpaceRef, "default@1");
+  assert.doesNotMatch(
+    await readFile(join(home, "model-catalogs", "codex-local-router.json"), "utf8"),
+    /feei-gpt-5\.6-sol/,
+  );
+  const latestDefault = await resolveSpace(`default@${history[0].revision}`, stoppedEnvironment);
+  const historicalRuntime = JSON.parse(await readFile(config, "utf8"));
+  await writeFile(config, JSON.stringify(composeRuntimeConfig(historicalRuntime, latestDefault)));
+  const capturedLatest = JSON.parse((await exec(
+    process.execPath,
+    [cli, "space", "capture", "default", "--yes", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(capturedLatest.changed, false);
+  assert.equal(JSON.parse((await exec(
+    process.execPath,
+    [cli, "space", "current", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout).active.revision, history[0].revision);
+  const pendingOfficial = JSON.parse((await exec(process.execPath, [cli, "space", "use", "official@1", "--yes", "--json"], { env: environment })).stdout);
+  assert.equal(pendingOfficial.pending, true);
+  await exec(process.execPath, [cli, "space", "cancel", "--yes", "--json"], { env: environment });
+  assert.match(await readFile(join(data, "state", "access-token"), "utf8"), /^[a-f0-9]{64}\n$/);
+
+  const transactionLock = join(data, "transactions", ".space-switch.lock");
+  await mkdir(join(data, "transactions"), { recursive: true });
+  await writeFile(transactionLock, "active switch");
+  await assert.rejects(
+    exec(process.execPath, [cli, "rescue", "--subscription", "--yes", "--json"], { env: stoppedEnvironment }),
+    (error) => JSON.parse(error.stderr).code === "operation_locked",
+  );
+  assert.match(await readFile(join(home, "config.toml"), "utf8"), /codex-local-router managed settings/);
+  assert.equal(JSON.parse((await exec(
+    process.execPath,
+    [cli, "space", "current", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout).active.space, "default");
+  await rm(transactionLock);
+
+  await exec(process.execPath, [cli, "space", "use", "official@1", "--yes", "--json"], { env: stoppedEnvironment });
+  await assert.rejects(readFile(join(root, "LaunchAgents", "router.plist")), (error) => error.code === "ENOENT");
+  for (const command of [["service", "start"], ["service", "restart"], ["upgrade"]]) {
+    await assert.rejects(
+      exec(process.execPath, [cli, ...command, "--json"], { env: stoppedEnvironment }),
+      (error) => JSON.parse(error.stderr).code === "official_space_service_dormant",
+    );
+  }
+
+  const pendingRouter = JSON.parse((await exec(
+    process.execPath,
+    [cli, "space", "use", "default", "--yes", "--json"],
+    { env: environment },
+  )).stdout);
+  assert.equal(pendingRouter.pending, true);
+  await exec(process.execPath, [cli, "uninstall", "--yes", "--json"], { env: environment });
+  await assert.rejects(readFile(join(data, "transactions", "space-switch.json")), (error) => error.code === "ENOENT");
+  await assert.rejects(readFile(join(root, "LaunchAgents", "switcher.plist")), (error) => error.code === "ENOENT");
+  const resumed = JSON.parse((await exec(
+    process.execPath,
+    [cli, "space", "resume", "--coordinator", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(resumed.changed, false);
+  const afterUninstall = JSON.parse((await exec(
+    process.execPath,
+    [cli, "space", "current", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(afterUninstall.active.space, "official");
+
+  const reactivated = JSON.parse((await exec(
+    process.execPath,
+    [cli, "space", "use", "default", "--yes", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(reactivated.active.space, "default");
+  const uninstalledRouter = JSON.parse((await exec(
+    process.execPath,
+    [cli, "uninstall", "--yes", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(uninstalledRouter.active.space, "official");
+  const restoredAfterUninstall = JSON.parse((await exec(
+    process.execPath,
+    [cli, "space", "use", "default", "--yes", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(restoredAfterUninstall.changed, true);
+  assert.equal(restoredAfterUninstall.active.space, "default");
 });

@@ -15,7 +15,11 @@ Codex Local Router (loopback only)
        `-- custom model IDs -----> configured third-party providers
 ```
 
-The router preserves the user's Codex login, keeps subscription and third-party credentials separate, archives cross-model history locally, and provides a reversible subscription rescue path. It does not modify the Codex binary.
+The router preserves the user's Codex login, keeps subscription and third-party credentials separate, archives cross-model history locally, and provides a reversible subscription rescue path. Versioned configuration spaces keep a provider/model/routing/policy combination together without copying accounts, MCP servers, Skills, Hooks, prompts, or history. It does not modify the Codex binary.
+
+Official subscription traffic uses a dedicated transparent relay. Only an explicitly configured custom model, or a request that must restore router-owned virtual history, enters the model engine. This keeps current and future official auxiliary APIs such as model discovery and standalone search compatible without opening the same identity on `/v1`.
+
+Third-party GPT targets can use a conservative Plugin allowlist to reduce the large client-supplied Plugin surface. Codex built-ins and user-configured MCP servers are not filtered. Non-GPT and legacy targets remain passthrough unless the user explicitly selects a policy.
 
 ## Supported scope
 
@@ -23,17 +27,17 @@ The router preserves the user's Codex login, keeps subscription and third-party 
 - Node.js 22 or later
 - Codex CLI and Codex App versions listed in the [compatibility matrix](docs/public/compatibility.md)
 - Responses and Chat Completions providers
-- ChatGPT subscription routing, OpenCode Go, and generic OpenAI-compatible providers
+- ChatGPT subscription routing, OpenCode Go, ai.feei GPT presets, and generic OpenAI-compatible providers
 
-Other operating systems and vendor-specific protocols are not claimed as supported in v0.2.1.
+Other operating systems and vendor-specific protocols are not claimed as supported in v0.3.0.
 
 ## Install from a GitHub Release
 
-Download the `.tgz` and SHA-256 file from the `v0.2.1` release, verify it, and install it locally:
+Download the `.tgz` and SHA-256 file from the `v0.3.0` release, verify it, and install it locally:
 
 ```bash
-shasum -a 256 -c codex-local-router-0.2.1.tgz.sha256
-npm install -g ./codex-local-router-0.2.1.tgz
+shasum -a 256 -c codex-local-router-0.3.0.tgz.sha256
+npm install -g ./codex-local-router-0.3.0.tgz
 codex-local-router --version
 ```
 
@@ -55,11 +59,23 @@ printf '%s' "$OPENCODE_GO_API_KEY" | codex-local-router setup --credential-stdin
 
 Environment-variable credential references remain supported for foreground use. The managed LaunchAgent does not import shell environment variables; `doctor` reports this and recommends Keychain.
 
-Setup discovers the Codex home, configuration, model catalog, and credential-store setting; shows the configuration diff; writes a recoverable transaction; installs a LaunchAgent; and reports each applied or pending stage. If Codex App is running, integration files are prepared and left pending. Quit the App normally and run:
+Setup discovers the Codex home, configuration, model catalog, and credential-store setting; creates protected `official@1` and the first `default@1` space; then starts a recoverable activation transaction. If Codex App is running, no Codex or service file is changed: a one-shot switcher waits for a normal App exit, applies the transaction once, and exits. It never force-quits or reopens the App. You can also resume explicitly:
 
 ```bash
 codex-local-router integration sync
 ```
+
+Create, inspect, switch, and roll back complete Router combinations:
+
+```bash
+codex-local-router space list
+codex-local-router space create work --from default --yes
+codex-local-router space use work --yes
+codex-local-router space diff default work
+codex-local-router space rollback --yes
+```
+
+Each confirmed Provider, model, route, Plugin, search, compression, or default-model edit creates an immutable revision. Use `--space NAME` to edit a dormant Router space. Manual edits to the active Router-owned fields are reported as drift; review and adopt them with `space capture` instead of allowing a later switch to overwrite them silently.
 
 Routine diagnostics never call a model:
 
@@ -75,6 +91,8 @@ A live model probe is explicit and consumes provider quota:
 codex-local-router model probe --id deepseek --live
 ```
 
+The built-in `feei/gpt-5.6-sol` and `feei/gpt-6-astra` presets use distinct App model IDs (`feei-gpt-5.6-sol` and `feei-gpt-6-astra`), standard Responses, a conservative 272,000-token configured window, and the third-party GPT Plugin policy. The API key must be supplied separately through Keychain or `FEEI_API_KEY`; no credential is included in this project. See the [configuration reference](docs/public/configuration.md).
+
 ## Safety and recovery
 
 Codex configuration changes use a managed block and a three-way transaction. Disable removes only fields that still match the router's last managed values, preserving unrelated changes made later.
@@ -82,8 +100,10 @@ Codex configuration changes use a managed block and a three-way transaction. Dis
 If the Gateway is unavailable, restore the pre-install subscription settings for new sessions without contacting the Gateway:
 
 ```bash
-codex-local-router rescue --subscription
+codex-local-router rescue --subscription --yes
 ```
+
+The rescue command requires Codex App to be closed, restores the permanently retained `official@1`, and stops the Router service without relying on the normal switch coordinator.
 
 History is encrypted with AES-256-GCM. The archive key is stored in macOS Keychain. Encrypted exports require a passphrase; plaintext export must be explicitly requested.
 
@@ -92,7 +112,7 @@ codex-local-router history export --thread THREAD_ID --output history.clr.json -
 codex-local-router history inspect --thread THREAD_ID
 ```
 
-See the [CLI reference](docs/public/cli.md), [configuration reference](docs/public/configuration.md), [architecture](docs/public/architecture.md), [data flow](docs/public/data-flow.md), and the [acceptance harness](docs/public/acceptance.md).
+See the [configuration-space guide](docs/public/configuration-spaces.md), [CLI reference](docs/public/cli.md), [configuration reference](docs/public/configuration.md), [architecture](docs/public/architecture.md), [data flow](docs/public/data-flow.md), and the [acceptance harness](docs/public/acceptance.md).
 
 ## Compression policy
 

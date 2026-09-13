@@ -1,5 +1,10 @@
 import http from "node:http";
-import { readRequestBody, parseJSON } from "./request-body.mjs";
+import {
+  readRequestBody,
+  readRequestBodyWithWire,
+  readWireBody,
+  parseJSON,
+} from "./request-body.mjs";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { timingSafeEqual } from "node:crypto";
@@ -14,6 +19,13 @@ import { fail, publicError } from "./errors.mjs";
 import { credential } from "./providers.mjs";
 import { PACKAGE_VERSION, PRODUCT_ID } from "./product.mjs";
 import { atomicJSON } from "./files.mjs";
+import { discoverToolSources } from "./tool-sources.mjs";
+import {
+  officialRelayUrl,
+  relayOfficialHttp,
+  validateOfficialRelayPath,
+} from "./official-relay.mjs";
+import { OfficialWebSocketSession } from "./official-websocket.mjs";
 export function createGateway(config, options = {}) {
   const log =
     options.log ??
@@ -50,6 +62,14 @@ export function createGateway(config, options = {}) {
           ...Object.keys(engine.config.subscription?.customModels ?? {}),
         ]
       : Object.values(engine.config.targets).map((t) => t.model);
+  const subscriptionAuthorized = async (headers) => {
+    if (!engine.config.subscription?.enabled)
+      throw fail("subscription_disabled", 404);
+    if (!headers.authorization?.startsWith("Bearer "))
+      throw fail("subscription_auth_required", 401);
+    if (engine.resolveIdentity)
+      await engine.resolveIdentity("subscription", headers);
+  };
   const controller = () => {
     const c = new AbortController();
     controllers.add(c);
@@ -89,60 +109,114 @@ export function createGateway(config, options = {}) {
         accepting,
         activeTurns: controllers.size,
       });
-    if (entryOf(req.url) === "api" && !(await apiAuthorized(req.headers)))
-      return json(res, 401, publicError(fail("local_access_denied", 401)));
-    if (
-      req.method === "GET" &&
-      ["/v1/models", "/subscription/v1/models"].includes(req.url)
-    )
+    const entry = entryOf(req.url);
+    try {
+      if (entry === "api" && !(await apiAuthorized(req.headers)))
+        return json(res, 401, publicError(fail("local_access_denied", 401)));
+      if (entry === "subscription") await subscriptionAuthorized(req.headers);
+    } catch (error) {
+      return json(res, error.status ?? 401, publicError(error));
+    }
+    const pathname = (() => {
+      try { return new URL(req.url, "http://router.invalid").pathname; }
+      catch { return ""; }
+    })();
+    if (req.method === "GET" && pathname === "/v1/models")
       return json(res, 200, {
         object: "list",
-        data: [...new Set(models(entryOf(req.url)))].map((id) => ({
-          id,
-          object: "model",
-        })),
+        data: [...new Set(models("api"))].map((id) => ({ id, object: "model" })),
       });
-    if (
-      req.method !== "POST" ||
-      !["/v1/responses", "/subscription/v1/responses"].includes(req.url)
-    )
+    if (entry === "api" && !(req.method === "POST" && pathname === "/v1/responses"))
       return json(res, 404, publicError(fail("not_found", 404)));
+    if (entry === "subscription") {
+      try { validateOfficialRelayPath(req.url, req.method); }
+      catch (error) { return json(res, error.status, publicError(error)); }
+    }
     if (!accepting)
       return json(res, 503, publicError(fail("service_draining", 503)));
     if (controllers.size >= (engine.config.maxConnections ?? 64))
       return json(res, 503, publicError(fail("capacity_exceeded", 503)));
-    const c = controller(),
-      requestId = randomUUID(),
-      startedAt = Date.now();
-    res.setHeader("x-gateway-request-id", requestId);
+    const c = controller(), requestId = randomUUID(), startedAt = Date.now();
     req.on("aborted", () => c.abort());
     res.on("close", () => {
       if (!res.writableFinished) c.abort();
     });
     const bodyStats = {};
-    let phase = "request_body",
-      requestModel;
+    let phase = "request_body", requestModel, responseStreaming = false, responseSequence = 0;
     try {
-      const body = await readRequestBody(req, {
-        limit: engine.config.maxBodyBytes ?? 20 * 1024 * 1024,
-        signal: c.signal,
-        stats: bodyStats,
-      });
-      requestModel =
-        typeof body?.model === "string" && body.model.length <= 200
-          ? body.model
-          : undefined;
+      const isResponses = pathname === "/subscription/v1/responses" || pathname === "/v1/responses";
+      let body, wire;
+      if (isResponses) {
+        const read = await readRequestBodyWithWire(req, {
+          limit: engine.config.maxBodyBytes ?? 20 * 1024 * 1024,
+          signal: c.signal,
+          stats: bodyStats,
+        });
+        body = read.body;
+        wire = read.wire;
+        responseStreaming = body.stream === true;
+        requestModel =
+          typeof body?.model === "string" && body.model.length <= 200
+            ? body.model
+            : undefined;
+      } else {
+        wire = await readWireBody(req, {
+          limit: engine.config.maxBodyBytes ?? 20 * 1024 * 1024,
+          signal: c.signal,
+          stats: bodyStats,
+        });
+      }
+
+      if (entry === "subscription") {
+        const custom = isResponses && engine.config.subscription.customModels?.[body.model];
+        let managed = false, officialClassification;
+        if (custom) {
+          await engine.requireObservedHistory(req.headers, body);
+          managed = true;
+        } else if (isResponses) {
+          officialClassification = await engine.officialRequestNeedsEngine(req.headers, body);
+          managed = officialClassification.needsEngine;
+        }
+        if (!managed) {
+          phase = "official_relay";
+          const requestWire = wire.length || req.headers["content-length"] || req.headers["transfer-encoding"]
+            ? wire
+            : undefined;
+          const result = await relayOfficialHttp({
+            req,
+            res,
+            wire: requestWire,
+            config: engine.config,
+            signal: c.signal,
+            send: options.officialRequest,
+            log,
+            observe: isResponses
+              ? (observation) => engine.queueOfficialObservation(
+                  officialClassification,
+                  () => engine.observeOfficial(req.headers, body, observation),
+                )
+              : undefined,
+          });
+          log({
+            event: "official_relay_completed",
+            transport: "http",
+            request_id: requestId,
+            path: pathname,
+            status: result.status,
+            response_bytes: result.bytes,
+            catalog_injected: result.injected,
+            duration_ms: Date.now() - startedAt,
+          });
+          return;
+        }
+      }
+
       phase = "inference";
+      res.setHeader("x-gateway-request-id", requestId);
       let response;
-      let seq = 0;
-      for await (const e of engine.generate(
-        entryOf(req.url),
-        req.headers,
-        body,
-        c.signal,
-      )) {
-        if (["response.completed", "response.incomplete"].includes(e.type))
-          response = e.response;
+      for await (const event of engine.generate(entry, req.headers, body, c.signal)) {
+        if (["response.completed", "response.incomplete"].includes(event.type))
+          response = event.response;
         if (body.stream) {
           if (!res.headersSent)
             res.writeHead(200, {
@@ -151,7 +225,7 @@ export function createGateway(config, options = {}) {
             });
           await write(
             res,
-            `event: ${e.type}\ndata: ${JSON.stringify({ ...e, sequence_number: seq++ })}\n\n`,
+            `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number: responseSequence++ })}\n\n`,
             c.signal,
           );
         }
@@ -159,7 +233,7 @@ export function createGateway(config, options = {}) {
       if (!response) throw fail("upstream_stream_incomplete", 502);
       if (body.stream) res.end();
       else json(res, 200, response);
-    } catch (e) {
+    } catch (error) {
       log({
         event: "request_error",
         at: new Date().toISOString(),
@@ -169,10 +243,23 @@ export function createGateway(config, options = {}) {
         request_id: requestId,
         model: requestModel,
         duration_ms: Date.now() - startedAt,
-        type: e.type ?? "gateway_error",
-        status: e.status ?? 502,
+        type: error.type ?? "gateway_error",
+        status: error.status ?? 502,
+        error_name: error.type ? undefined : error.name,
       });
-      if (!res.headersSent) json(res, e.status ?? 502, publicError(e));
+      if (!res.headersSent) json(res, error.status ?? 502, publicError(error));
+      else if (
+        responseStreaming &&
+        ["disallowed_plugin_tool_call", "tool_policy_conflict"].includes(error.type)
+      )
+        res.end(
+          `event: error\ndata: ${JSON.stringify({
+            type: "error",
+            status: error.status ?? 502,
+            ...publicError(error),
+            sequence_number: responseSequence++,
+          })}\n\n`,
+        );
       else res.destroy();
     } finally {
       c.abort();
@@ -187,8 +274,15 @@ export function createGateway(config, options = {}) {
     perMessageDeflate: false,
   });
   server.on("upgrade", async (req, socket, head) => {
+    const pathname = (() => {
+      try { return new URL(req.url, "http://router.invalid").pathname; }
+      catch { return ""; }
+    })();
     if (
-      !["/v1/responses", "/subscription/v1/responses"].includes(req.url) ||
+      !(
+        pathname === "/v1/responses" ||
+        pathname.startsWith("/subscription/v1/")
+      ) ||
       !allowedOrigin(req) ||
       wss.clients.size >= (engine.config.maxConnections ?? 64)
     )
@@ -197,14 +291,16 @@ export function createGateway(config, options = {}) {
       return socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
     if (entryOf(req.url) === "api" && !(await apiAuthorized(req.headers).catch(() => false)))
       return socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-    if (
-      entryOf(req.url) === "subscription" &&
-      (!engine.config.subscription?.enabled ||
-        !req.headers.authorization?.startsWith("Bearer "))
-    )
-      return socket.end(
-        "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n",
-      );
+    if (entryOf(req.url) === "subscription") {
+      try {
+        validateOfficialRelayPath(req.url, "GET");
+        await subscriptionAuthorized(req.headers);
+      } catch {
+        return socket.end(
+          "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n",
+        );
+      }
+    }
     wss.handleUpgrade(req, socket, head, (ws) =>
       wss.emit("connection", ws, req),
     );
@@ -217,11 +313,28 @@ export function createGateway(config, options = {}) {
       active,
       queue = Promise.resolve(),
       queued = 0;
+    const entry = entryOf(req.url);
+    const pathname = new URL(req.url, "http://router.invalid").pathname;
+    const officialSession = entry === "subscription"
+      ? new OfficialWebSocketSession(headers, {
+          createSocket: options.createOfficialWebSocket,
+          url: officialRelayUrl(req.url, "GET").replace(/^https:/, "wss:"),
+          maxPayload: engine.config.maxBodyBytes ?? 20 * 1024 * 1024,
+          log,
+        })
+      : null;
     const send = (event) =>
       new Promise((resolve, reject) => {
         if (ws.readyState !== 1) return reject(fail("cancelled", 499));
         ws.send(JSON.stringify(event), (e) =>
           e ? reject(fail("cancelled", 499)) : resolve(),
+        );
+      });
+    const sendRaw = (data, isBinary) =>
+      new Promise((resolve, reject) => {
+        if (ws.readyState !== 1) return reject(fail("cancelled", 499));
+        ws.send(data, { binary: !!isBinary }, (error) =>
+          error ? reject(fail("cancelled", 499)) : resolve(),
         );
       });
     let alive = true;
@@ -237,9 +350,10 @@ export function createGateway(config, options = {}) {
     ws.on("close", () => {
       clearInterval(heartbeat);
       active?.abort();
+      officialSession?.close();
     });
     ws.on("error", () => active?.abort());
-    ws.on("message", (data) => {
+    ws.on("message", (data, isBinary) => {
       if (queued >= 8) {
         ws.close(1008, "request queue exceeded");
         return;
@@ -268,6 +382,14 @@ export function createGateway(config, options = {}) {
             requestModel,
             phase = "request";
           try {
+            if (entry === "subscription" && pathname !== "/subscription/v1/responses") {
+              phase = "official_relay";
+              await officialSession.run(data, isBinary, {
+                signal: active.signal,
+                forward: sendRaw,
+              });
+              return;
+            }
             const message = parseJSON(data);
             requestModel =
               typeof message?.model === "string" && message.model.length <= 200
@@ -278,17 +400,42 @@ export function createGateway(config, options = {}) {
             const body = { ...message, stream: true };
             delete body.type;
             phase = "inference";
+            const custom =
+              entry === "subscription" &&
+              engine.config.subscription.customModels?.[body.model];
+            let managed = entry !== "subscription", officialClassification;
+            if (custom) {
+              await engine.requireObservedHistory(headers, body);
+              managed = true;
+            } else if (entry === "subscription") {
+              officialClassification = await engine.officialRequestNeedsEngine(headers, body);
+              managed = officialClassification.needsEngine;
+            }
+            if (!managed) {
+              phase = "official_relay";
+              await officialSession.run(data, isBinary, {
+                signal: active.signal,
+                forward: sendRaw,
+                observe: message.generate === false
+                  ? undefined
+                  : (event) => engine.queueOfficialObservation(
+                      officialClassification,
+                      () => engine.observeOfficialEvent(headers, body, event),
+                    ),
+              });
+              return;
+            }
             delete body.generate;
             if (message.generate === false) {
               // Local protocol prewarm only; route/auth validation still applies.
-              engine.route(engine.config, entryOf(req.url), body, { headers });
+              engine.route(engine.config, entry, body, { headers });
               const response = {
                 id: `warmup_${randomUUID()}`,
                 object: "response",
                 status: "completed",
                 output: [],
               };
-              const ctx = await engine.identify(entryOf(req.url), headers, body);
+              const ctx = await engine.identify(entry, headers, body);
               const warmInput =
                 typeof body.input === "string"
                   ? [{ role: "user", content: body.input }]
@@ -381,6 +528,7 @@ if (
   try {
     checkTransport();
     const config = await loadConfig(path);
+    const toolRegistry = await discoverToolSources();
     const persistent = config.history?.persistent;
     const archive = persistent?.enabled
       ? await openArchive(persistent, {
@@ -391,6 +539,7 @@ if (
       archive,
       closeArchive: !!archive,
       resolveIdentity: createLocalIdentityResolver(),
+      toolRegistry,
     });
     gateway.server.listen(
       config.listen?.port ?? 8788,

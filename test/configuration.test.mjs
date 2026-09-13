@@ -175,3 +175,33 @@ test("Responses message phase policy is provider-scoped and validated", () => {
     /invalid Responses message phase policy guess/,
   );
 });
+
+test("Plugin policy config keeps legacy targets passthrough and validates families and aliases", () => {
+  const input = upgradeConfig(legacy()).config;
+  input.targets.deepseek.modelFamily = "openai-gpt";
+  input.targets.deepseek.pluginToolPolicy = {
+    mode: "allowlist",
+    allowedPlugins: ["spreadsheets", "github"],
+  };
+  input.pluginTools = {
+    thirdPartyGpt: {
+      additionalAllowedPlugins: ["gmail"],
+      excludedDefaultPlugins: ["sites"],
+    },
+  };
+  const normalized = validate(input);
+  assert.deepEqual(normalized.targets.deepseek.pluginToolPolicy.allowedPlugins, [
+    "connected_documents",
+    "github",
+  ]);
+  assert.equal(normalized.targets.deepseek.modelFamily, "openai-gpt");
+
+  const invalid = structuredClone(input);
+  invalid.targets.deepseek.modelFamily = "gpt";
+  assert.throws(() => validate(invalid), /invalid model family/);
+
+  const conflict = structuredClone(input);
+  conflict.pluginTools.thirdPartyGpt.additionalAllowedPlugins = ["spreadsheets"];
+  conflict.pluginTools.thirdPartyGpt.excludedDefaultPlugins = ["codex_document_control"];
+  assert.throws(() => validate(conflict), /both adds and excludes connected_documents/);
+});

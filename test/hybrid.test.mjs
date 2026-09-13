@@ -103,7 +103,8 @@ test("subscription identities stay official; Go headers and metadata are isolate
     seen[1].headers["x-opencode-session"],
     seen[2].headers["x-opencode-session"],
   );
-  await assert.rejects(collect(engine, { model: "unknown" }), /unknown_model/);
+  await collect(engine, { model: "unknown" });
+  assert.equal(seen[3].body.model, "unknown");
   await assert.rejects(
     collect(engine, { model: "gpt-5.5" }, "subscription", {}),
     /subscription_auth_required/,
@@ -499,12 +500,24 @@ test("production HTTP and WebSocket entrypoints, prewarm and origin rejection", 
         { type: "response.completed", response: result() },
       ]);
     },
+    officialRequest: async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "application/json" }),
+      rawHeaders: [["content-type", "application/json"]],
+      body: Readable.from([JSON.stringify({
+        models: [{ slug: "gpt-5.5", display_name: "GPT 5.5", priority: 10 }],
+      })]),
+    }),
     log: () => {},
   });
   await new Promise((r) => gateway.server.listen(0, "127.0.0.1", r));
   t.after(() => gateway.close());
   const base = `http://127.0.0.1:${gateway.server.address().port}`;
-  assert.equal((await fetch(base + "/subscription/v1/models")).status, 200);
+  assert.equal((await fetch(base + "/subscription/v1/models")).status, 401);
+  assert.equal((await fetch(base + "/subscription/v1/models", {
+    headers: { authorization: "Bearer test" },
+  })).status, 200);
   assert.equal(
     (
       await fetch(base + "/v1/models", {
@@ -536,7 +549,7 @@ test("production HTTP and WebSocket entrypoints, prewarm and origin rejection", 
   ws.send(
     JSON.stringify({
       type: "response.create",
-      model: "gpt-5.5",
+      model: "deepseek-v4.1-flash",
       generate: false,
     }),
   );
@@ -546,7 +559,7 @@ test("production HTTP and WebSocket entrypoints, prewarm and origin rejection", 
   ws.send(
     JSON.stringify({
       type: "response.create",
-      model: "gpt-5.5",
+      model: "deepseek-v4.1-flash",
       previous_response_id: warm.response.id,
       input: [{ role: "user", content: "hi" }],
     }),

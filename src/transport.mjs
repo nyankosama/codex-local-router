@@ -43,6 +43,19 @@ export function request(
   url,
   { headers = {}, body, signal, timeoutMs = 180000 } = {},
 ) {
+  return requestRaw(url, {
+    method: "POST",
+    headers,
+    body: Buffer.from(JSON.stringify(body)),
+    signal,
+    timeoutMs,
+  });
+}
+
+export function requestRaw(
+  url,
+  { method = "GET", headers = {}, body, signal, timeoutMs = 180000 } = {},
+) {
   if (signal?.aborted) return Promise.reject(fail("cancelled", 499));
   return new Promise((resolve, reject) => {
     const output = new PassThrough({ highWaterMark: 64 * 1024 });
@@ -61,9 +74,9 @@ export function request(
         "--max-time",
         String(timeoutMs / 1000),
         "--config",
-        "-",
+        "/dev/fd/3",
       ],
-      { stdio: ["pipe", "pipe", "pipe"] },
+      { stdio: ["pipe", "pipe", "pipe", "pipe"] },
     );
     children.add(child);
     let header = Buffer.alloc(0),
@@ -91,13 +104,21 @@ export function request(
     child.stderr.on("data", (chunk) => {
       stderr = (stderr + chunk).slice(-4096);
     });
-    child.stdin.end(
-      `url = ${JSON.stringify(url)}\nrequest = "POST"\n${Object.entries(headers)
-        .map(([k, v]) => `header = ${JSON.stringify(`${k}: ${v}`)}`)
-        .join(
-          "\n",
-        )}\nheader = "Expect:"\ndata-binary = ${JSON.stringify(JSON.stringify(body))}\n`,
+    const headerLines = Object.entries(headers).flatMap(([key, value]) =>
+      (Array.isArray(value) ? value : [value])
+        .filter((item) => item != null)
+        .map((item) => `header = ${JSON.stringify(`${key}: ${item}`)}`),
     );
+    child.stdio[3].on("error", () => {});
+    child.stdio[3].end([
+      `url = ${JSON.stringify(url)}`,
+      `request = ${JSON.stringify(method)}`,
+      ...headerLines,
+      'header = "Expect:"',
+      ...(body == null ? [] : ['data-binary = "@-"']),
+      "",
+    ].join("\n"));
+    child.stdin.end(body ?? undefined);
     child.stdout.on("data", (chunk) => {
       if (!started) {
         header = Buffer.concat([header, chunk]);
@@ -119,10 +140,14 @@ export function request(
             return;
           }
           if (status < 200) continue;
-          const h = new Headers();
+          const h = new Headers(), rawHeaders = [];
           for (const line of raw.split("\r\n").slice(1)) {
             const i = line.indexOf(":");
-            if (i > 0) h.append(line.slice(0, i), line.slice(i + 1).trim());
+            if (i > 0) {
+              const key = line.slice(0, i), value = line.slice(i + 1).trim();
+              h.append(key, value);
+              rawHeaders.push([key, value]);
+            }
           }
           started = true;
           settled = true;
@@ -130,6 +155,7 @@ export function request(
             status,
             ok: status >= 200 && status < 300,
             headers: h,
+            rawHeaders,
             body: output,
           });
           chunk = header;

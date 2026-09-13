@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-13
+
+- Added immutable, content-addressed configuration spaces containing providers, models, default model, routing, Plugin, search, compression, and subscription-routing policy, while machine listener/access/history/resource settings remain global.
+- Added protected `official@1`, legacy migration to `default@1`, cloning, history, diff, drift capture, explicit historical activation, and rollback to the previous successful activation.
+- Added a hash-bound space-switch transaction and one-shot non-KeepAlive LaunchAgent. Running Codex App now leaves switching pending until normal exit; active Gateway turns drain before materialization, and concurrent file changes fail closed with recovery material retained.
+- Added `space` CLI commands, `--space` editing for Provider/model/config operations, Schema 4 integration references, official-space service guards, and an App-closed `official@1` subscription rescue path.
+- Added a fixed-destination, query-preserving HTTP and WebSocket relay for official `/subscription/v1/**` traffic, including standalone search, model discovery, future auxiliary endpoints, cancellation, and bounded side-channel history observation.
+- Changed subscription model routing so explicit custom App model mappings win while all other model IDs are left for the official backend to accept or reject.
+- Added target-level `modelFamily` and `pluginToolPolicy`, a configurable third-party GPT Plugin allowlist, read-only Plugin/MCP source discovery, tool-choice conflict handling, and a downstream guard for disallowed Plugin calls. Codex core tools, user MCP, unknown sources, Skills, Hooks, and prompt text are preserved.
+- Added ai.feei Responses presets for `feei-gpt-5.6-sol` and `feei-gpt-6-astra`, with conservative 272,000-token windows and standalone App search capability kept separate from provider-native hosted search.
+- Added deterministic A1-A10 coverage and an opt-in five-turn focused acceptance runner with hard turn/generation budgets and metadata-only evidence.
+
 ## 0.2.1 - 2026-09-13
 
 - Added an end-to-end acceptance harness (`npm run e2e`, `e2e:l0|l1|l2|live`) that drives the Codex App core and reports PASS/ANOMALY/FAIL from machine-checkable criteria, with isolated `CODEX_HOME`, a random loopback port, external-process health sampling, and per-case evidence under `artifacts/e2e/<runId>/`.

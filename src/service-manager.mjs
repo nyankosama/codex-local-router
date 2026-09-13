@@ -5,12 +5,13 @@ import { createServer } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { atomicJSON, atomicWrite, readJSON } from "./files.mjs";
+import { atomicJSON, atomicWrite, readJSON, withFileLock } from "./files.mjs";
 import { loadConfig } from "./config.mjs";
 import { PACKAGE_VERSION, runtimePaths } from "./product.mjs";
 
 const exec = promisify(execFile);
 export const SERVICE_LABEL = "com.nyankosama.codex-local-router";
+export const SPACE_SWITCHER_LABEL = "com.nyankosama.codex-local-router.space-switcher";
 
 const xml = (value) => String(value)
   .replaceAll("&", "&amp;")
@@ -21,6 +22,11 @@ const xml = (value) => String(value)
 export function launchAgentPath(env = process.env) {
   return env.CODEX_LOCAL_ROUTER_LAUNCH_AGENT ??
     join(homedir(), "Library", "LaunchAgents", `${SERVICE_LABEL}.plist`);
+}
+
+export function spaceSwitcherLaunchAgentPath(env = process.env) {
+  return env.CODEX_LOCAL_ROUTER_SPACE_SWITCHER_LAUNCH_AGENT ??
+    join(dirname(launchAgentPath(env)), `${SPACE_SWITCHER_LABEL}.plist`);
 }
 
 export function renderLaunchAgent({
@@ -53,6 +59,47 @@ ${environment}
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>${xml(log)}</string>
+  <key>StandardErrorPath</key><string>${xml(log)}</string>
+</dict></plist>
+`;
+}
+
+export function renderSpaceSwitcherLaunchAgent({
+  node = process.execPath,
+  admin,
+  log,
+  env = {},
+}) {
+  const variables = {};
+  for (const key of [
+    "CODEX_HOME",
+    "CODEX_CONFIG_PATH",
+    "CODEX_MODEL_CATALOG_SOURCE",
+    "CODEX_LOCAL_ROUTER_HOME",
+    "CODEX_LOCAL_ROUTER_CONFIG",
+    "CODEX_LOCAL_ROUTER_LAUNCH_AGENT",
+    "CODEX_LOCAL_ROUTER_SPACE_SWITCHER_LAUNCH_AGENT",
+    "CODEX_APP_EXECUTABLE",
+  ]) if (env[key]) variables[key] = env[key];
+  const environment = Object.entries(variables)
+    .map(([key, value]) => `    <key>${key}</key><string>${xml(value)}</string>`)
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${SPACE_SWITCHER_LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${xml(node)}</string><string>${xml(admin)}</string>
+    <string>space</string><string>resume</string><string>--coordinator</string><string>--json</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+${environment}
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>${xml(log)}</string>
   <key>StandardErrorPath</key><string>${xml(log)}</string>
 </dict></plist>
@@ -101,8 +148,14 @@ export async function serviceStatus(configPath, env = process.env) {
       } catch {}
     }
   } catch {}
+  const installed = await access(launchAgentPath(env)).then(() => true, () => false);
+  const loaded = env.CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL === "1"
+    ? env.CODEX_LOCAL_ROUTER_TEST_SERVICE_LOADED === "1"
+    : await launchctl(["print", `${domain()}/${SERVICE_LABEL}`], env)
+      .then(() => true, () => false);
   return {
-    installed: await access(launchAgentPath(env)).then(() => true, () => false),
+    installed,
+    loaded,
     running: !!health,
     saved,
     installation,
@@ -174,6 +227,120 @@ export async function uninstallService(options = {}) {
   await stopService({ env, ignoreMissing: true });
   await rm(launchAgentPath(env), { force: true });
   return { removed: true };
+}
+
+export async function installSpaceSwitcher(options = {}) {
+  const env = options.env ?? process.env;
+  const paths = runtimePaths(env);
+  return withSpaceSwitcherLock(paths, async () => {
+    const control = options.launchctl ?? ((args) => launchctl(args, env));
+    const admin = options.adminPath ?? fileURLToPath(
+      new URL("../scripts/gateway-admin.mjs", import.meta.url),
+    );
+    const plist = spaceSwitcherLaunchAgentPath(env);
+    await mkdir(dirname(plist), { recursive: true, mode: 0o700 });
+    await mkdir(paths.logs, { recursive: true, mode: 0o700 });
+    const desired = renderSpaceSwitcherLaunchAgent({
+      node: process.execPath,
+      admin,
+      log: paths.serviceLog,
+      env,
+    });
+    const prior = await readFile(plist, "utf8").catch(() => null);
+    const label = `${domain()}/${SPACE_SWITCHER_LABEL}`;
+    const loaded = await control(["print", label]).then(() => true, () => false);
+    if (prior !== desired) {
+      if (loaded) await control(["bootout", domain(), plist]);
+      await atomicWrite(plist, desired, 0o600);
+    }
+    if (!loaded || prior !== desired) {
+      try {
+        await control(["bootstrap", domain(), plist]);
+      } catch (error) {
+        if (!(await control(["print", label]).then(() => true, () => false))) throw error;
+      }
+    }
+    await control(["kickstart", label]);
+    const state = {
+      label: SPACE_SWITCHER_LABEL,
+      launchAgent: plist,
+      installedAt: Date.now(),
+    };
+    await atomicJSON(paths.spaceSwitcherInstall, state);
+    return state;
+  }, options.switcherLockWaitMs);
+}
+
+async function withSpaceSwitcherLock(paths, callback, waitMs = 60000) {
+  const lock = `${paths.spaceSwitcherInstall}.lock`;
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      return await withFileLock(lock, callback);
+    } catch (error) {
+      if (error.code !== "operation_locked" || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}
+
+export async function uninstallSpaceSwitcher(options = {}) {
+  const env = options.env ?? process.env;
+  const paths = runtimePaths(env);
+  return withSpaceSwitcherLock(paths, async () => {
+    const plist = spaceSwitcherLaunchAgentPath(env);
+    if (!options.skipBootout)
+      await launchctl(["bootout", domain(), plist], env).catch(() => {});
+    await rm(plist, { force: true });
+    await rm(paths.spaceSwitcherInstall, { force: true });
+    return { removed: true };
+  }, options.switcherLockWaitMs);
+}
+
+export async function spaceSwitcherStatus(env = process.env) {
+  const paths = runtimePaths(env);
+  return {
+    installed: await access(spaceSwitcherLaunchAgentPath(env)).then(() => true, () => false),
+    loaded: await launchctl(["print", `${domain()}/${SPACE_SWITCHER_LABEL}`], env)
+      .then(() => true, () => false),
+    installation: await readJSON(paths.spaceSwitcherInstall, null),
+  };
+}
+
+export async function drainService(configPath, options = {}) {
+  const env = options.env ?? process.env;
+  const waitMs = options.waitMs ?? 300000;
+  const signal = options.signal ?? process.kill;
+  const before = await serviceStatus(configPath, env);
+  if (!before.health) {
+    if (before.loaded)
+      return {
+        drained: false,
+        wasRunning: true,
+        reason: "health_unavailable",
+        before,
+      };
+    return { drained: true, wasRunning: false, before };
+  }
+  if (!before.health.pid)
+    return {
+      drained: false,
+      wasRunning: true,
+      reason: "health_unavailable",
+      before,
+    };
+  signal(before.health.pid, "SIGUSR2");
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const state = await serviceStatus(configPath, env);
+    if (state.health?.activeTurns === 0)
+      return { drained: true, wasRunning: true, before, state };
+    if (Date.now() >= deadline) {
+      signal(before.health.pid, "SIGUSR1");
+      return { drained: false, wasRunning: true, reason: "active_turn_timeout", before };
+    }
+    await new Promise((done) => setTimeout(done, options.pollMs ?? 500));
+  }
 }
 
 async function freePort() {

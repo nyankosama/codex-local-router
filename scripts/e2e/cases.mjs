@@ -125,7 +125,7 @@ function buildObservation({ id, ctx, gateway, probe, extra = {} }) {
     case: id,
     runId: ctx.runId,
     startedAt: probe?.startedAt ?? Date.now(),
-    entry: { kind: ctx.entryKind, binary: ctx.core.path, sha256: ctx.core.sha256, version: ctx.core.version },
+    entry: { kind: ctx.entryKind, binary: ctx.core.source, sha256: ctx.core.sha256, version: ctx.core.version },
     gateway: { url: gateway.url, version: PACKAGE_VERSION, instance: null },
     result: "PASS",
     terminal: events.filter((x) => TERMINAL.includes(x.type)),
@@ -336,7 +336,6 @@ export async function e2e2(ctx) {
       JSON.stringify(thirdParty.map((x) => ({ host: x.host, bearer: x.subscriptionBearer, account: x.accountHeader }))),
     );
 
-    const probeText = [turn.text, firstText].join("\n");
     const healthSamples = health.stop().map((x) => ({ at: x.at, ms: x.ms, ok: x.ok, activeTurns: x.activeTurns }));
     return buildObservation({
       id: "E2E-2", ctx, gateway: gw,
@@ -348,7 +347,11 @@ export async function e2e2(ctx) {
         eventLoopDelayP99Ms: loop.stop(),
         historyVersionsDelta: gw.archive.stats().versions - versions0,
         toolsExecutedLocally: false,
-        detail: { appText: probeText.slice(0, 200), imageDescription: Boolean(describeLog) },
+        detail: {
+          appAnswerObserved: turn.text.length > 0,
+          imageAnswerObserved: firstText.length > 0,
+          imageDescription: Boolean(describeLog),
+        },
       },
     });
   } finally {
