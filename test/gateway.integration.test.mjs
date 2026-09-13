@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,13 @@ const json = (res, value, status = 200) => {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(value));
 };
+const gatewayEnv = (dir, configPath) => ({
+  ...process.env,
+  CODEX_LOCAL_ROUTER_HOME: join(dir, "router-home"),
+  GATEWAY_CONFIG: configPath,
+  GATEWAY_STATE_PATH: join(dir, "gateway-state.json"),
+  GATEWAY_INSTANCE_ID: `test-${process.pid}`,
+});
 
 for (const failureStatus of [429, 503])
   test(`Gateway forwards session, converts chat, and falls back on ${failureStatus}`, async (t) => {
@@ -64,9 +71,10 @@ for (const failureStatus of [429, 503])
       rules: [],
       fallbackTarget: "fallback",
     };
-    await writeFile(join(dir, "config.json"), JSON.stringify(config));
+    const configPath = join(dir, "config.json");
+    await writeFile(configPath, JSON.stringify(config));
     const gateway = spawn(process.execPath, ["src/server.mjs"], {
-      env: { ...process.env, GATEWAY_CONFIG: join(dir, "config.json") },
+      env: gatewayEnv(dir, configPath),
       stdio: ["ignore", "pipe", "pipe"],
     });
     t.after(async () => {
@@ -97,6 +105,9 @@ for (const failureStatus of [429, 503])
     assert.equal(value.output_text, "ok");
     assert.equal(calls, 2);
     assert.equal(seenSession, "session-it");
+    const state = JSON.parse(await readFile(join(dir, "gateway-state.json"), "utf8"));
+    assert.equal(state.configPath, configPath);
+    assert.equal(state.instance, `test-${process.pid}`);
   });
 
 test("Gateway falls back after an upstream timeout", async (t) => {
@@ -136,9 +147,10 @@ test("Gateway falls back after an upstream timeout", async (t) => {
     rules: [],
     fallbackTarget: "fallback",
   };
-  await writeFile(join(dir, "config.json"), JSON.stringify(config));
+  const configPath = join(dir, "config.json");
+  await writeFile(configPath, JSON.stringify(config));
   const gateway = spawn(process.execPath, ["src/server.mjs"], {
-    env: { ...process.env, GATEWAY_CONFIG: join(dir, "config.json") },
+    env: gatewayEnv(dir, configPath),
     stdio: ["ignore", "pipe", "ignore"],
   });
   t.after(async () => {
@@ -199,9 +211,10 @@ test("Gateway does not fallback after a stream has started", async (t) => {
     rules: [],
     fallbackTarget: "fallback",
   };
-  await writeFile(join(dir, "config.json"), JSON.stringify(config));
+  const configPath = join(dir, "config.json");
+  await writeFile(configPath, JSON.stringify(config));
   const gateway = spawn(process.execPath, ["src/server.mjs"], {
-    env: { ...process.env, GATEWAY_CONFIG: join(dir, "config.json") },
+    env: gatewayEnv(dir, configPath),
     stdio: ["ignore", "pipe", "ignore"],
   });
   t.after(async () => {

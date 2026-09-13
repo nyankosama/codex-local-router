@@ -9,6 +9,10 @@ const { stdout } = await exec("npm", ["pack", "--dry-run", "--json"], {
 });
 const report = JSON.parse(stdout)[0];
 const names = report.files.map((file) => file.path);
+const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+for (const command of ["codex-local-router", "llm-auto-gateway"])
+  if (packageJson.bin?.[command] !== "scripts/gateway-admin.mjs")
+    throw Error(`package is missing the ${command} executable`);
 const denied = names.filter((name) =>
   /(^|\/)(artifacts|test|\.runtime|node_modules)(\/|$)/.test(name) ||
   /(^|\/)(auth\.json|history\.sqlite|gateway\.subscription\.local\.json)$/.test(name) ||
@@ -30,4 +34,4 @@ for (const name of textFiles) {
     if (pattern.test(body)) findings.push(`${name}: ${label}`);
 }
 if (findings.length) throw Error(`package content audit failed:\n${findings.join("\n")}`);
-console.log(JSON.stringify({ ok: true, package: report.filename, files: names.length, bytes: report.size }, null, 2));
+console.log(JSON.stringify({ ok: true, package: report.filename, files: names.length, bytes: report.size, commands: Object.keys(packageJson.bin) }, null, 2));

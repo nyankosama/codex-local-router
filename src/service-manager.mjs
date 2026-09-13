@@ -79,13 +79,19 @@ const domain = () => `gui/${process.getuid()}`;
 
 export async function serviceStatus(configPath, env = process.env) {
   const paths = runtimePaths(env);
-  const saved = await readJSON(paths.serviceState, null);
+  const recorded = await readJSON(paths.serviceState, null);
   const installation = await readJSON(paths.serviceInstall, null);
   let health = null, healthUrl = null;
+  let saved = null;
   try {
-    const config = await loadConfig(configPath ?? saved?.configPath ?? paths.config);
+    const currentConfigPath = resolve(configPath ?? paths.config);
+    saved = recorded?.instance == null && recorded?.configPath &&
+      resolve(recorded.configPath) === currentConfigPath
+      ? recorded
+      : null;
+    const config = await loadConfig(currentConfigPath);
     const configuredUrl = `http://${config.listen?.host ?? "127.0.0.1"}:${config.listen?.port ?? 8788}`;
-    for (const url of new Set([saved?.url, configuredUrl].filter(Boolean))) {
+    for (const url of new Set([configuredUrl, saved?.url].filter(Boolean))) {
       try {
         const response = await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(1500) });
         if (!response.ok) continue;

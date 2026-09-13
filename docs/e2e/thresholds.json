@@ -1,0 +1,13 @@
+{
+  "$comment": "异常绊线单一来源。判据代码只读本文件，不内嵌数字。修改本文件属于 B 类，必须附证据并取得批准。",
+  "version": 1,
+  "firstSubstantiveEventMs": { "default": 30000, "large": 90000, "largeInputBytes": 400000 },
+  "firstTextMs": { "default": 45000, "large": 90000 },
+  "maxEventGapMs": 60000,
+  "reconnects": { "recordAt": 1, "anomalyAt": 2 },
+  "healthP95Ms": 1000,
+  "healthSampleIntervalMs": 400,
+  "eventLoopP99Ms": 200,
+  "activeTurnsIdleMs": 30000,
+  "liveUserInterferenceGuard": 4
+}

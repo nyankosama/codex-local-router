@@ -28,6 +28,7 @@ import {
   inputBudget,
   isExplicitContextError,
 } from "./context.mjs";
+const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value) ?? "");
 const searchFunction = {
   type: "function",
   name: "gateway_web_search",
@@ -288,6 +289,7 @@ export class Engine {
     };
   }
   async *generate(entry, headers, original, signal) {
+    const acceptedAt = Date.now();
     if (
       entry === "api" &&
       original &&
@@ -321,13 +323,17 @@ export class Engine {
           ? [{ role: "user", content: original.input }]
           : (original.input ?? []),
     };
+    const identityStartedAt = Date.now();
     const identityContext = await this.identify(entry, headers, body),
+      identityMs = Date.now() - identityStartedAt,
       ctx = { ...identityContext, entry, headers };
     ctx.channelSession =
       entry === "api" && headers["x-opencode-session"]
         ? headers["x-opencode-session"]
         : this.state.session(ctx);
-    const replay = this.state.replay(ctx, body);
+    const replayStartedAt = Date.now(),
+      replay = this.state.replay(ctx, body),
+      replayMs = Date.now() - replayStartedAt;
     body = replay.body;
     const turnKey = ctx.thread && ctx.turn ? ctx.owner + ":" + ctx.turn : null;
     // Compaction of the old model and inference by the selected model share a Codex
@@ -354,7 +360,7 @@ export class Engine {
     }
     const config = lease.config,
       requestId = randomUUID(),
-      startedAt = Date.now();
+      startedAt = acceptedAt;
     ctx.providerCalls = 0;
     let target = lease.target,
       output = false,
@@ -582,6 +588,15 @@ export class Engine {
         tool_results: body.input.filter(
           (x) => x.type === "function_call_output",
         ).length,
+        input_items: body.input.length,
+        tool_definitions: adapted.tools?.length ?? 0,
+        payload_bytes: jsonBytes(adapted),
+        instructions_bytes: jsonBytes(adapted.instructions),
+        input_bytes: jsonBytes(adapted.input),
+        tools_bytes: jsonBytes(adapted.tools),
+        request_setup_ms: Date.now() - startedAt,
+        identity_ms: identityMs,
+        history_replay_ms: replayMs,
         estimated_input_tokens: estimateRequestTokens(body),
         input_budget: inputBudget(target, body),
         count_quality: "estimate",
@@ -700,6 +715,12 @@ export class Engine {
           round++;
           continue;
         }
+        if (e && typeof e === "object")
+          e.gatewayContext = {
+            ...correlation,
+            provider: target.provider,
+            model: target.model,
+          };
         throw e;
       }
       if (!response) throw fail("upstream_stream_incomplete", 502);
@@ -1218,14 +1239,50 @@ export class Engine {
         : toChat({ ...body, stream: true }, target.model);
     if (target.provider === "chatgpt-subscription") payload.store = false;
     ctx.providerCalls = (ctx.providerCalls ?? 0) + 1;
-    const upstream = await callProvider(
-      config,
-      target,
-      payload,
-      ctx,
-      signal,
-      this.send,
-    );
+    const upstreamStartedAt = Date.now();
+    let upstream;
+    try {
+      upstream = await callProvider(
+        config,
+        target,
+        payload,
+        ctx,
+        signal,
+        this.send,
+      );
+    } catch (error) {
+      this.log({
+        event: "upstream_transport_error",
+        ...(hooks.correlation ?? {}),
+        provider: target.provider,
+        model: target.model,
+        duration_ms: Date.now() - upstreamStartedAt,
+        provider_queue_ms: ctx.providerQueue?.waitMs,
+        provider_queue_ahead: ctx.providerQueue?.ahead,
+        provider_active: ctx.providerQueue?.active,
+        provider_limit: ctx.providerQueue?.limit,
+        type: error?.type ?? "gateway_error",
+        status: error?.status ?? 502,
+        transport_code: error?.transportCode,
+        transport_category: error?.transportCategory,
+      });
+      throw error;
+    }
+    const upstreamHeadersAt = Date.now();
+    this.log({
+      event: "upstream_headers",
+      ...(hooks.correlation ?? {}),
+      provider: target.provider,
+      model: target.model,
+      status: upstream.status,
+      duration_ms: upstreamHeadersAt - upstreamStartedAt,
+      network_ms:
+        upstreamHeadersAt - upstreamStartedAt - (ctx.providerQueue?.waitMs ?? 0),
+      provider_queue_ms: ctx.providerQueue?.waitMs,
+      provider_queue_ahead: ctx.providerQueue?.ahead,
+      provider_active: ctx.providerQueue?.active,
+      provider_limit: ctx.providerQueue?.limit,
+    });
     if (!upstream.ok) {
       let detail;
       try {
@@ -1302,12 +1359,40 @@ export class Engine {
     if (target.wireApi === "responses") {
       let terminal;
       const outputItems = new Map();
-      let receivedBytes = 0;
+      let receivedBytes = 0,
+        upstreamSubstantive = false,
+        upstreamOutputText = false,
+        downstreamOutputText = false;
+      const engine = this;
       const measuredEvents = async function* () {
         for await (const event of sseEvents(upstream.body)) {
           receivedBytes += Buffer.byteLength(JSON.stringify(event));
-          if (isSubstantiveResponseEvent(event))
+          if (isSubstantiveResponseEvent(event)) {
             hooks.onUpstreamOutput?.(event);
+            if (!upstreamSubstantive) {
+              upstreamSubstantive = true;
+              engine.log({
+                event: "upstream_first_substantive_event",
+                ...(hooks.correlation ?? {}),
+                provider: target.provider,
+                model: target.model,
+                event_type: event.type,
+                duration_ms: Date.now() - upstreamStartedAt,
+                after_headers_ms: Date.now() - upstreamHeadersAt,
+              });
+            }
+          }
+          if (!upstreamOutputText && event.type === "response.output_text.delta") {
+            upstreamOutputText = true;
+            engine.log({
+              event: "upstream_first_output_text",
+              ...(hooks.correlation ?? {}),
+              provider: target.provider,
+              model: target.model,
+              duration_ms: Date.now() - upstreamStartedAt,
+              after_headers_ms: Date.now() - upstreamHeadersAt,
+            });
+          }
           if (receivedBytes > (config.maxBodyBytes ?? 20 * 1024 * 1024))
             throw fail("upstream_body_too_large", 502);
           yield event;
@@ -1336,6 +1421,17 @@ export class Engine {
             }),
         },
       )) {
+        if (!downstreamOutputText && event.type === "response.output_text.delta") {
+          downstreamOutputText = true;
+          this.log({
+            event: "downstream_first_output_text",
+            ...(hooks.correlation ?? {}),
+            provider: target.provider,
+            model: target.model,
+            duration_ms: Date.now() - upstreamStartedAt,
+            after_headers_ms: Date.now() - upstreamHeadersAt,
+          });
+        }
         if (event.type === "response.output_item.done" && event.item)
           outputItems.set(event.output_index ?? outputItems.size, event.item);
         if (["response.completed", "response.incomplete"].includes(event.type))

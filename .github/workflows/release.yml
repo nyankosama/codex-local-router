@@ -7,22 +7,60 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
+      - name: Validate immutable release identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          test "$GITHUB_REF_NAME" = "v$version"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace it." >&2
+            exit 1
+          fi
       - run: npm ci
       - run: npm test
+      - run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
       - run: npm run audit:package
-      - run: npm pack
-      - run: shasum -a 256 codex-local-router-*.tgz > codex-local-router-0.2.0.tgz.sha256
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            codex-local-router-0.2.0.tgz
-            codex-local-router-0.2.0.tgz.sha256
+      - run: node scripts/audit-public.mjs
+      - name: Build and verify release assets
+        id: assets
+        shell: bash
+        run: |
+          package_file="$(npm pack --json | node -e 'let value=""; process.stdin.on("data", chunk => value += chunk).on("end", () => process.stdout.write(JSON.parse(value)[0].filename))')"
+          checksum_file="$package_file.sha256"
+          shasum -a 256 "$package_file" > "$checksum_file"
+          mkdir -p "$RUNNER_TEMP/router-prefix"
+          npm install --prefix "$RUNNER_TEMP/router-prefix" --no-save "./$package_file"
+          expected="Codex Local Router $(node -p 'require("./package.json").version')"
+          test "$("$RUNNER_TEMP/router-prefix/node_modules/.bin/codex-local-router" --version)" = "$expected"
+          test "$("$RUNNER_TEMP/router-prefix/node_modules/.bin/llm-auto-gateway" --version)" = "$expected"
+          echo "package=$package_file" >> "$GITHUB_OUTPUT"
+          echo "checksum=$checksum_file" >> "$GITHUB_OUTPUT"
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "${{ steps.assets.outputs.package }}" \
+            "${{ steps.assets.outputs.checksum }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

@@ -40,6 +40,21 @@ test("integration sync is idempotent and disable preserves unrelated user edits"
   await writeFile(configPath, (await readFile(configPath, "utf8")) + '\n[projects."/after"]\ntrust_level = "trusted"\n');
   const third = await syncIntegration(config, { env, codexHome });
   assert.equal(third.changed, false);
+  await writeFile(
+    configPath,
+    (await readFile(configPath, "utf8")).replace(
+      'model = "gpt-5.5"',
+      'model = "deepseek-v4.1-flash"',
+    ),
+  );
+  assert.equal(
+    (await integrationStatus(config, { env, codexHome })).configCurrent,
+    true,
+  );
+  const selected = await syncIntegration(config, { env, codexHome });
+  assert.equal(selected.changed, true);
+  assert.equal(selected.pending, false);
+  assert.equal(selected.state.managed.model, "deepseek-v4.1-flash");
   const status = await integrationStatus(config, { env, codexHome });
   assert.equal(status.configCurrent, true);
   assert.equal(status.targets[0].contextWindow, 400000);

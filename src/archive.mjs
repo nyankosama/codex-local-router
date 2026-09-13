@@ -281,10 +281,12 @@ export class Archive {
   }
 
   ensureQuota(additionalBytes) {
-    const row = this.db
-      .prepare("SELECT coalesce(sum(bytes),0) AS bytes FROM blobs")
-      .get();
-    const used = Math.max(Number(row.bytes), this.physicalBytes());
+    // 配额用物理文件大小（O(1)）”估；`SUM(bytes)` 在数 GB 库上是全表扫描，
+    // 而每个 blob 写入都会走到这里，会阻塞主线程数秒（线上实测健康检查 p95 5s，
+    // sample 显示 87% 主线程采样停在 StatementSync::Get）。
+    // ponytail: 物理大小作为上界（blob 存在库内，sum ≤ file）；若将来出现库外溢存
+    // 再改成增量计数器。
+    const used = this.physicalBytes();
     if (used + additionalBytes > this.limit)
       throw fail(
         "history_disk_full",
@@ -545,7 +547,7 @@ export class Archive {
             this.opaque(history.branch),
             history.responseId,
           );
-        if (prior) return prior.version;
+        if (prior) return { version: prior.version, inserted: false };
       }
       const version = this.appendHistoryRow(history);
       const hash = this.putBlob({
@@ -571,7 +573,7 @@ export class Archive {
           this.opaque(history.thread),
           this.opaque(history.branch),
         );
-      return version;
+      return { version, inserted: true };
     });
   }
 

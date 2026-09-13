@@ -540,7 +540,7 @@ async function serviceCommand() {
 
 async function main() {
   if (flag("version") || group === "version") return console.log(`${PRODUCT_NAME} ${PACKAGE_VERSION}`);
-  if (!group || flag("help") || group === "help") return console.log("Usage: llm-auto-gateway <command> [subcommand] [options]\n\nCommands: setup, status, provider, model, models, integration, doctor, logs, service, upgrade, rescue, history, uninstall");
+  if (!group || flag("help") || group === "help") return console.log("Usage: codex-local-router <command> [subcommand] [options]\n\nCommands: setup, status, provider, model, models, integration, doctor, logs, service, upgrade, rescue, history, uninstall");
   if (group === "setup") return setup();
   if (group === "status") return status();
   if (group === "provider") return providerCommand();
@@ -590,7 +590,7 @@ catch (error) {
   const result = {
     ok: false, code, correlationId, message: error.message,
     impact: error.impact ?? "requested operation was not completed",
-    next: error.next ?? (code === "integration_conflict" ? "llm-auto-gateway integration status --json" : "llm-auto-gateway doctor --json"),
+    next: error.next ?? (code === "integration_conflict" ? "codex-local-router integration status --json" : "codex-local-router doctor --json"),
   };
   console.error(jsonMode ? JSON.stringify(result, null, 2) : `[${code}] ${error.message}\ncorrelation: ${correlationId}\nimpact: ${result.impact}\nnext: ${result.next}`);
   process.exitCode = 1;

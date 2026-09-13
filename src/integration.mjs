@@ -96,7 +96,7 @@ function insertBeforeTables(lines, block) {
 function renderBlock(managed) {
   return [
     BEGIN,
-    "# Managed transactionally. Use `llm-auto-gateway integration disable` to remove.",
+    "# Managed transactionally. Use `codex-local-router integration disable` to remove.",
     ...MANAGED_KEYS.map((key) => `${key} = ${tomlValue(managed[key])}`),
     END,
   ];
@@ -266,11 +266,13 @@ export async function syncIntegration(config, options = {}) {
       ...(config.subscription?.models ?? []),
       ...Object.keys(config.subscription?.customModels ?? {}),
     ]);
-    if (stored && allowedModels.has(stored.managed?.model)) {
+    const removed = removeManagedBlock(splitLines(configText));
+    const current = blockValues(removed.block);
+    if (allowedModels.has(current.model)) {
+      managed = { ...managed, model: current.model };
+    } else if (stored && allowedModels.has(stored.managed?.model)) {
       managed = { ...managed, model: stored.managed.model };
     } else if (!stored) {
-      const removed = removeManagedBlock(splitLines(configText));
-      const current = blockValues(removed.block);
       const baseline = blockValues(Object.values(removeTopLevelKeys(removed.lines).baseline));
       const selectedModel = current.model ?? baseline.model;
       if (allowedModels.has(selectedModel)) {
@@ -280,10 +282,13 @@ export async function syncIntegration(config, options = {}) {
       }
     }
     const edited = editCodexConfig(configText, managed, previous?.managed);
-    if (edited.conflicts.length && !options.force)
-      throw Object.assign(Error(`Codex managed settings changed: ${edited.conflicts.join(", ")}`), {
+    const conflicts = edited.conflicts.filter(
+      (key) => key !== "model" || !allowedModels.has(edited.current.model),
+    );
+    if (conflicts.length && !options.force)
+      throw Object.assign(Error(`Codex managed settings changed: ${conflicts.join(", ")}`), {
         code: "integration_conflict",
-        conflicts: edited.conflicts,
+        conflicts,
       });
     const catalog = await buildCatalog(config, paths);
     let catalogCurrent = null;
@@ -312,12 +317,21 @@ export async function syncIntegration(config, options = {}) {
       await copyFile(paths.catalog, backup);
       state.baselineCatalogBackup = backup;
     }
-    const noChange =
+    const filesUnchanged =
       configText === edited.text &&
       catalogCurrent &&
-      Buffer.compare(catalogCurrent, catalog) === 0 &&
-      previous?.status === "applied";
-    if (noChange) return { changed: false, pending: false, state: previous };
+      Buffer.compare(catalogCurrent, catalog) === 0;
+    if (filesUnchanged && previous?.status === "applied") {
+      const stateUnchanged = MANAGED_KEYS.every(
+        (key) => previous.managed?.[key] === managed[key],
+      );
+      if (!stateUnchanged) await atomicJSON(paths.state, state);
+      return {
+        changed: !stateUnchanged,
+        pending: false,
+        state: stateUnchanged ? previous : state,
+      };
+    }
     if (clients.includes("app") && (await appIsRunning(env)) && !options.applyWhileRunning) {
       await atomicWrite(paths.pendingConfig, edited.text);
       await atomicWrite(paths.pendingCatalog, catalog);
@@ -346,6 +360,10 @@ export async function integrationStatus(config, options = {}) {
   try { configText = await readFile(state.configPath, "utf8"); } catch {}
   try { catalog = JSON.parse(await readFile(state.catalogPath, "utf8")); } catch {}
   const currentBlock = blockValues(removeManagedBlock(splitLines(configText)).block);
+  const allowedModels = new Set([
+    ...(config.subscription?.models ?? []),
+    ...Object.keys(config.subscription?.customModels ?? {}),
+  ]);
   const targets = Object.values(config.targets)
     .filter((target) => target.app?.enabled)
     .map((target) => {
@@ -364,7 +382,11 @@ export async function integrationStatus(config, options = {}) {
     active: state.status === "applied",
     pending: state.status === "pending_app_quit",
     statePath: paths.state,
-    configCurrent: MANAGED_KEYS.every((key) => currentBlock[key] === state.managed[key]),
+    configCurrent: MANAGED_KEYS.every((key) =>
+      key === "model"
+        ? allowedModels.has(currentBlock.model)
+        : currentBlock[key] === state.managed[key],
+    ),
     catalogCurrent: !!catalog && digest(Buffer.from(JSON.stringify(catalog, null, 2) + "\n")) === state.catalogHash,
     appRunning: await appIsRunning(env),
     clients: state.clients,
@@ -383,10 +405,21 @@ export async function disableIntegration(options = {}) {
       throw Object.assign(Error("Codex App is running; quit it before disabling integration"), { code: "app_running" });
     const current = await readFile(state.configPath, "utf8");
     const restored = restoreCodexConfig(current, state);
-    if (restored.conflicts.length && !options.force)
-      throw Object.assign(Error(`Codex managed settings changed: ${restored.conflicts.join(", ")}`), {
+    let catalog;
+    try {
+      const bytes = await readFile(state.catalogPath);
+      if (digest(bytes) === state.catalogHash) catalog = JSON.parse(bytes);
+    } catch {}
+    const selectedModelAllowed = catalog?.models?.some(
+      (model) => model.slug === restored.current.model,
+    );
+    const conflicts = restored.conflicts.filter(
+      (key) => key !== "model" || !selectedModelAllowed,
+    );
+    if (conflicts.length && !options.force)
+      throw Object.assign(Error(`Codex managed settings changed: ${conflicts.join(", ")}`), {
         code: "integration_conflict",
-        conflicts: restored.conflicts,
+        conflicts,
       });
     await atomicWrite(state.configPath, restored.text);
     if (state.baselineCatalogBackup)
@@ -395,6 +428,6 @@ export async function disableIntegration(options = {}) {
     state.status = "disabled";
     state.disabledAt = Date.now();
     await atomicJSON(paths.state, state);
-    return { changed: true, conflicts: restored.conflicts };
+    return { changed: true, conflicts };
   });
 }

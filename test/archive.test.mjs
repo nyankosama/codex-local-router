@@ -100,6 +100,33 @@ test("encrypted SQLite history survives restart and preserves order, duplicates 
   archive.close();
 });
 
+test("fresh persistent responses stay in memory without a redundant SQLite read", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-archive-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = new Archive(join(dir, "history.sqlite"), key);
+  t.after(() => archive.close());
+  const state = new StateStore({ maxBytes: 1024 * 1024 }, archive);
+  const getState = archive.getState.bind(archive);
+  let reads = 0;
+  archive.getState = (...args) => {
+    reads++;
+    return getState(...args);
+  };
+  const response = {
+    id: "cached-response",
+    status: "completed",
+    output: [message("assistant", "done")],
+  };
+  state.save(ctx, response, [message("user", "original")], target);
+  state.save(ctx, response, [message("user", "retry")], target);
+  assert.equal(reads, 0);
+  assert.equal(
+    state.replay(ctx, { previous_response_id: response.id, input: [] })
+      .body.input[0].content[0].text,
+    "original",
+  );
+});
+
 test("summary operations persist terminal state and pruning cannot orphan retained versions", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "gateway-archive-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -160,6 +187,18 @@ test("summary operations persist terminal state and pruning cannot orphan retain
     { count: 2, dryRun: false },
   );
   assert.equal(archive.stats().versions, 0);
+});
+
+test("quota checks read the physical file size instead of scanning blobs", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-quota-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = new Archive(join(dir, "history.sqlite"), key, { diskMaxBytes: 1024 * 1024 });
+  t.after(() => archive.close());
+  archive.putBlob({ payload: "x" });
+  // 任何针对 blobs 的查询都会立刻失败：配额判定必须只用 O(1) 的物理大小，
+  // 否则每个 blob 写入都会在数 GB 历史库上做全表扫描并阻塞主线程。
+  archive.db.exec("DROP TABLE blobs");
+  assert.doesNotThrow(() => archive.ensureQuota(1));
 });
 
 test("history quota stops new encrypted content without deleting existing versions", async (t) => {

@@ -10,6 +10,6 @@
 | Images | Capable target, or a configured source model for lossy description | Original stays encrypted locally |
 | Operational logs | User-level log directory | Metadata only; no body, image, credential, or encrypted state |
 
-The default archive quota is 10 GiB. At 80% the router logs a warning. At the quota it rejects new durable history rather than deleting old content. Export never includes provider or subscription credentials.
+The default archive quota is 10 GiB and is measured from the archive files on disk. At 80% the router logs a warning. At the quota it rejects new durable history rather than deleting old content. Export never includes provider or subscription credentials.
 
 The router is a local routing boundary, not an anonymity layer. A custom provider receives the conversation content required for that request. Users must decide whether the provider is appropriate for their data.

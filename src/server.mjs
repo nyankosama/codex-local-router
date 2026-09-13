@@ -14,9 +14,11 @@ import { fail, publicError } from "./errors.mjs";
 import { credential } from "./providers.mjs";
 import { PACKAGE_VERSION, PRODUCT_ID } from "./product.mjs";
 import { atomicJSON } from "./files.mjs";
-import { runtimePaths } from "./product.mjs";
 export function createGateway(config, options = {}) {
-  const log = options.log ?? ((event) => console.error(JSON.stringify(event)));
+  const log =
+    options.log ??
+    ((event) =>
+      console.error(JSON.stringify({ at: new Date().toISOString(), ...event })));
   const engine = new Engine(config, { ...options, log }),
     controllers = new Set();
   let accepting = true;
@@ -260,13 +262,22 @@ export function createGateway(config, options = {}) {
           }
           busy = true;
           active = controller();
-          let seq = 0;
+          const startedAt = Date.now(),
+            wireBytes = typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
+          let seq = 0,
+            requestModel,
+            phase = "request";
           try {
             const message = parseJSON(data);
+            requestModel =
+              typeof message?.model === "string" && message.model.length <= 200
+                ? message.model
+                : undefined;
             if (message.type !== "response.create")
               throw fail("unsupported_ws_event", 400);
             const body = { ...message, stream: true };
             delete body.type;
+            phase = "inference";
             delete body.generate;
             if (message.generate === false) {
               // Local protocol prewarm only; route/auth validation still applies.
@@ -309,7 +320,21 @@ export function createGateway(config, options = {}) {
               ))
                 await send({ ...event, sequence_number: seq++ });
           } catch (e) {
-            log({ event: "ws_error", type: e.type ?? "invalid_request" });
+            log({
+              event: "ws_error",
+              at: new Date().toISOString(),
+              transport: "websocket",
+              phase,
+              wire_bytes: wireBytes,
+              decoded_bytes: wireBytes,
+              model: requestModel,
+              duration_ms: Date.now() - startedAt,
+              ...(e.gatewayContext ?? {}),
+              type: e.type ?? "invalid_request",
+              status: e.status ?? 400,
+              transport_code: e.transportCode,
+              transport_category: e.transportCategory,
+            });
             await send({
               type: "error",
               status: e.status ?? 400,
@@ -372,15 +397,16 @@ if (
       config.listen?.host ?? "127.0.0.1",
       async () => {
         const address = gateway.server.address();
-        const statePath = process.env.GATEWAY_STATE_PATH ?? runtimePaths().serviceState;
-        await atomicJSON(statePath, {
-          pid: process.pid,
-          startedAt: Date.now(),
-          runningVersion: PACKAGE_VERSION,
-          configPath: path,
-          instance: process.env.GATEWAY_INSTANCE_ID ?? null,
-          url: `http://${config.listen?.host ?? "127.0.0.1"}:${address.port}`,
-        }).catch(() => {});
+        const statePath = process.env.GATEWAY_STATE_PATH;
+        if (statePath)
+          await atomicJSON(statePath, {
+            pid: process.pid,
+            startedAt: Date.now(),
+            runningVersion: PACKAGE_VERSION,
+            configPath: path,
+            instance: process.env.GATEWAY_INSTANCE_ID ?? null,
+            url: `http://${config.listen?.host ?? "127.0.0.1"}:${address.port}`,
+          }).catch(() => {});
         console.log(
           `gateway listening on http://${config.listen?.host ?? "127.0.0.1"}:${gateway.server.address().port}`,
         );

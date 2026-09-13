@@ -4,6 +4,8 @@
 
 Codex Local Router 是面向 macOS Codex CLI 和 Codex App 的本地多模型路由工具。官方 GPT 始终走 ChatGPT 订阅后端；只有显式配置的自定义模型才会发送到对应第三方渠道。
 
+Codex Local Router 是独立的非官方社区项目，与 OpenAI 不存在隶属、赞助或背书关系。
+
 ```text
 Codex CLI / App
        │
@@ -23,32 +25,32 @@ Codex Local Router（仅监听本机回环地址）
 - Responses 与 Chat Completions
 - ChatGPT 订阅、OpenCode Go 和通用 OpenAI 兼容渠道
 
-v0.2.0 不声明 Linux、Windows 或未知供应商私有协议已受支持。
+v0.2.1 不声明 Linux、Windows 或未知供应商私有协议已受支持。
 
 ## 从 GitHub Release 安装
 
-下载 `v0.2.0` Release 中的 `.tgz` 与 SHA-256 文件：
+下载 `v0.2.1` Release 中的 `.tgz` 与 SHA-256 文件：
 
 ```bash
-shasum -a 256 -c codex-local-router-0.2.0.tgz.sha256
-npm install -g ./codex-local-router-0.2.0.tgz
-llm-auto-gateway --version
+shasum -a 256 -c codex-local-router-0.2.1.tgz.sha256
+npm install -g ./codex-local-router-0.2.1.tgz
+codex-local-router --version
 ```
 
-v0.2.0 继续保留 `llm-auto-gateway` 命令，避免破坏已有本机脚本。
+`codex-local-router` 是正式命令；旧的 `llm-auto-gateway` 继续作为兼容别名保留。
 
 ## 首次接入
 
 默认预设通过 OpenCode Go 接入 DeepSeek V4.1 Flash。使用终端隐藏输入将渠道凭证保存到 macOS Keychain：
 
 ```bash
-llm-auto-gateway setup --credential-prompt
+codex-local-router setup --credential-prompt
 ```
 
 非交互安装可以通过 stdin 传入凭证；凭证不会进入配置正文或命令参数：
 
 ```bash
-printf '%s' "$OPENCODE_GO_API_KEY" | llm-auto-gateway setup --credential-stdin --yes
+printf '%s' "$OPENCODE_GO_API_KEY" | codex-local-router setup --credential-stdin --yes
 ```
 
 前台运行仍可使用环境变量凭证。受管 LaunchAgent 不继承 Shell 环境变量；`doctor` 会报告这一问题并建议改用 Keychain。
@@ -56,21 +58,21 @@ printf '%s' "$OPENCODE_GO_API_KEY" | llm-auto-gateway setup --credential-stdin -
 `setup` 会发现 Codex home、配置、模型目录和凭证存储方式；展示差异；写入可恢复事务；安装 LaunchAgent；分别报告配置、服务、目录和 App 加载状态。若 Codex App 正在运行，只准备接入文件并标记待应用。正常退出 App 后运行：
 
 ```bash
-llm-auto-gateway integration sync
+codex-local-router integration sync
 ```
 
 日常诊断不调用模型：
 
 ```bash
-llm-auto-gateway status
-llm-auto-gateway doctor
-llm-auto-gateway model list
+codex-local-router status
+codex-local-router doctor
+codex-local-router model list
 ```
 
 只有显式 `--live` 才执行会消耗额度的真实模型验收：
 
 ```bash
-llm-auto-gateway model probe --id deepseek --live
+codex-local-router model probe --id deepseek --live
 ```
 
 ## 恢复与历史
@@ -80,17 +82,17 @@ Codex 配置使用受管区块和三方比较事务。禁用时只撤销仍等�
 Gateway 不可用时，可在不连接 Gateway 的情况下恢复官方订阅直连：
 
 ```bash
-llm-auto-gateway rescue --subscription
+codex-local-router rescue --subscription
 ```
 
 历史正文使用 AES-256-GCM 加密，密钥保存在 macOS Keychain。默认导出也加密并要求口令；只有显式指定才允许明文导出。
 
 ```bash
-llm-auto-gateway history export --thread THREAD_ID --output history.clr.json --passphrase-env HISTORY_PASSPHRASE
-llm-auto-gateway history inspect --thread THREAD_ID
+codex-local-router history export --thread THREAD_ID --output history.clr.json --passphrase-env HISTORY_PASSPHRASE
+codex-local-router history inspect --thread THREAD_ID
 ```
 
-更多信息见 [CLI 说明](docs/public/cli.md)、[配置说明](docs/public/configuration.md)、[架构](docs/public/architecture.md)与[数据流向](docs/public/data-flow.md)。
+更多信息见 [CLI 说明](docs/public/cli.md)、[配置说明](docs/public/configuration.md)、[架构](docs/public/architecture.md)、[数据流向](docs/public/data-flow.md)与[验收工具链](docs/public/acceptance.md)。
 
 ## 压缩边界
 

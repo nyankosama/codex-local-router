@@ -9,6 +9,12 @@ import { tmpdir } from "node:os";
 const exec = promisify(execFile);
 const cli = resolve("scripts/gateway-admin.mjs");
 
+test("CLI reports the public command and package version", async () => {
+  const manifest = JSON.parse(await readFile(resolve("package.json"), "utf8"));
+  assert.equal((await exec(process.execPath, [cli, "--version"])).stdout.trim(), `Codex Local Router ${manifest.version}`);
+  assert.match((await exec(process.execPath, [cli, "--help"])).stdout, /^Usage: codex-local-router /);
+});
+
 test("setup reports pending App integration and core query commands are JSON-safe", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "router-cli-"));
   t.after(() => rm(root, { recursive: true, force: true }));
