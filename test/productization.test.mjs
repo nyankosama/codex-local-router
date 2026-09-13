@@ -196,12 +196,17 @@ test("LaunchAgent uses installed paths, user-level logs and safe network setting
     server: "/pkg/server.mjs",
     config: "/data/config.json",
     log: "/data/gateway Ring & log",
-    env: { https_proxy: "http://127.0.0.1:7897/?a=1&b=2", API_KEY: "secret" },
+    env: {
+      https_proxy: "http://127.0.0.1:7897/?a=1&b=2",
+      wss_proxy: "socks5://127.0.0.1:7898",
+      API_KEY: "secret",
+    },
   });
   assert.match(plist, /com\.nyankosama\.codex-local-router/);
   assert.match(plist, /\/pkg\/server\.mjs/);
   assert.match(plist, /Ring &amp; log/);
   assert.match(plist, /<key>https_proxy<\/key><string>http:\/\/127\.0\.0\.1:7897\/\?a=1&amp;b=2<\/string>/);
+  assert.match(plist, /<key>wss_proxy<\/key><string>socks5:\/\/127\.0\.0\.1:7898<\/string>/);
   assert.doesNotMatch(plist, /API_KEY|secret/);
 });
 

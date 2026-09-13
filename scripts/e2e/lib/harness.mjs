@@ -56,7 +56,8 @@ export async function isolatedCodexHome({
   await symlink(authSource, `${home}/auth.json`);
   const toml =
     `model_provider = "openai"\nmodel = "${model}"\nmodel_reasoning_effort = "${reasoningEffort}"\n` +
-    `web_search = "${webSearch}"\nopenai_base_url = "${baseUrl}"\nmodel_catalog_json = "${catalogPath}"\n${extra}`;
+    `${webSearch == null ? "" : `web_search = "${webSearch}"\n`}` +
+    `openai_base_url = "${baseUrl}"\nmodel_catalog_json = "${catalogPath}"\n${extra}`;
   await writeFile(`${home}/config.toml`, toml, { mode: 0o600 });
   return home;
 }
@@ -127,6 +128,7 @@ export async function startIsolatedGateway({
       accountHeader: Boolean(headers["chatgpt-account-id"]),
       opencodeSession: Boolean(headers["x-opencode-session"]),
       path: new URL(url).pathname,
+      transport: options.transport ?? "http",
     };
     beforeOutbound?.({
       ...metadata,
@@ -196,6 +198,20 @@ export async function startIsolatedGateway({
         metadata.error = error?.type ?? "transport_error";
         throw error;
       }
+    },
+    createOfficialWebSocket: (url, options) => {
+      const socket = new WebSocket(url, options);
+      const send = socket.send.bind(socket);
+      socket.send = (data, sendOptions, callback) => {
+        const metadata = recordOutbound(url, {
+          headers: options.headers,
+          body: Buffer.from(data),
+          transport: "websocket",
+        });
+        metadata.status = 101;
+        return send(data, sendOptions, callback);
+      };
+      return socket;
     },
     log: (event) => logs.push(event),
   });
@@ -298,13 +314,14 @@ export async function runCliExec({
   corePath,
   home,
   cwd,
+  globalArgs = [],
   args,
   env = {},
   timeoutMs = 600000,
   prompt,
   signal,
 }) {
-  const child = spawn(corePath, ["exec", "--json", ...args, prompt], {
+  const child = spawn(corePath, [...globalArgs, "exec", "--json", ...args, prompt], {
     cwd,
     env: { ...process.env, CODEX_HOME: home, ...env },
     stdio: ["ignore", "pipe", "pipe"],

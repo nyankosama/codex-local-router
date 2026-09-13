@@ -19,6 +19,8 @@ Codex Local Router（仅监听本机回环地址）
 
 官方订阅流量使用独立透明通道。只有显式配置的自定义模型，或必须恢复 Router 虚拟历史的请求，才进入模型 Engine。这样 `/models`、独立搜索和未来官方辅助接口可以继续兼容，同时不会把订阅身份开放给 `/v1`。
 
+Router 不替用户开启或关闭搜索：Codex 继续使用正常搜索模式（默认 cached，或由用户选择 live）。官方 HTTP 与 WebSocket 会共同继承 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`WS_PROXY`、`WSS_PROXY` 并遵守 `NO_PROXY`。
+
 第三方 GPT target 默认采用保守的 Plugin 白名单，以减少 Codex 客户端携带的大体积 Plugin 工具定义；Codex 核心工具和用户自行配置的 MCP 不受裁剪。非 GPT 与未声明模型家族的旧 target 默认仍原样转发。
 
 ## 支持范围
@@ -29,15 +31,15 @@ Codex Local Router（仅监听本机回环地址）
 - Responses 与 Chat Completions
 - ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设和通用 OpenAI 兼容渠道
 
-v0.3.0 不声明 Linux、Windows 或未知供应商私有协议已受支持。
+v0.3.1 不声明 Linux、Windows 或未知供应商私有协议已受支持。
 
 ## 从 GitHub Release 安装
 
-下载 `v0.3.0` Release 中的 `.tgz` 与 SHA-256 文件：
+下载 `v0.3.1` Release 中的 `.tgz` 与 SHA-256 文件：
 
 ```bash
-shasum -a 256 -c codex-local-router-0.3.0.tgz.sha256
-npm install -g ./codex-local-router-0.3.0.tgz
+shasum -a 256 -c codex-local-router-0.3.1.tgz.sha256
+npm install -g ./codex-local-router-0.3.1.tgz
 codex-local-router --version
 ```
 

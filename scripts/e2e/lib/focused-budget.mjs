@@ -25,7 +25,9 @@ export class FocusedAcceptanceBudget {
       this.searchRequests++;
       return;
     }
-    if (!event.path.endsWith("/responses") || !event.model || event.generate === false)
+    // Compressed official requests may not expose a decoded model to the harness.
+    // Count every Responses send unless it is positively identified as prewarm.
+    if (!event.path.endsWith("/responses") || event.generate === false)
       return;
     this.generationAttempts++;
     if (this.generations >= this.maxGenerations) {

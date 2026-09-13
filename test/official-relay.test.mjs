@@ -12,7 +12,11 @@ import {
   relayRequestHeaders,
   validateOfficialRelayPath,
 } from "../src/official-relay.mjs";
-import { OfficialWebSocketSession } from "../src/official-websocket.mjs";
+import {
+  createOfficialWebSocketAgent,
+  OfficialWebSocketSession,
+  officialWebSocketProxyForUrl,
+} from "../src/official-websocket.mjs";
 
 const listen = (server) =>
   new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
@@ -346,6 +350,93 @@ test("A8 an ordinary official response does not wait for observation I/O", async
   assert.equal(gateway.engine.officialObservations.size, 0);
 });
 
+test("A6 official WebSocket proxy resolution honors native variables, compatible fallbacks and bypass", () => {
+  const nativeCalls = [];
+  assert.equal(
+    officialWebSocketProxyForUrl(
+      "wss://chatgpt.com/backend-api/codex/responses",
+      (url) => {
+        nativeCalls.push(url);
+        return url.startsWith("wss:") ? "socks5://127.0.0.1:7897" : "";
+      },
+      { WSS_PROXY: "socks5://127.0.0.1:7897", ALL_PROXY: "http://127.0.0.1:7898" },
+    ),
+    "socks5://127.0.0.1:7897",
+  );
+  assert.equal(nativeCalls.length, 1);
+
+  const fallbackCalls = [];
+  assert.equal(
+    officialWebSocketProxyForUrl(
+      "wss://chatgpt.com/backend-api/codex/responses",
+      (url) => {
+        fallbackCalls.push(url);
+        return url.startsWith("https:") ? "http://127.0.0.1:7897" : "";
+      },
+      { HTTPS_PROXY: "http://127.0.0.1:7897", ALL_PROXY: "http://127.0.0.1:7898" },
+    ),
+    "http://127.0.0.1:7897",
+  );
+  assert.deepEqual(fallbackCalls, ["https://chatgpt.com/backend-api/codex/responses"]);
+
+  assert.equal(
+    officialWebSocketProxyForUrl(
+      "wss://chatgpt.com/backend-api/codex/responses",
+      () => "",
+      { HTTPS_PROXY: "http://127.0.0.1:7897", NO_PROXY: "chatgpt.com" },
+    ),
+    "",
+  );
+});
+
+test("A6 ProxyAgent callback adapts its request argument without changing proxy resolution", async (t) => {
+  const agent = createOfficialWebSocketAgent({
+    env: { HTTPS_PROXY: "http://127.0.0.1:7897", ALL_PROXY: "socks5://127.0.0.1:7898" },
+    resolveProxy: (url) => url.startsWith("https:") ? "http://127.0.0.1:7897" : "",
+  });
+  t.after(() => agent.destroy());
+  assert.equal(
+    await agent.getProxyForUrl(
+      "wss://chatgpt.com/backend-api/codex/responses",
+      { requestArgument: true },
+    ),
+    "http://127.0.0.1:7897",
+  );
+});
+
+test("A6 official WebSocket connection failures stay redacted and attributable", async () => {
+  const logs = [];
+  class FailingSocket extends EventEmitter {
+    constructor() {
+      super();
+      queueMicrotask(() => {
+        const error = Error("connect ETIMEDOUT via private proxy detail");
+        error.code = "ETIMEDOUT";
+        this.emit("error", error);
+      });
+    }
+    terminate() {}
+  }
+  const session = new OfficialWebSocketSession(
+    { authorization: "Bearer subscription" },
+    {
+      agent: {},
+      createSocket: () => new FailingSocket(),
+      log: (event) => logs.push(event),
+    },
+  );
+  await assert.rejects(session.connect(), (error) =>
+    error.type === "upstream_connection_error" &&
+    error.transportCategory === "timeout" &&
+    !error.message.includes("private proxy"),
+  );
+  assert.deepEqual(logs, [{
+    event: "official_ws_connect_failed",
+    transport: "websocket",
+    transport_category: "timeout",
+  }]);
+});
+
 test("A6 official WebSocket relays message payloads and sequence without Engine rewriting", async (t) => {
   const upstreamSockets = [];
   const received = [];
@@ -416,6 +507,7 @@ test("A6 official WebSocket relays message payloads and sequence without Engine 
   socket.send(request);
   await done;
   assert.equal(upstreamSockets[0].url, "wss://chatgpt.com/backend-api/codex/responses");
+  assert.ok(upstreamSockets[0].options.agent);
   assert.equal(upstreamSockets[0].options.headers.authorization, "Bearer subscription");
   assert.equal(Buffer.compare(received[0].data, request), 0);
   assert.deepEqual(messages.map((message) => JSON.parse(message).sequence_number), [91, 92]);
