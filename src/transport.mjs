@@ -2,6 +2,37 @@ import { spawn, execFileSync } from "node:child_process";
 import { PassThrough } from "node:stream";
 import { fail } from "./errors.mjs";
 const children = new Set();
+const curlFailureCategory = (code, stderr) => {
+  if (/could not resolve proxy/i.test(stderr)) return "proxy_dns";
+  if (/could not resolve host/i.test(stderr)) return "upstream_dns";
+  if (/connect tunnel failed/i.test(stderr)) return "proxy_connect";
+  if (/ssl|tls/i.test(stderr)) return "tls";
+  if (/empty reply/i.test(stderr)) return "empty_response";
+  if (/recv failure|failure when receiving|connection reset/i.test(stderr))
+    return "receive";
+  if (/partial file|transfer closed|bytes missing|end of response with/i.test(stderr))
+    return "truncated";
+  if (/send failure|failure when sending/i.test(stderr)) return "send";
+  if (/timed out|timeout/i.test(stderr)) return "timeout";
+  if (/failed to connect|connection refused/i.test(stderr)) return "connect";
+  return {
+    5: "proxy_dns",
+    6: "upstream_dns",
+    7: "connect",
+    16: "http2",
+    18: "truncated",
+    23: "write",
+    28: "timeout",
+    35: "tls",
+    47: "redirect",
+    52: "empty_response",
+    55: "send",
+    56: "receive",
+    92: "http2",
+  }[code] ?? "other";
+};
+// 观测辅助：把 curl 退出码/ stderr 映射为可归因的传输类别（供 H9 归因使用）。
+export const transportCategoryOf = (code, stderr = "") => curlFailureCategory(code, stderr);
 export function checkTransport() {
   execFileSync("curl", ["--version"], { stdio: "ignore" });
 }
@@ -36,6 +67,7 @@ export function request(
     );
     children.add(child);
     let header = Buffer.alloc(0),
+      stderr = "",
       started = false,
       settled = false,
       aborted = false;
@@ -55,7 +87,10 @@ export function request(
       }
     };
     child.stdin.on("error", () => {});
-    child.stderr.resume();
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr = (stderr + chunk).slice(-4096);
+    });
     child.stdin.end(
       `url = ${JSON.stringify(url)}\nrequest = "POST"\n${Object.entries(headers)
         .map(([k, v]) => `header = ${JSON.stringify(`${k}: ${v}`)}`)
@@ -111,17 +146,21 @@ export function request(
     child.on("close", (code) => {
       children.delete(child);
       signal?.removeEventListener("abort", abort);
-      if (code !== 0)
-        error(
-          fail(
-            aborted
-              ? "cancelled"
-              : code === 28
-                ? "upstream_timeout"
-                : "upstream_connection_error",
-            aborted ? 499 : code === 28 ? 504 : 502,
-          ),
+      if (code !== 0) {
+        const failure = fail(
+          aborted
+            ? "cancelled"
+            : code === 28
+              ? "upstream_timeout"
+              : "upstream_connection_error",
+          aborted ? 499 : code === 28 ? 504 : 502,
         );
+        if (!aborted) {
+          failure.transportCode = code;
+          failure.transportCategory = curlFailureCategory(code, stderr);
+        }
+        error(failure);
+      }
       else if (!started) error(fail("invalid_upstream_headers", 502));
       else output.end();
     });

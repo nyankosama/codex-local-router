@@ -2,23 +2,32 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm test
+      - run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
       - run: npm run audit:package
+      - run: node scripts/audit-public.mjs
       - name: Clean package install
+        shell: bash
         run: |
-          npm pack
+          package_file="$(npm pack --json | node -e 'let value=""; process.stdin.on("data", chunk => value += chunk).on("end", () => process.stdout.write(JSON.parse(value)[0].filename))')"
           mkdir -p "$RUNNER_TEMP/router-prefix"
-          npm install --prefix "$RUNNER_TEMP/router-prefix" --no-save ./codex-local-router-0.2.0.tgz
-          "$RUNNER_TEMP/router-prefix/node_modules/.bin/llm-auto-gateway" --version
+          npm install --prefix "$RUNNER_TEMP/router-prefix" --no-save "./$package_file"
+          expected="Codex Local Router $(node -p 'require("./package.json").version')"
+          test "$("$RUNNER_TEMP/router-prefix/node_modules/.bin/codex-local-router" --version)" = "$expected"
+          test "$("$RUNNER_TEMP/router-prefix/node_modules/.bin/llm-auto-gateway" --version)" = "$expected"

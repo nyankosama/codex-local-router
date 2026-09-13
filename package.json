@@ -1,6 +1,6 @@
 {
   "name": "codex-local-router",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local multi-model routing for Codex CLI and App while preserving ChatGPT subscription access",
   "license": "MIT",
   "repository": {
@@ -18,6 +18,8 @@
     "scripts/gateway-admin.mjs",
     "scripts/gateway-service.mjs",
     "scripts/codex-app-upgrade.mjs",
+    "scripts/e2e/",
+    "docs/e2e/thresholds.json",
     "config/gateway.example.json",
     "docs/public/",
     "README.md",
@@ -28,11 +30,17 @@
   ],
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test",
+    "test": "node scripts/run-tests.mjs",
     "gateway": "node scripts/gateway-admin.mjs",
-    "audit:package": "node scripts/audit-package.mjs"
+    "audit:package": "node scripts/audit-package.mjs",
+    "e2e": "node scripts/e2e/run.mjs --group all --include-pre-release",
+    "e2e:l0": "node scripts/e2e/run.mjs --group l0",
+    "e2e:l1": "node scripts/e2e/run.mjs --group l1",
+    "e2e:l2": "node scripts/e2e/run.mjs --group l2",
+    "e2e:live": "node scripts/e2e/run.mjs --group live"
   },
   "bin": {
+    "codex-local-router": "scripts/gateway-admin.mjs",
     "llm-auto-gateway": "scripts/gateway-admin.mjs"
   },
   "dependencies": {

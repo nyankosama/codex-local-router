@@ -1,9 +1,14 @@
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+const packageJson = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+);
+
 export const PRODUCT_NAME = "Codex Local Router";
 export const PRODUCT_ID = "codex-local-router";
-export const PACKAGE_VERSION = "0.2.0";
+export const PACKAGE_VERSION = packageJson.version;
 export const CONFIG_SCHEMA_VERSION = 3;
 export const INTEGRATION_SCHEMA_VERSION = 3;
 

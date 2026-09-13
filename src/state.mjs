@@ -208,12 +208,11 @@ export class StateStore {
           ? { thread: ctx.parentThread, branch: ctx.parentThread }
           : undefined,
       };
-      const version = responseKey
-        ? this.archive.saveResponse(responseKey, record, history)
-        : this.archive.appendHistory(history);
-      if (responseKey)
-        this.setMemory(responseKey, this.archive.getState(responseKey));
-      return version;
+      if (!responseKey) return this.archive.appendHistory(history);
+      const saved = this.archive.saveResponse(responseKey, record, history);
+      if (saved.inserted) this.setMemory(responseKey, record);
+      else this.get(responseKey);
+      return saved.version;
     }
     if (responseKey) this.set(responseKey, record);
   }

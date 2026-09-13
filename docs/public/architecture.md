@@ -16,7 +16,7 @@ Official GPT model IDs accepted from the Codex model catalog are routed only to 
 
 Each provider has a concurrency limit. A slow provider cannot consume every global request slot. Responses and Chat Completions share the same normalized event and durable-history boundary, while channel-specific stream fixes remain provider-scoped.
 
-The service listens only on loopback. Raw `/v1` access can require an independent local bearer token. `/subscription/v1` validates the bearer and optional account claim against the current trusted Codex credential document. The router supports Codex file and macOS Keychain credential stores; ephemeral credentials cannot provide restart-stable identity.
+The service listens only on loopback. Raw `/v1` access can require an independent local bearer token. `/subscription/v1` validates the bearer and optional account claim against the current trusted Codex credential document. The router supports Codex file and macOS Keychain credential stores; ephemeral credentials cannot provide restart-stable identity. File credentials are re-read when `auth.json` changes, Keychain credentials are re-read every 30 seconds, and any bearer mismatch forces an immediate re-read before the request is rejected.
 
 History uses SQLite WAL and AES-256-GCM. Version 3 stores encrypted events once and records immutable prefix references and suffixes for each version. A v2 archive is copied with SQLite's consistent backup API, retained as a recovery snapshot, and remains readable without eagerly rewriting every historical version; new versions use incremental storage immediately. Original history and the active model view remain separate. Completion is published only after the response index and history version commit together.
 

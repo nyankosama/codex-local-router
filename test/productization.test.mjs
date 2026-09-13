@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadConfig, validate } from "../src/config.mjs";
@@ -8,8 +8,8 @@ import { buildModelCatalog } from "../src/model-catalog.mjs";
 import { providerEndpoint } from "../src/providers.mjs";
 import { isExplicitContextError } from "../src/context.mjs";
 import { configDiff, createConfig, rawConfig, writeConfigTransaction } from "../src/config-store.mjs";
-import { preflightCandidate, renderLaunchAgent } from "../src/service-manager.mjs";
-import { runtimePaths } from "../src/product.mjs";
+import { preflightCandidate, renderLaunchAgent, serviceStatus } from "../src/service-manager.mjs";
+import { PACKAGE_VERSION, runtimePaths } from "../src/product.mjs";
 import { callProvider } from "../src/providers.mjs";
 import {
   createHistoryPayload,
@@ -29,6 +29,11 @@ const config = () => ({
     deepseek: { provider: "go", preset: "opencode-go/deepseek-v4.1-flash" },
   },
   subscription: { enabled: true, models: ["gpt-5.5"] },
+});
+
+test("runtime version is sourced from package.json", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(PACKAGE_VERSION, manifest.version);
 });
 
 test("versioned presets fill defaults while explicit model-channel settings win", () => {
@@ -173,6 +178,35 @@ test("candidate health checks keep their state separate from the live service", 
   const health = await preflightCandidate(new URL("../src/server.mjs", import.meta.url).pathname, configPath, { env });
   assert.equal(health.service, "codex-local-router");
   assert.equal(await access(runtimePaths(env).serviceState).then(() => true, () => false), false);
+});
+
+test("service status ignores saved state from a different config or test instance", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "router-status-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const env = {
+    ...process.env,
+    CODEX_LOCAL_ROUTER_HOME: root,
+    CODEX_LOCAL_ROUTER_LAUNCH_AGENT: join(root, "agent.plist"),
+  };
+  const paths = runtimePaths(env);
+  const configPath = join(root, "config.json");
+  await mkdir(paths.runtime, { recursive: true });
+  await writeFile(configPath, JSON.stringify({
+    schemaVersion: 3,
+    listen: { host: "127.0.0.1", port: 9 },
+    mode: "rules",
+    defaultTarget: "model",
+    providers: { local: { baseUrl: "http://127.0.0.1:9" } },
+    targets: { model: { provider: "local", model: "test", wireApi: "responses", contextWindow: 32000 } },
+  }));
+  await writeFile(paths.serviceState, JSON.stringify({
+    configPath: join(root, "test-config.json"),
+    instance: "test-123",
+    url: "http://127.0.0.1:8",
+  }));
+  const status = await serviceStatus(configPath, env);
+  assert.equal(status.saved, null);
+  assert.equal(status.health, null);
 });
 
 test("provider concurrency queues a second request until the first stream closes", async () => {

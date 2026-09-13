@@ -192,14 +192,23 @@ test("API passthrough and fixed routing execute real targets; no configured fall
     );
   }
   let calls = 0;
+  const logs = [];
   const e = new Engine(validate(cfg()), {
+    log: (event) => logs.push(event),
     send: async () => {
       calls++;
-      throw fail("upstream_connection_error", 502);
+      const error = fail("upstream_connection_error", 502);
+      error.transportCode = 56;
+      error.transportCategory = "receive";
+      throw error;
     },
   });
   await assert.rejects(collect(e, { model: "x" }, "api", {}));
   assert.equal(calls, 1);
+  assert.ok(logs.some((event) =>
+    event.event === "upstream_transport_error" &&
+    event.transport_code === 56 &&
+    event.transport_category === "receive"));
 });
 test("fallback only before output, within API provider, not on auth or capability errors", async () => {
   for (const status of [401, 400, 429, 500, 503]) {

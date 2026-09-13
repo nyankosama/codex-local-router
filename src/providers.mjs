@@ -120,7 +120,15 @@ export async function callProvider(
     `${target.provider}:${provider.baseUrl}`,
     provider.concurrency ?? 4,
   );
+  const queuedAt = Date.now(),
+    queueAhead = gate.waiters.length;
   await gate.acquire(signal);
+  ctx.providerQueue = {
+    waitMs: Date.now() - queuedAt,
+    ahead: queueAhead,
+    active: gate.active,
+    limit: gate.limit,
+  };
   let released = false;
   const release = () => {
     if (released) return;
