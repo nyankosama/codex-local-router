@@ -37,6 +37,10 @@ import {
   resolvePluginToolPolicy,
   toolSourceStatus,
 } from "../src/tool-policy.mjs";
+import {
+  resolveStandaloneSearchPolicy,
+  validateStandaloneSearchSource,
+} from "../src/standalone-search.mjs";
 import { discoverToolSources } from "../src/tool-sources.mjs";
 import {
   DEFAULT_SPACE,
@@ -97,6 +101,51 @@ function requestedPluginPolicy(current) {
     mode: "allowlist",
     allowedPlugins: allowed.split(",").map((item) => item.trim()).filter(Boolean),
   };
+}
+
+function requestedSearchSource() {
+  const modern = value("search-source");
+  const legacyEnabled = flag("supports-search-tool");
+  const legacyDisabled = flag("no-supports-search-tool");
+  if (legacyEnabled && legacyDisabled)
+    throw Object.assign(Error("search support aliases conflict"), { code: "usage_error" });
+  if (modern != null && (legacyEnabled || legacyDisabled))
+    throw Object.assign(Error("--search-source cannot be combined with legacy search support aliases"), {
+      code: "usage_error",
+    });
+  if (modern != null) {
+    try { return validateStandaloneSearchSource(modern, "--search-source"); }
+    catch {
+      throw Object.assign(Error("--search-source must be subscription, provider or disabled"), {
+        code: "usage_error",
+      });
+    }
+  }
+  if (legacyEnabled) return "subscription";
+  if (legacyDisabled) return "disabled";
+  return undefined;
+}
+
+function searchSummaries(config, credentials) {
+  const providers = new Map(
+    (credentials?.providers ?? []).map((provider) => [provider.id, provider]),
+  );
+  return Object.values(config.targets).map((target) => {
+    const policy = resolveStandaloneSearchPolicy(config, target);
+    const credentialReady = policy.source === "subscription"
+      ? credentials?.subscription?.available ?? false
+      : policy.source === "provider"
+        ? providers.get(target.provider)?.available ?? false
+        : false;
+    return {
+      target: target.id,
+      source: policy.source,
+      reason: policy.reason,
+      advertised: policy.advertised,
+      providerEndpointConfigured: policy.providerEndpointConfigured,
+      credentialReady,
+    };
+  });
 }
 
 function emit(value, human) {
@@ -460,6 +509,8 @@ async function providerCommand() {
   if (!["add", "edit", "remove"].includes(command) || !id)
     throw Object.assign(Error("provider add|edit|remove requires --id"), { code: "usage_error" });
   const suppliedCredential = await requestedCredential();
+  if (flag("no-standalone-search-endpoint") && value("standalone-search-endpoint") != null)
+    throw Object.assign(Error("standalone search endpoint flags conflict"), { code: "usage_error" });
   const keychain = suppliedCredential == null ? null : {
     service: value("keychain-service") ?? "codex-local-router-provider",
     account: value("keychain-account") ?? id,
@@ -487,6 +538,12 @@ async function providerCommand() {
     if (!config.providers[id].baseUrl) throw Object.assign(Error("--base-url is required"), { code: "usage_error" });
     if (value("responses-endpoint")) (config.providers[id].endpoints ??= {}).responses = value("responses-endpoint");
     if (value("chat-endpoint")) (config.providers[id].endpoints ??= {}).chatCompletions = value("chat-endpoint");
+    if (value("standalone-search-endpoint") != null)
+      config.providers[id].standaloneSearch = {
+        endpoint: value("standalone-search-endpoint"),
+      };
+    if (flag("no-standalone-search-endpoint"))
+      delete config.providers[id].standaloneSearch;
     if (keychain) {
       config.providers[id].keychain = keychain;
       delete config.providers[id].apiKeyEnv;
@@ -503,6 +560,10 @@ async function modelCommand() {
   if (command === "list") {
     const config = await loadCommandConfig();
     const registry = await discoverToolSources();
+    const credentials = await inspectCredentials(config);
+    const searches = new Map(
+      searchSummaries(config, credentials).map((search) => [search.target, search]),
+    );
     return emit(Object.values(config.targets).map((target) => ({
       id: target.id, provider: target.provider, model: target.model,
       protocol: target.wireApi, contextWindow: target.contextWindow,
@@ -511,6 +572,7 @@ async function modelCommand() {
       modelFamily: target.modelFamily ?? null,
       pluginToolPolicy: resolvePluginToolPolicy(config, target),
       toolSourceRecognition: toolSourceStatus(registry),
+      standaloneSearch: searches.get(target.id),
     })), (rows) => rows.map((row) => `${row.id}\t${row.provider}\t${row.model}\t${row.contextWindow}`).join("\n"));
   }
   if (command === "probe") {
@@ -518,6 +580,7 @@ async function modelCommand() {
     const config = await loadCommandConfig(), target = config.targets[id];
     if (!target) throw Object.assign(Error(`model does not exist: ${id}`), { code: "model_not_found" });
     const registry = await discoverToolSources();
+    const credentials = await inspectCredentials(config);
     const configured = {
       id,
       provider: target.provider,
@@ -526,6 +589,8 @@ async function modelCommand() {
       modelFamily: target.modelFamily ?? null,
       pluginToolPolicy: resolvePluginToolPolicy(config, target),
       toolSourceRecognition: toolSourceStatus(registry),
+      standaloneSearch: searchSummaries(config, credentials)
+        .find((search) => search.target === id),
       live: false,
     };
     if (!flag("live")) return emit(configured, () => `Model ${id} configuration is valid. Use --live to spend model quota on an end-to-end probe.`);
@@ -556,11 +621,19 @@ async function modelCommand() {
       return;
     }
     const current = config.targets[id] ?? {};
+    const searchSource = requestedSearchSource();
     if (value("preset")) {
       config.targets[id] = { ...current, provider: value("provider") ?? current.provider, preset: value("preset") };
+      if (searchSource != null) {
+        config.targets[id].standaloneSearch = { source: searchSource };
+        if (config.targets[id].app) delete config.targets[id].app.supportsSearchTool;
+      }
       return;
     }
-    config.targets[id] = {
+    const modelFamily = value("model-family") ?? current.modelFamily;
+    const impliedSearchSource = searchSource ?? current.standaloneSearch?.source ??
+      (modelFamily === "openai-gpt" ? "subscription" : null);
+    const next = {
       ...current,
       provider: value("provider") ?? current.provider,
       model: value("upstream-model") ?? current.model,
@@ -569,7 +642,7 @@ async function modelCommand() {
       maxContextWindow: Number(value("max-context-window") ?? value("context-window") ?? current.maxContextWindow ?? current.contextWindow),
       inputModalities: (value("input-modalities") ?? current.inputModalities?.join(",") ?? "text").split(","),
       compression: { mode: value("compression") ?? current.compression?.mode ?? "unsupported" },
-      modelFamily: value("model-family") ?? current.modelFamily,
+      modelFamily,
       pluginToolPolicy: requestedPluginPolicy(current.pluginToolPolicy),
       capabilities: {
         ...current.capabilities,
@@ -585,18 +658,19 @@ async function modelCommand() {
         modelId: value("app-model") ?? current.app?.modelId ?? value("upstream-model"),
         displayName: value("display-name") ?? current.app?.displayName,
         reasoningLevels: (value("reasoning-levels") ?? current.app?.reasoningLevels?.join(",") ?? "low,medium,high,xhigh").split(","),
-        supportsSearchTool: flag("supports-search-tool")
-          ? true
-          : flag("no-supports-search-tool")
-            ? false
-            : current.app?.supportsSearchTool,
         useResponsesLite: flag("responses-lite")
           ? true
           : flag("no-responses-lite")
             ? false
-            : (current.app?.useResponsesLite ?? false),
+            : (current.app?.useResponsesLite ??
+              (["subscription", "provider"].includes(impliedSearchSource))),
       },
     };
+    if (searchSource != null) {
+      next.standaloneSearch = { source: searchSource };
+      if (next.app) delete next.app.supportsSearchTool;
+    }
+    config.targets[id] = next;
   }, `model ${command} ${id}`);
 }
 
@@ -743,6 +817,21 @@ async function spaceCommand() {
       source: "default-model-edit",
     });
   }
+  if (command === "set-search-source") {
+    const source = positional[2] ?? value("source");
+    try { validateStandaloneSearchSource(source, "space search source"); }
+    catch {
+      throw Object.assign(Error("space set-search-source requires subscription, provider or disabled"), {
+        code: "usage_error",
+      });
+    }
+    return mutateSpaceConfig((config) => {
+      config.standaloneSearch ??= {};
+      config.standaloneSearch.thirdPartyGpt = { defaultSource: source };
+    }, `set third-party GPT search source ${source}`, {
+      source: "standalone-search-default-edit",
+    });
+  }
   if (command === "use") {
     const target = positional[2];
     if (!target) throw Object.assign(Error("space use requires NAME[@REV]"), { code: "usage_error" });
@@ -784,7 +873,7 @@ async function spaceCommand() {
     if (!apply) return emit({ applied: false }, () => "Pending switch retained.");
     return emit(await cancelSpaceSwitch({ env }), () => "Pending switch cancelled.");
   }
-  throw Object.assign(Error("use space init|list|current|show|history|diff|create|capture|set-default-model|use|rollback|resume|cancel"), {
+  throw Object.assign(Error("use space init|list|current|show|history|diff|create|capture|set-default-model|set-search-source|use|rollback|resume|cancel"), {
     code: "usage_error",
   });
 }
@@ -934,6 +1023,7 @@ async function doctor() {
     integration: config ? await integrationStatus(config, { env }) : null,
     configurationSpace: await configurationSpaceStatus({ env, configPath }),
     credentials,
+    standaloneSearch: config ? searchSummaries(config, credentials) : [],
     warnings,
     issues,
     liveModelCalls: 0,
@@ -955,6 +1045,7 @@ async function status() {
     defaultModel = active.defaultCodexModel;
     latestRevision = (await readSpaceIndex(env)).spaces[active.space].latestRevision;
   }
+  const credentials = await inspectCredentials(config);
   emit({
     product: PRODUCT_NAME,
     cliVersion: PACKAGE_VERSION,
@@ -964,6 +1055,7 @@ async function status() {
     integration: await integrationStatus(config, { env }),
     configurationSpace: { ...configurationSpace, defaultModel, latestRevision },
     targets: Object.keys(config.targets),
+    standaloneSearch: searchSummaries(config, credentials),
   },
   (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nSpace: ${x.configurationSpace.active ? `${x.configurationSpace.active.space}@${x.configurationSpace.active.revision}` : "uninitialized"}\nModels: ${x.targets.join(", ")}`);
 }

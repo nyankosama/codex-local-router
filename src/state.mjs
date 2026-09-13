@@ -12,6 +12,7 @@ const durablePrefixes = [
   "prepared:",
   "image-description:",
   "observation-incomplete:",
+  "standalone-search-route:",
 ];
 
 export function identity(entry, headers, body, trustedAccount) {

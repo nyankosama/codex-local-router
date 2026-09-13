@@ -82,14 +82,14 @@ test("ai.feei presets use distinct App IDs, conservative windows and standalone 
     assert.equal(target.maxContextWindow, 272000);
     assert.equal(target.compression.mode, "summary");
     assert.equal(target.capabilities.nativeWebSearch, false);
-    assert.equal(target.app.supportsSearchTool, true);
-    assert.equal(target.app.useResponsesLite, false);
+    assert.equal(target.app.supportsSearchTool, undefined);
+    assert.equal(target.app.useResponsesLite, true);
   }
   const catalog = buildModelCatalog({
     models: [{ slug: "gpt-official", priority: 10 }],
   }, normalized);
   assert.equal(catalog.models[1].supports_search_tool, true);
-  assert.equal(catalog.models[1].use_responses_lite, false);
+  assert.equal(catalog.models[1].use_responses_lite, true);
   assert.equal(catalog.models[1].description.includes("ai.feei"), true);
 });
 

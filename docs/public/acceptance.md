@@ -1,6 +1,7 @@
 # Acceptance harness
 
 The current configuration-space candidate record is [configuration-spaces-acceptance.md](configuration-spaces-acceptance.md).
+The v0.4.0 third-party standalone-search record is [third-party-openai-search-acceptance.md](third-party-openai-search-acceptance.md). Its isolated CLI/App-protocol live gate passed; App UI and installed-environment activation remain separate.
 
 The published package ships the end-to-end acceptance harness that verifies a real installation. It drives the Codex App core and reports `PASS` / `ANOMALY` / `FAIL` from machine-checkable criteria. It never drives the App UI.
 
@@ -49,12 +50,17 @@ npm run e2e:l2     # pre-release capacity case E2E-4
 npm run e2e:live   # concurrency against a running service (E2E-6)
 npm run e2e        # gate plus every case, pre-release last
 npm run e2e:official-search -- --run  # two-turn official cached-default + explicit-live search
+npm run e2e:third-party-search -- --run  # two-turn ai.feei + subscription-search acceptance
 npm run e2e:focused -- --run  # explicit five-turn official + ai.feei candidate acceptance
 ```
 
 `e2e:official-search` is the narrow official-only canary. It first makes a zero-generation handshake probe through the Router's production official-WebSocket client and requires HTTP 101. Its first isolated CLI turn then leaves `web_search` unset and verifies the normal cached default without requiring a new user flag. Its second turn passes the one-run `--search` override to verify live search. Both turns require a successful official Responses exchange over the transport selected by the current Codex build, a successful fixed-origin `/alpha/search` request, a completed `web_search` client item, a source hostname in the answer, and no non-OpenAI outbound destination. The runner allows exactly two turns and at most six generation requests because one search turn can require multiple model/tool continuations; it stores no prompt or response body.
 
 The live case only runs outside your own usage window, requires `activeTurns == 0` before it starts, uses four short sessions, and can be aborted at any time. It does not restart the service and does not change configuration.
+
+`e2e:third-party-search` is the bounded canary for this routing feature. It uses an isolated Codex home, Router config/state/archive, workspace, random port, and the current App-bundled Codex core. The first turn selects ai.feei Sol from the CLI while leaving `web_search` unset, so normal cached-default behavior is exercised without `--search`. The second uses ai.feei Astra through `app-server` with `web_search = "live"`. It allows exactly two turns, twelve generation sends, and eight search sends, with no retry loop; an exact repeated generation payload is blocked before its second send. The larger bound accommodates the normal Responses Lite search/open/read phases observed in real runs.
+
+A case passes only when the client reports a completed search; every search request reaches `chatgpt.com`; every custom-model generation reaches `ai.feei.cn`; the subscription and Provider credentials are each observed only on their own leg; at least one URL fingerprint extracted in memory from the successful search response appears in a later third-party request; and the final answer contains source information. It persists only URL/response hashes, counts, hosts, status, bytes, timing, and booleans. Missing execution or correlation evidence is `FAIL`. A Provider Key may come from `FEEI_API_KEY` or the existing read-only Keychain reference; neither is printed or copied to the artifact.
 
 `e2e:focused` is a separate release-candidate check. It requires a signed-in subscription, an existing production Router configuration used only as a base, and `FEEI_API_KEY` in the invoking environment. It copies the public GitHub Plugin into an isolated Codex home, installs a synthetic read-only MCP fixture there, adds the two ai.feei presets only to an in-memory isolated configuration, uses a random Router port and encrypted temporary archive, and removes its temporary working tree at the end. It does not restart or edit the installed service.
 
@@ -70,7 +76,7 @@ It has no retry loop. The outbound hook rejects a generation beyond the budget a
 
 ## Isolation and privacy
 
-Every automated case uses an isolated `CODEX_HOME` whose `auth.json` is symlinked rather than copied, a random loopback port, an isolated history namespace, and a work root under the operating system's temporary directory. The harness records timing, model ids, byte counts, header names, event/tool types, status, counts, and booleans only. It never records request or response bodies, credentials, image content, tool schemas, or local paths.
+Every automated case uses an isolated `CODEX_HOME` whose `auth.json` is symlinked rather than copied, a random loopback port, an isolated history namespace, and a work root under the operating system's temporary directory. The harness records timing, model ids, byte counts, header names, event/tool types, status, counts, hashes, and booleans only. It never records request or response bodies, search queries/results/URLs, credentials, image content, tool schemas, or local paths.
 
 ## Criteria
 

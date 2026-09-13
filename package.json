@@ -1,6 +1,6 @@
 {
   "name": "codex-local-router",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Local multi-model routing for Codex CLI and App while preserving ChatGPT subscription access",
   "license": "MIT",
   "repository": {
@@ -39,7 +39,8 @@
     "e2e:l2": "node scripts/e2e/run.mjs --group l2",
     "e2e:live": "node scripts/e2e/run.mjs --group live",
     "e2e:focused": "node scripts/e2e/focused-acceptance.mjs",
-    "e2e:official-search": "node scripts/e2e/official-search-acceptance.mjs"
+    "e2e:official-search": "node scripts/e2e/official-search-acceptance.mjs",
+    "e2e:third-party-search": "node scripts/e2e/third-party-search-acceptance.mjs"
   },
   "bin": {
     "codex-local-router": "scripts/gateway-admin.mjs",

@@ -4,7 +4,7 @@
 |---|---|---|
 | Official subscription request or auxiliary API | Fixed ChatGPT Codex backend | Successful Responses are observed into encrypted local history; auxiliary bodies are not archived |
 | Custom-model request | The target's configured third-party provider | Encrypted local history plus that provider's processing |
-| Standalone search from a custom GPT turn | ChatGPT Codex backend only | Search result may enter the custom model's subsequent conversation input |
+| Standalone search from a custom GPT turn | Effective source: ChatGPT Codex backend by default, or an explicitly configured Provider endpoint | Search result may enter the custom model's subsequent conversation input |
 | ChatGPT credential | Official subscription adapter only | Managed by Codex, not copied into router configuration |
 | Third-party credential | Its configured provider only | Environment variable or macOS Keychain |
 | Conversation and tool history | Local SQLite archive | AES-256-GCM until explicit prune |
@@ -19,15 +19,19 @@ This boundary intentionally treats search and generation differently:
 
 ```text
 Codex App
-  |-- /subscription/v1/alpha/search --> OpenAI subscription backend
-  `-- custom model generation -------> configured third-party provider
+  |-- custom model turn -------------> freezes a search-route lease
+  |-- /subscription/v1/alpha/search --> OpenAI subscription backend (default)
+  |                                `--> explicit Provider search endpoint
+  `-- custom model generation --------> configured third-party provider
              ^ search results can be included in the next turn input
 ```
 
-The subscription bearer and account header are retained only on the fixed official leg. Provider credentials are retained only on their configured provider leg. The router never upgrades a local `/v1` API-key request into subscription identity.
+The subscription bearer and account header are retained only on the fixed official leg. Provider credentials are retained only on their configured provider leg. When Provider search is selected, the Router removes the subscription identity and inserts only that Provider's key. It stores only the route source, target, endpoint reference, credential-reference name, configuration digest, correlation identifiers, and TTL—not the search query, result, or credential. The router never upgrades a local `/v1` API-key request into subscription identity.
+
+There is no automatic failover between subscription, Provider, Tavily, or Exa search. The selected source either succeeds or returns a typed error. Search observations used by the acceptance harness stay in memory and persist only response/URL hashes, byte counts, destinations, and booleans.
 
 The default archive quota is 10 GiB and is measured from the archive files on disk. At 80% the router logs a warning. At the quota it rejects new durable history rather than deleting old content. Export never includes provider or subscription credentials.
 
-The router is a local routing boundary, not an anonymity layer. A custom provider receives the conversation content required for that request. Users must decide whether the provider is appropriate for their data.
+The router is a local routing boundary, not an anonymity layer. A custom provider receives the conversation content required for that request, including any standalone-search result that Codex includes in a later generation. Users must decide whether that provider is appropriate for their data.
 
 Space switching changes only Router-managed Codex keys and Router-owned configuration fields. User MCP, Skills, Hooks, prompts, history, and authentication files remain in place. If Codex App is open, the switch has no data-plane effect until the App exits normally and the pending transaction succeeds.

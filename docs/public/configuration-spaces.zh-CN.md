@@ -45,6 +45,14 @@ codex-local-router space diff default work
 
 每次确认修改 Provider、模型、路由、Plugin、搜索、压缩或默认模型时，只有内容实际变化才追加不可变 revision。修改非活动空间不会改变当前安装。只在 Codex 会话里临时选择其他模型不会生成版本。
 
+第三方 GPT 的独立搜索默认来源也属于 revision 和 drift 边界：
+
+```bash
+codex-local-router space set-search-source subscription --space work --yes
+```
+
+逐 target 覆盖和 Provider 搜索 endpoint 随 target/Provider 一起版本化；查询、结果、ChatGPT Token 和 Provider Key 永远不会复制进空间。
+
 空间只保存凭证引用。隐藏输入会把 Provider 密钥存入 macOS Keychain，revision 只记录 service/account；使用环境变量时也只记录变量名。
 
 ## 不打断 Codex App 的切换

@@ -7,10 +7,12 @@ import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import { readFile, writeFile, symlink, mkdir, rm } from "node:fs/promises";
 import { monitorEventLoopDelay } from "node:perf_hooks";
+import * as zlib from "node:zlib";
 import { WebSocket } from "ws";
 import { loadConfig, validate } from "../../../src/config.mjs";
 import { createGateway } from "../../../src/server.mjs";
 import { request, requestRaw } from "../../../src/transport.mjs";
+import { credential } from "../../../src/providers.mjs";
 import { Archive } from "../../../src/archive.mjs";
 import { identityHash } from "./criteria.mjs";
 import { createLocalIdentityResolver } from "../../../src/local-identity.mjs";
@@ -19,6 +21,51 @@ import { discoverToolSources } from "../../../src/tool-sources.mjs";
 
 const exec = promisify(execFile);
 export const APP_CORE = "/Applications/ChatGPT.app/Contents/Resources/codex";
+
+export function extractSearchResultCandidates(raw, encoding = "identity") {
+  let decoded = Buffer.from(raw);
+  try {
+    if (encoding === "gzip") decoded = zlib.gunzipSync(decoded);
+    else if (encoding === "br") decoded = zlib.brotliDecompressSync(decoded);
+    else if (encoding === "zstd" && zlib.zstdDecompressSync)
+      decoded = zlib.zstdDecompressSync(decoded);
+  } catch {
+    return [];
+  }
+  const text = decoded.toString("utf8").replaceAll("\\/", "/");
+  return [...new Set(text.match(/https?:\/\/[^\s"'<>\\]{12,1024}/g) ?? [])]
+    .slice(0, 32);
+}
+
+export function searchResultFingerprint(candidate) {
+  return createHash("sha256").update(candidate).digest("hex");
+}
+
+export function assertAcceptanceRevision({ expected, actual, status = "" }) {
+  if (!expected) return { commit: "working-tree" };
+  if (!/^[a-f0-9]{40}$/.test(expected) || expected !== actual)
+    throw Object.assign(Error("acceptance commit does not match HEAD"), {
+      code: "acceptance_revision_mismatch",
+    });
+  if (status.trim())
+    throw Object.assign(Error("acceptance worktree is not clean"), {
+      code: "acceptance_worktree_dirty",
+    });
+  return { commit: actual };
+}
+
+export async function verifyAcceptanceRevision(projectRoot, expected) {
+  if (!expected) return { commit: "working-tree" };
+  const [{ stdout: head }, { stdout: status }] = await Promise.all([
+    exec("git", ["rev-parse", "HEAD"], { cwd: projectRoot, timeout: 20000 }),
+    exec("git", ["status", "--porcelain"], { cwd: projectRoot, timeout: 20000 }),
+  ]);
+  return assertAcceptanceRevision({
+    expected,
+    actual: head.trim(),
+    status,
+  });
+}
 
 export async function resolveCore() {
   const candidates = [
@@ -90,6 +137,11 @@ export async function startIsolatedGateway({
   const accessToken = createHash("sha256").update(`e2e-token-${seed}`).digest("hex");
   await writeFile(tokenFile, accessToken, { mode: 0o600 });
   const subscriptionToken = JSON.parse(await readFile(authSource, "utf8")).tokens.access_token;
+  const providerTokens = new Set();
+  for (const provider of Object.values(config.providers ?? {})) {
+    const key = await credential(provider).catch(() => null);
+    if (key) providerTokens.add(`Bearer ${key}`);
+  }
   const toolRegistry = await discoverToolSources(
     toolCodexHome ? { codexHome: toolCodexHome } : undefined,
   );
@@ -97,6 +149,8 @@ export async function startIsolatedGateway({
   const logs = [];
   const outbound = [];
   const payloads = [];
+  const searchEvidence = [];
+  const searchMarkers = new Map();
   const archive = new Archive(archivePath, archiveKey);
   // 历史写入观测：只记录结构化元数据（是否新插、版本号、responseId 哈希）。
   const historyWrites = [];
@@ -112,7 +166,8 @@ export async function startIsolatedGateway({
     return saved;
   };
   const recordOutbound = (url, options) => {
-    const host = new URL(url).host;
+    const parsedUrl = new URL(url);
+    const host = parsedUrl.host;
     const headers = options.headers ?? {};
     const authorization = headers.authorization ?? "";
     let body = options.body;
@@ -120,24 +175,52 @@ export async function startIsolatedGateway({
       try { body = JSON.parse(body.toString("utf8")); } catch { body = null; }
     const input = Array.isArray(body?.input) ? body.input : [];
     const messages = Array.isArray(body?.messages) ? body.messages : [];
+    const requestBytes = Buffer.isBuffer(options.body)
+      ? options.body
+      : Buffer.from(JSON.stringify(options.body ?? ""));
     const metadata = {
       host,
       official: host === "chatgpt.com",
+      bodyShape: body && typeof body === "object" && !Buffer.isBuffer(body)
+        ? Object.fromEntries(Object.entries(body).map(([key, item]) => [
+            key,
+            Array.isArray(item) ? "array" : item === null ? "null" : typeof item,
+          ]))
+        : null,
       headerNames: Object.keys(headers).sort(),
       subscriptionBearer: Boolean(subscriptionToken) && authorization === `Bearer ${subscriptionToken}`,
+      providerCredential: providerTokens.has(authorization),
       accountHeader: Boolean(headers["chatgpt-account-id"]),
       opencodeSession: Boolean(headers["x-opencode-session"]),
-      path: new URL(url).pathname,
+      path: parsedUrl.pathname,
       transport: options.transport ?? "http",
+      requestFingerprint: createHash("sha256")
+        .update(options.method ?? "POST")
+        .update(parsedUrl.pathname)
+        .update(requestBytes)
+        .digest("hex"),
     };
+    if (!metadata.official && metadata.path.endsWith("/responses")) {
+      const text = (Buffer.isBuffer(options.body)
+        ? options.body.toString("utf8")
+        : JSON.stringify(options.body ?? "")).replaceAll("\\/", "/");
+      const match = [...searchMarkers.entries()].find(([marker]) => text.includes(marker));
+      metadata.searchResultFingerprint = match?.[1] ?? null;
+    }
     beforeOutbound?.({
       ...metadata,
       model: body?.model,
       generate: body?.generate,
+      requestFingerprint: metadata.requestFingerprint,
     });
     outbound.push(metadata);
+    const additionalToolCarriers = input.filter(
+      (item) => item?.type === "additional_tools" && Array.isArray(item.tools),
+    );
+    const additionalToolDefinitions = additionalToolCarriers.flatMap((item) => item.tools);
     payloads.push({
       host,
+      path: parsedUrl.pathname,
       model: body?.model,
       bytes: Buffer.isBuffer(options.body)
         ? options.body.length
@@ -155,6 +238,14 @@ export async function startIsolatedGateway({
           .map((x) => (x.content ?? []).map((part) => part?.type)),
       ],
       tools: (body?.tools ?? []).map((x) => x.name ?? x.function?.name ?? x.type),
+      additionalToolSurface: {
+        carriers: additionalToolCarriers.length,
+        definitions: additionalToolDefinitions.length,
+        hasWebRun: additionalToolDefinitions.some((tool) =>
+          tool?.type === "namespace" &&
+          (tool.name ?? tool.namespace) === "web" &&
+          tool.tools?.some((nested) => nested?.name === "run")),
+      },
       toolSizes: (body?.tools ?? []).map((x) => ({
         name: x.name ?? x.function?.name ?? x.type,
         type: x.type ?? null,
@@ -171,6 +262,43 @@ export async function startIsolatedGateway({
       ],
     });
     return metadata;
+  };
+  const observeSearchResponse = (response, metadata) => {
+    const chunks = [];
+    let bytes = 0;
+    let complete = false;
+    const body = response.body;
+    response.body = (async function* () {
+      try {
+        for await (const chunk of body) {
+          const value = Buffer.from(chunk);
+          bytes += value.length;
+          if (bytes <= 2 * 1024 * 1024) chunks.push(value);
+          yield value;
+        }
+        complete = true;
+      } finally {
+        const raw = Buffer.concat(chunks);
+        const encoding = response.headers?.get?.("content-encoding")?.toLowerCase();
+        const candidates = extractSearchResultCandidates(raw, encoding);
+        const hashes = candidates.map(searchResultFingerprint);
+        for (const [index, candidate] of candidates.entries())
+          searchMarkers.set(candidate, hashes[index]);
+        metadata.searchResponseComplete = complete;
+        metadata.searchResponseBytes = bytes;
+        metadata.searchResultFingerprints = hashes;
+        searchEvidence.push({
+          host: metadata.host,
+          path: metadata.path,
+          status: metadata.status ?? null,
+          complete,
+          bytes,
+          responseSha256: createHash("sha256").update(raw).digest("hex"),
+          resultFingerprints: hashes,
+        });
+      }
+    })();
+    return response;
   };
   const gateway = createGateway(config, {
     archive,
@@ -193,7 +321,20 @@ export async function startIsolatedGateway({
       try {
         const response = await requestRaw(url, options);
         metadata.status = response.status;
-        return response;
+        return metadata.path.endsWith("/alpha/search")
+          ? observeSearchResponse(response, metadata)
+          : response;
+      } catch (error) {
+        metadata.error = error?.type ?? "transport_error";
+        throw error;
+      }
+    },
+    providerSearchRequest: async (url, options) => {
+      const metadata = recordOutbound(url, options);
+      try {
+        const response = await requestRaw(url, options);
+        metadata.status = response.status;
+        return observeSearchResponse(response, metadata);
       } catch (error) {
         metadata.error = error?.type ?? "transport_error";
         throw error;
@@ -227,6 +368,7 @@ export async function startIsolatedGateway({
     logs,
     outbound,
     payloads,
+    searchEvidence,
     historyWrites,
     subscriptionToken,
     async close() {

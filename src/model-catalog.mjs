@@ -1,3 +1,5 @@
+import { resolveStandaloneSearchPolicy } from "./standalone-search.mjs";
+
 const defaultReasoningLevels = ["low", "medium", "high", "xhigh"].map((effort) => ({
   effort,
   description: `${effort} reasoning effort`,
@@ -35,7 +37,7 @@ function legacyTarget(options = {}) {
   };
 }
 
-function customModel(target, source) {
+function customModel(target, source, config) {
   const highestPriority = Math.max(
     1,
     ...source.models.map((model) => Number(model.priority ?? 1)),
@@ -72,9 +74,7 @@ function customModel(target, source) {
     effective_context_window_percent: target.effectiveContextWindowPercent,
     experimental_supported_tools: [],
     input_modalities: target.inputModalities,
-    supports_search_tool:
-      target.app.supportsSearchTool ??
-      (target.capabilities?.nativeWebSearch === true),
+    supports_search_tool: resolveStandaloneSearchPolicy(config, target).advertised,
     use_responses_lite: target.app.useResponsesLite ?? false,
   };
 }
@@ -86,12 +86,15 @@ export function buildModelCatalog(source, configOrOptions = {}) {
   const targets = configOrOptions.targets
     ? Object.values(configOrOptions.targets).filter((x) => x.app?.enabled)
     : [legacyTarget(configOrOptions)];
+  const config = configOrOptions.targets
+    ? configOrOptions
+    : { providers: {}, targets: Object.fromEntries(targets.map((target) => [target.id, target])) };
   const official = new Set(source.models.map((x) => x.slug));
   for (const target of targets)
     if (official.has(target.app.modelId))
       throw Error(`custom model conflicts with official model ${target.app.modelId}`);
   return {
     ...source,
-    models: [...source.models, ...targets.map((x) => customModel(x, source))],
+    models: [...source.models, ...targets.map((x) => customModel(x, source, config))],
   };
 }

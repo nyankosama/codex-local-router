@@ -21,6 +21,8 @@ Codex Local Router（仅监听本机回环地址）
 
 Router 不替用户开启或关闭搜索：Codex 继续使用正常搜索模式（默认 cached，或由用户选择 live）。官方 HTTP 与 WebSocket 会共同继承 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`WS_PROXY`、`WSS_PROXY` 并遵守 `NO_PROXY`。
 
+第三方 `openai-gpt` target 默认复用当前官方登录的独立搜索，而模型生成仍发往配置的 Provider。单个 target 可以显式改为兼容的 Provider 搜索 endpoint，或禁用搜索；Router 不猜测，也不会在来源间静默回退。Responses 内嵌 hosted search 仍是另一项独立能力。详见[独立搜索路由](docs/public/configuration.zh-CN.md#独立搜索路由)。
+
 第三方 GPT target 默认采用保守的 Plugin 白名单，以减少 Codex 客户端携带的大体积 Plugin 工具定义；Codex 核心工具和用户自行配置的 MCP 不受裁剪。非 GPT 与未声明模型家族的旧 target 默认仍原样转发。
 
 ## 支持范围
@@ -31,15 +33,15 @@ Router 不替用户开启或关闭搜索：Codex 继续使用正常搜索模式�
 - Responses 与 Chat Completions
 - ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设和通用 OpenAI 兼容渠道
 
-v0.3.1 不声明 Linux、Windows 或未知供应商私有协议已受支持。
+v0.4.0 不声明 Linux、Windows 或未知供应商私有协议已受支持。
 
 ## 从 GitHub Release 安装
 
-下载 `v0.3.1` Release 中的 `.tgz` 与 SHA-256 文件：
+下载 `v0.4.0` Release 中的 `.tgz` 与 SHA-256 文件：
 
 ```bash
-shasum -a 256 -c codex-local-router-0.3.1.tgz.sha256
-npm install -g ./codex-local-router-0.3.1.tgz
+shasum -a 256 -c codex-local-router-0.4.0.tgz.sha256
+npm install -g ./codex-local-router-0.4.0.tgz
 codex-local-router --version
 ```
 
@@ -93,7 +95,7 @@ codex-local-router model list
 codex-local-router model probe --id deepseek --live
 ```
 
-内置的 `feei/gpt-5.6-sol`、`feei/gpt-6-astra` 预设分别使用 `feei-gpt-5.6-sol`、`feei-gpt-6-astra` 作为 App 模型 ID，采用标准 Responses、保守的 272,000 token 配置窗口和第三方 GPT Plugin 策略。API Key 必须由用户通过 Keychain 或 `FEEI_API_KEY` 单独提供，项目不包含任何凭证。具体配置见[配置说明](docs/public/configuration.zh-CN.md)。
+内置的 `feei/gpt-5.6-sol`、`feei/gpt-6-astra` 预设分别使用 `feei-gpt-5.6-sol`、`feei-gpt-6-astra` 作为 App 模型 ID，采用标准 Responses、保守的 272,000 token 配置窗口、第三方 GPT Plugin 策略和通用订阅搜索默认值。API Key 必须由用户通过 Keychain 或 `FEEI_API_KEY` 单独提供，项目不包含任何凭证。具体配置见[配置说明](docs/public/configuration.zh-CN.md)。
 
 ## 恢复与历史
 

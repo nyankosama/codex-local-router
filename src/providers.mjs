@@ -4,6 +4,12 @@ import { request } from "./transport.mjs";
 import { fail } from "./errors.mjs";
 const exec = promisify(execFile);
 const limiters = new Map();
+const codexCompatibilityHeaders = [
+  "user-agent",
+  "originator",
+  "x-codex-beta-features",
+  "x-openai-internal-codex-responses-lite",
+];
 
 class Limiter {
   constructor(limit) {
@@ -170,6 +176,17 @@ export async function callProvider(
     const p = config.providers[target.provider],
       key = await credential(p);
     if (key) headers.authorization = `Bearer ${key}`;
+    // Codex-aware OpenAI-compatible relays may use these non-identity headers
+    // for protocol negotiation. Keep account/session/install correlation and all
+    // subscription credentials on the local side of the trust boundary.
+    if (
+      target.modelFamily === "openai-gpt" &&
+      target.wireApi === "responses" &&
+      p.adapter === "openai-compatible"
+    ) {
+      for (const name of codexCompatibilityHeaders)
+        if (ctx.headers[name]) headers[name] = ctx.headers[name];
+    }
     if (p.adapter === "opencode-go")
       headers["x-opencode-session"] = ctx.channelSession;
     body = { ...body };

@@ -22,8 +22,50 @@ test("A10 focused acceptance enforces turn and sent-generation hard limits", () 
     maxGenerations: 10,
     generationAttempts: 11,
     blockedGenerations: 1,
+    implicitRetries: 0,
     searchRequests: 0,
+    maxSearchRequests: null,
+    blockedSearchRequests: 0,
   });
+  assert.equal(aborted, 1);
+});
+
+test("A10 focused acceptance stops before sending an identical model retry", () => {
+  const budget = new FocusedAcceptanceBudget();
+  budget.beforeOutbound({
+    path: "/v1/responses",
+    generate: true,
+    requestFingerprint: "same-request",
+  });
+  let aborted = 0;
+  budget.activeAbort = () => aborted++;
+  assert.throws(
+    () => budget.beforeOutbound({
+      path: "/v1/responses",
+      generate: true,
+      requestFingerprint: "same-request",
+    }),
+    (error) => error.code === "implicit_model_retry_detected",
+  );
+  assert.equal(budget.generations, 1);
+  assert.equal(budget.generationAttempts, 2);
+  assert.equal(budget.blockedGenerations, 1);
+  assert.equal(budget.implicitRetries, 1);
+  assert.equal(aborted, 1);
+});
+
+test("A10 focused acceptance enforces the independent search hard limit", () => {
+  const budget = new FocusedAcceptanceBudget({ maxSearchRequests: 2 });
+  budget.beforeOutbound({ path: "/codex/alpha/search", official: true });
+  budget.beforeOutbound({ path: "/codex/alpha/search", official: true });
+  let aborted = 0;
+  budget.activeAbort = () => aborted++;
+  assert.throws(
+    () => budget.beforeOutbound({ path: "/codex/alpha/search", official: true }),
+    (error) => error.code === "search_budget_exhausted",
+  );
+  assert.equal(budget.searchRequests, 2);
+  assert.equal(budget.blockedSearchRequests, 1);
   assert.equal(aborted, 1);
 });
 

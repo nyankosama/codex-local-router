@@ -21,6 +21,8 @@ Official subscription traffic uses a dedicated transparent relay. Only an explic
 
 The relay does not enable or disable search. Codex keeps its normal search mode (cached by default, or live when the user selects it), while the router forwards official HTTP and WebSocket traffic through the configured `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `WS_PROXY`, or `WSS_PROXY` environment and honors `NO_PROXY`.
 
+Third-party `openai-gpt` targets use the signed-in user's official standalone search by default, while model generation still goes to the configured Provider. A target may explicitly select a compatible Provider search endpoint or disable search; the router never guesses or silently falls back between sources. Embedded Responses hosted search remains a separate capability. See the [configuration reference](docs/public/configuration.md#standalone-search-routing).
+
 Third-party GPT targets can use a conservative Plugin allowlist to reduce the large client-supplied Plugin surface. Codex built-ins and user-configured MCP servers are not filtered. Non-GPT and legacy targets remain passthrough unless the user explicitly selects a policy.
 
 ## Supported scope
@@ -31,15 +33,15 @@ Third-party GPT targets can use a conservative Plugin allowlist to reduce the la
 - Responses and Chat Completions providers
 - ChatGPT subscription routing, OpenCode Go, ai.feei GPT presets, and generic OpenAI-compatible providers
 
-Other operating systems and vendor-specific protocols are not claimed as supported in v0.3.1.
+Other operating systems and vendor-specific protocols are not claimed as supported in v0.4.0.
 
 ## Install from a GitHub Release
 
-Download the `.tgz` and SHA-256 file from the `v0.3.1` release, verify it, and install it locally:
+Download the `.tgz` and SHA-256 file from the `v0.4.0` release, verify it, and install it locally:
 
 ```bash
-shasum -a 256 -c codex-local-router-0.3.1.tgz.sha256
-npm install -g ./codex-local-router-0.3.1.tgz
+shasum -a 256 -c codex-local-router-0.4.0.tgz.sha256
+npm install -g ./codex-local-router-0.4.0.tgz
 codex-local-router --version
 ```
 
@@ -93,7 +95,7 @@ A live model probe is explicit and consumes provider quota:
 codex-local-router model probe --id deepseek --live
 ```
 
-The built-in `feei/gpt-5.6-sol` and `feei/gpt-6-astra` presets use distinct App model IDs (`feei-gpt-5.6-sol` and `feei-gpt-6-astra`), standard Responses, a conservative 272,000-token configured window, and the third-party GPT Plugin policy. The API key must be supplied separately through Keychain or `FEEI_API_KEY`; no credential is included in this project. See the [configuration reference](docs/public/configuration.md).
+The built-in `feei/gpt-5.6-sol` and `feei/gpt-6-astra` presets use distinct App model IDs (`feei-gpt-5.6-sol` and `feei-gpt-6-astra`), Responses Lite tool transport, a conservative 272,000-token configured window, the third-party GPT Plugin policy, and the general subscription-search default. The API key must be supplied separately through Keychain or `FEEI_API_KEY`; no credential is included in this project. See the [configuration reference](docs/public/configuration.md).
 
 ## Safety and recovery
 

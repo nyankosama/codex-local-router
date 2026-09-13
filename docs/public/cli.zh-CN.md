@@ -1,6 +1,6 @@
 # CLI 说明
 
-正式命令为 `codex-local-router`，`llm-auto-gateway` 是完全等价的兼容别名。新增 `space init/list/current/show/history/diff/create/capture/set-default-model/use/rollback/resume/cancel`，用于管理完整配置组合和不可变 revision。
+正式命令为 `codex-local-router`，`llm-auto-gateway` 是完全等价的兼容别名。`space init/list/current/show/history/diff/create/capture/set-default-model/set-search-source/use/rollback/resume/cancel` 用于管理完整配置组合和不可变 revision。
 
 完整日常流程、pending 切换、drift 恢复和数据边界见[配置空间指南](configuration-spaces.zh-CN.md)。
 
@@ -11,10 +11,13 @@
 - `--model-family openai-gpt|other`
 - `--plugin-policy passthrough|third-party-gpt-default|allowlist`
 - `--allowed-plugins github,figma,...`（只用于显式 allowlist）
-- `--supports-search-tool` / `--no-supports-search-tool`
-- `--responses-lite` / `--no-responses-lite`
+- `--search-source subscription|provider|disabled`
+- `--supports-search-tool` / `--no-supports-search-tool`（兼容别名，不能与新参数同时使用）
+- `--responses-lite` / `--no-responses-lite`（独立搜索启用时默认 Lite；显式关闭会被拒绝）
 
-`model list --json` 和非 live 的 `model probe --id ID --json` 会输出最终 Plugin 策略、选择原因、有效名单和来源识别状态，不调用模型。只有显式增加 `--live` 才消费 Provider 额度。
+`provider add|edit --standalone-search-endpoint RELATIVE_PATH` 显式配置 Provider 搜索端点；`provider edit --no-standalone-search-endpoint` 删除。`space set-search-source subscription|provider|disabled [--space NAME]` 修改该空间的第三方 GPT 默认来源。Provider 模式仍要求 App-enabled Responses target，且不存在自动回退。
+
+`model list --json` 和非 live 的 `model probe --id ID --json` 会输出最终 Plugin 策略、独立搜索来源/原因、是否向 App 广告、Provider endpoint 与凭证就绪状态、有效名单和来源识别状态，不调用模型；`status --json`、`doctor --json` 也包含搜索摘要。只有显式增加 `--live` 才消费 Provider 额度。
 
 Provider、模型与 `config upgrade` 支持 `--space NAME`。缺省修改当前 Router 空间；当前为 `official` 时必须显式指定。每次确认修改生成不可变 revision；修改活动空间会启动切换，修改非活动空间只追加版本。
 

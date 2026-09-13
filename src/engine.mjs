@@ -34,6 +34,14 @@ import {
   resolvePluginToolPolicy,
 } from "./tool-policy.mjs";
 import { observedOfficialResponse } from "./official-relay.mjs";
+import {
+  resolveStandaloneSearchPolicy,
+  standaloneSearchConfigDigest,
+} from "./standalone-search.mjs";
+import {
+  StandaloneSearchRoutes,
+  requireStandaloneSearchRoute,
+} from "./search-routes.mjs";
 const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value) ?? "");
 const searchFunction = {
   type: "function",
@@ -95,6 +103,7 @@ export class Engine {
     this.resolveIdentity = resolveIdentity;
     this.toolRegistry = toolRegistry ?? {};
     this.state = new StateStore(config.history, archive);
+    this.standaloneSearchRoutes = new StandaloneSearchRoutes(this.state);
     this.summaryInflight = new Map();
     this.officialObservations = new Map();
   }
@@ -111,6 +120,88 @@ export class Engine {
       ? await this.resolveIdentity(entry, headers)
       : undefined;
     return identity(entry, headers, body, trustedAccount);
+  }
+  allVisibleTargetsUseSubscriptionSearch(config = this.config) {
+    const visible = Object.values(config.targets).filter((target) => target.app?.enabled);
+    return visible.every(
+      (target) => resolveStandaloneSearchPolicy(config, target).source === "subscription",
+    );
+  }
+  recordStandaloneSearchRoute(config, target, headers, body, ctx) {
+    const policy = resolveStandaloneSearchPolicy(config, target);
+    const provider = config.providers?.[target.provider];
+    const route = this.standaloneSearchRoutes.save(
+      ctx.auth,
+      headers,
+      body,
+      {
+        target: target.id,
+        provider: target.provider,
+        source: policy.source,
+        endpoint: policy.source === "provider"
+          ? provider?.standaloneSearch?.endpoint
+          : null,
+        providerBaseUrl: policy.source === "provider" ? provider?.baseUrl : null,
+        credentialRef: policy.source === "provider"
+          ? {
+              ...(provider?.apiKeyEnv ? { apiKeyEnv: provider.apiKeyEnv } : {}),
+              ...(provider?.keychain
+                ? { keychain: structuredClone(provider.keychain) }
+                : {}),
+            }
+          : null,
+        configDigest: standaloneSearchConfigDigest(config, target, policy),
+      },
+      ctx,
+    );
+    this.log({
+      event: "standalone_search_route_selected",
+      source: route.source,
+      target: route.target,
+      provider: route.provider,
+      matched_scope: route.correlation.turn
+        ? "turn"
+        : route.correlation.thread
+          ? "thread"
+          : route.correlation.session
+            ? "session"
+            : "account",
+    });
+    return route;
+  }
+  async recordOfficialStandaloneSearchRoute(headers, body, prepared) {
+    const context = prepared ?? await this.officialRelayContext(headers, body);
+    return this.recordStandaloneSearchRoute(
+      this.config,
+      this.officialTarget(body.model),
+      headers,
+      body,
+      context.ctx,
+    );
+  }
+  async resolveStandaloneSearchRoute(headers) {
+    const ctx = await this.identify("subscription", headers, {});
+    let route = this.standaloneSearchRoutes.resolve(ctx.auth, headers, {}, {
+      // Codex builds may omit turn correlation on the standalone request. In
+      // that shape, the account's latest model request is the only safe lease;
+      // scoped requests never fall back across an unmatched thread/session.
+      allowAccountFallback: true,
+    });
+    if (!route && this.allVisibleTargetsUseSubscriptionSearch())
+      route = {
+        schemaVersion: 1,
+        target: "official:implicit",
+        provider: "chatgpt-subscription",
+        source: "subscription",
+        endpoint: null,
+        providerBaseUrl: null,
+        credentialRef: null,
+        configDigest: null,
+        createdAt: Date.now(),
+        correlation: {},
+        matchedBy: "subscription-only-default",
+      };
+    return requireStandaloneSearchRoute(route);
   }
   targetFromRecord(config, record) {
     if (!record) return undefined;
@@ -513,6 +604,7 @@ export class Engine {
     const config = lease.config,
       requestId = randomUUID(),
       startedAt = acceptedAt;
+    this.recordStandaloneSearchRoute(config, lease.target, headers, original, ctx);
     ctx.providerCalls = 0;
     let target = lease.target,
       output = false,
@@ -690,8 +782,12 @@ export class Engine {
       migrationSummaryAttempted = false;
     for (;;) {
       if (signal.aborted) throw fail("cancelled", 499);
-      const plan = planCapabilities(target, contextFromRequest(body, headers));
-      if (plan.mode === "unsupported") throw fail("capability_error", 400);
+      const standaloneSearch = resolveStandaloneSearchPolicy(config, target);
+      const plan = planCapabilities(target, contextFromRequest(body, headers), {
+        standaloneSearchSource: standaloneSearch.source,
+      });
+      if (plan.mode === "unsupported")
+        throw fail(plan.reason ?? "capability_error", 400);
       if (body.tools?.length && target.capabilities?.toolCalling === false)
         throw fail("capability_error", 400);
       const search = plan.mode === "tool_fallback";
