@@ -5,10 +5,11 @@ import { createServer, request as httpRequest } from "node:http";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
-import { readFile, writeFile, symlink, mkdir, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
+import { dirname } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import * as zlib from "node:zlib";
-import { WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { loadConfig, validate } from "../../../src/config.mjs";
 import { createGateway } from "../../../src/server.mjs";
 import { request, requestRaw } from "../../../src/transport.mjs";
@@ -18,9 +19,92 @@ import { identityHash } from "./criteria.mjs";
 import { createLocalIdentityResolver } from "../../../src/local-identity.mjs";
 import { buildModelCatalog } from "../../../src/model-catalog.mjs";
 import { discoverToolSources } from "../../../src/tool-sources.mjs";
+import { isSubstantiveResponseEvent } from "../../../src/response-stream.mjs";
 
 const exec = promisify(execFile);
 export const APP_CORE = "/Applications/ChatGPT.app/Contents/Resources/codex";
+
+export function finalizeTransportFailure(metadata, error, observedAt = Date.now()) {
+  metadata.error = error?.type ?? "transport_error";
+  metadata.responseBytes ??= 0;
+  metadata.responseComplete = false;
+  metadata.terminationReason = "transport-error-before-headers";
+  metadata.totalMs = observedAt - metadata.at;
+  return metadata;
+}
+
+// E2E Codex children talk only to the isolated loopback Gateway. They must not
+// inherit credentials or proxy routing from the operator's shell; the Gateway
+// process itself keeps its own environment for explicitly-authorized upstream
+// live canaries.
+const SENSITIVE_ENV_NAMES = new Set([
+  "OPENAI_API_KEY",
+  "FEEI_API_KEY",
+  "OPENCODE_GO_API_KEY",
+  "TAVILY_API_KEY",
+  "EXA_API_KEY",
+  "ROUTER_SEARCH_TEST_KEY",
+  "ROUTER_TEST_FEEI_KEY",
+  "TEST_PROVIDER_KEY",
+  "TEST_VENDOR_KEY",
+  "ROUTER_SHAPE_KEY",
+  "CODEX_AUTH_TOKEN",
+  "GITHUB_TOKEN",
+  "GH_TOKEN",
+  "NPM_TOKEN",
+  "NODE_AUTH_TOKEN",
+  "LOCAL_PROXY_KEY",
+  "SSH_AUTH_SOCK",
+  "CODEX_APP_TOOLS_PIPE_PATH",
+  "NODE_EXTRA_CA_CERTS",
+  "AWS_ACCESS_KEY_ID",
+  "AWS_SECRET_ACCESS_KEY",
+  "AWS_SESSION_TOKEN",
+]);
+
+// App-server may carry tools inside a namespace/additional_tools envelope.
+// Record only names and recursively inspect the envelope; never retain the
+// user-provided schemas or descriptions in public evidence.
+export function collectToolNames(tool) {
+  if (!tool || typeof tool !== "object") return [];
+  const names = [];
+  if (typeof tool.name === "string" && tool.name) names.push(tool.name);
+  if (typeof tool.namespace === "string" && tool.namespace) names.push(tool.namespace);
+  for (const key of ["tools", "functions"]) {
+    if (Array.isArray(tool[key])) {
+      for (const nested of tool[key]) names.push(...collectToolNames(nested));
+    }
+  }
+  return names;
+}
+
+export function isolatedChildEnv(home, overrides = {}) {
+  const env = { ...process.env, ...overrides };
+  for (const name of Object.keys(env)) {
+    if (
+      SENSITIVE_ENV_NAMES.has(name) ||
+      /^(?:HTTP|HTTPS|ALL|NO)_PROXY$/i.test(name) ||
+      /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|SECRET|PASSWORD)$/.test(name)
+    ) delete env[name];
+  }
+  // HOME/CODEX_HOME are always authoritative for the run.  Caller overrides
+  // may add harmless fixture values, but can never redirect the child back to
+  // a user's real Codex directory.
+  return {
+    ...env,
+    HOME: home,
+    CODEX_HOME: home,
+    XDG_CONFIG_HOME: `${home}/xdg-config`,
+    XDG_CACHE_HOME: `${home}/xdg-cache`,
+    XDG_DATA_HOME: `${home}/xdg-data`,
+    XDG_STATE_HOME: `${home}/xdg-state`,
+    XDG_RUNTIME_DIR: `${home}/xdg-runtime`,
+    CODEX_LOCAL_ROUTER_HOME: `${home}/router-home`,
+    CODEX_LOCAL_ROUTER_CONFIG: `${home}/router-home/config.json`,
+    GATEWAY_STATE_PATH: `${home}/router-home/state/gateway.json`,
+    GATEWAY_INSTANCE_ID: `acceptance-${createHash("sha256").update(home).digest("hex").slice(0, 16)}`,
+  };
+}
 
 export function extractSearchResultCandidates(raw, encoding = "identity") {
   let decoded = Buffer.from(raw);
@@ -41,8 +125,67 @@ export function searchResultFingerprint(candidate) {
   return createHash("sha256").update(candidate).digest("hex");
 }
 
-export function assertAcceptanceRevision({ expected, actual, status = "" }) {
-  if (!expected) return { commit: "working-tree" };
+export async function createEvidenceDirectory(path) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  await mkdir(path, { recursive: false, mode: 0o700 });
+  return path;
+}
+
+export async function writeImmutableJson(path, value) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  const body = text.endsWith("\n") ? text : `${text}\n`;
+  await writeFile(path, body, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  return path;
+}
+
+// Decode only the harness observation copy. The proxy still forwards the
+// original response bytes and headers unchanged, including compression.
+export function decodeSseFrames(raw, encoding = "identity") {
+  let decoded = Buffer.from(raw);
+  try {
+    if (encoding === "gzip") decoded = zlib.gunzipSync(decoded);
+    else if (encoding === "deflate") decoded = zlib.inflateSync(decoded);
+    else if (encoding === "br") decoded = zlib.brotliDecompressSync(decoded);
+    else if (encoding === "zstd" && zlib.zstdDecompressSync)
+      decoded = zlib.zstdDecompressSync(decoded);
+  } catch {
+    return [];
+  }
+  const frames = [];
+  const text = decoded.toString("utf8");
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+    if (!data || data === "[DONE]") continue;
+    try {
+      const event = JSON.parse(data);
+      frames.push({
+        type: event.type,
+        sequence_number: event.sequence_number,
+        itemType: event.item?.type,
+        inputTokens: event.response?.usage?.input_tokens ?? event.usage?.input_tokens,
+        outputTokens: event.response?.usage?.output_tokens ?? event.usage?.output_tokens,
+        phase: event.item?.phase,
+        itemId: event.item?.id,
+      });
+    } catch {
+      // Ignore comments and non-JSON SSE records; the transport is still
+      // forwarded and the acceptance assertion will fail closed if no frames
+      // can be observed.
+    }
+  }
+  return frames;
+}
+
+export function assertAcceptanceRevision({ expected, actual, tree, status = "" }) {
+  if (!expected) return { commit: "working-tree", tree: null };
   if (!/^[a-f0-9]{40}$/.test(expected) || expected !== actual)
     throw Object.assign(Error("acceptance commit does not match HEAD"), {
       code: "acceptance_revision_mismatch",
@@ -51,18 +194,30 @@ export function assertAcceptanceRevision({ expected, actual, status = "" }) {
     throw Object.assign(Error("acceptance worktree is not clean"), {
       code: "acceptance_worktree_dirty",
     });
-  return { commit: actual };
+  if (!/^[a-f0-9]{40}$/.test(tree ?? ""))
+    throw Object.assign(Error("acceptance tree could not be resolved"), {
+      code: "acceptance_tree_unresolved",
+    });
+  return { commit: actual, tree };
+}
+
+// Persisted case observations must carry the same verdict as the case record;
+// the probe shape may default to PASS before assertions are evaluated.
+export function persistCaseVerdict(observation, finalVerdict) {
+  return { ...observation, result: finalVerdict };
 }
 
 export async function verifyAcceptanceRevision(projectRoot, expected) {
-  if (!expected) return { commit: "working-tree" };
-  const [{ stdout: head }, { stdout: status }] = await Promise.all([
+  if (!expected) return { commit: "working-tree", tree: null };
+  const [{ stdout: head }, { stdout: tree }, { stdout: status }] = await Promise.all([
     exec("git", ["rev-parse", "HEAD"], { cwd: projectRoot, timeout: 20000 }),
+    exec("git", ["rev-parse", "HEAD^{tree}"], { cwd: projectRoot, timeout: 20000 }),
     exec("git", ["status", "--porcelain"], { cwd: projectRoot, timeout: 20000 }),
   ]);
   return assertAcceptanceRevision({
     expected,
     actual: head.trim(),
+    tree: tree.trim(),
     status,
   });
 }
@@ -100,13 +255,109 @@ export async function isolatedCodexHome({
 }) {
   await mkdir(home, { recursive: true, mode: 0o700 });
   await rm(`${home}/auth.json`, { force: true });
-  await symlink(authSource, `${home}/auth.json`);
+  // Copy the fixture instead of symlinking the real auth file.  Some Codex
+  // versions refresh auth metadata during startup; a symlink would let an E2E
+  // child write into the user's active login.
+  const authBytes = await readFile(authSource);
+  await writeFile(`${home}/auth.json`, authBytes, { mode: 0o600 });
   const toml =
     `model_provider = "openai"\nmodel = "${model}"\nmodel_reasoning_effort = "${reasoningEffort}"\n` +
     `${webSearch == null ? "" : `web_search = "${webSearch}"\n`}` +
     `openai_base_url = "${baseUrl}"\nmodel_catalog_json = "${catalogPath}"\n${extra}`;
   await writeFile(`${home}/config.toml`, toml, { mode: 0o600 });
   return home;
+}
+
+export async function writeDeterministicCodexInputs(root) {
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  const authPath = `${root}/auth.json`;
+  const catalogPath = `${root}/models.json`;
+  const jwt = (payload) => [
+    Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT", kid: "deterministic-fixture" })).toString("base64url"),
+    Buffer.from(JSON.stringify(payload)).toString("base64url"),
+    "deterministic-signature",
+  ].join(".");
+  const account = "deterministic-subscription-account";
+  const authClaims = {
+    chatgpt_account_id: account,
+    chatgpt_plan_type: "plus",
+    chatgpt_user_id: "deterministic-user",
+    user_id: "deterministic-user",
+    localhost: true,
+  };
+  const auth = {
+    auth_mode: "chatgpt",
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: jwt({
+        iss: "https://auth.openai.com/",
+        aud: ["deterministic-codex-client"],
+        sub: "deterministic-user",
+        email: "deterministic@example.invalid",
+        email_verified: true,
+        iat: 1700000000,
+        exp: 4102444800,
+        "https://api.openai.com/auth": authClaims,
+      }),
+      access_token: jwt({
+        iss: "https://auth.openai.com/",
+        aud: ["https://api.openai.com/v1"],
+        client_id: "deterministic-codex-client",
+        sub: "deterministic-user",
+        iat: 1700000000,
+        nbf: 1700000000,
+        exp: 4102444800,
+        scp: ["openid", "profile", "email", "offline_access"],
+        "https://api.openai.com/auth": authClaims,
+        "https://api.openai.com/profile": {
+          email: "deterministic@example.invalid",
+          email_verified: true,
+          name: "Deterministic Fixture",
+        },
+      }),
+      refresh_token: "deterministic-refresh-token",
+      account_id: account,
+    },
+    last_refresh: new Date().toISOString(),
+  };
+  const catalog = {
+    models: [{
+      slug: "gpt-5.6-sol",
+      display_name: "Deterministic Official GPT",
+      description: "Local qualification fixture",
+      default_reasoning_level: "low",
+      supported_reasoning_levels: [{ effort: "low", description: "low reasoning effort" }],
+      shell_type: "unified_exec",
+      visibility: "list",
+      supported_in_api: true,
+      priority: 100,
+      additional_speed_tiers: [],
+      service_tiers: [],
+      availability_nux: null,
+      upgrade: null,
+      base_instructions: "",
+      model_messages: null,
+      supports_reasoning_summaries: true,
+      default_reasoning_summary: "auto",
+      support_verbosity: false,
+      default_verbosity: null,
+      apply_patch_tool_type: "freeform",
+      web_search_tool_type: "text",
+      truncation_policy: { mode: "tokens", limit: 10000 },
+      supports_parallel_tool_calls: true,
+      supports_image_detail_original: true,
+      context_window: 272000,
+      max_context_window: 272000,
+      effective_context_window_percent: 95,
+      experimental_supported_tools: [],
+      input_modalities: ["text", "image"],
+      supports_search_tool: true,
+      use_responses_lite: false,
+    }],
+  };
+  await writeFile(authPath, `${JSON.stringify(auth)}\n`, { mode: 0o600 });
+  await writeFile(catalogPath, `${JSON.stringify(catalog)}\n`, { mode: 0o600 });
+  return { authPath, catalogPath };
 }
 
 export async function writeCatalog({ sourceCatalogPath, config, targetPath }) {
@@ -126,7 +377,12 @@ export async function startIsolatedGateway({
   seed = 0,
   mutate,
   toolCodexHome,
+  markerObservations = [],
   beforeOutbound,
+  sendRequest = request,
+  officialRequest = requestRaw,
+  providerSearchRequest = requestRaw,
+  createOfficialWebSocket = (url, options) => new WebSocket(url, options),
 }) {
   const base = structuredClone(await loadConfig(configPath));
   base.listen = { host: "127.0.0.1", port: 0 };
@@ -150,6 +406,7 @@ export async function startIsolatedGateway({
   const outbound = [];
   const payloads = [];
   const searchEvidence = [];
+  const websocketEvents = [];
   const searchMarkers = new Map();
   const archive = new Archive(archivePath, archiveKey);
   // 历史写入观测：只记录结构化元数据（是否新插、版本号、responseId 哈希）。
@@ -166,6 +423,7 @@ export async function startIsolatedGateway({
     return saved;
   };
   const recordOutbound = (url, options) => {
+    const startedAt = Date.now();
     const parsedUrl = new URL(url);
     const host = parsedUrl.host;
     const headers = options.headers ?? {};
@@ -175,10 +433,45 @@ export async function startIsolatedGateway({
       try { body = JSON.parse(body.toString("utf8")); } catch { body = null; }
     const input = Array.isArray(body?.input) ? body.input : [];
     const messages = Array.isArray(body?.messages) ? body.messages : [];
+    const threadId = options.context?.thread ?? headers["thread-id"] ?? headers["x-thread-id"] ?? null;
+    const turnId = options.context?.turn ?? headers["turn-id"] ?? headers["x-turn-id"] ?? null;
     const requestBytes = Buffer.isBuffer(options.body)
       ? options.body
       : Buffer.from(JSON.stringify(options.body ?? ""));
+    const requestText = requestBytes.toString("utf8");
+    const markerMatches = markerObservations
+      .filter((marker) => marker && typeof marker.value === "string" && requestText.includes(marker.value))
+      .map((marker) => marker.label);
+    const toolResultItems = [
+      ...input,
+      ...messages.filter((item) => item?.role === "tool"),
+    ];
+    const toolCallNames = [
+      ...input
+        .filter((item) => ["function_call", "custom_tool_call"].includes(item?.type))
+        .map((item) => item.name ?? item.function?.name ?? item.type),
+      ...messages.flatMap((item) => (item.tool_calls ?? []).map((call) =>
+        call.function?.name ?? call.name ?? "tool_call",
+      )),
+    ];
+    const toolResultMarkers = markerObservations
+      .filter((marker) => marker && typeof marker.value === "string")
+      .filter((marker) => toolResultItems.some((item) =>
+        (["function_call_output", "custom_tool_call_output"].includes(item?.type) || item?.role === "tool") &&
+        JSON.stringify(item).includes(marker.value),
+      ))
+      .map((marker) => marker.label);
+    const toolResultShapes = toolResultItems.map((item) => ({
+      type: item?.type ?? null,
+      role: item?.role ?? null,
+      keys: item && typeof item === "object" ? Object.keys(item).sort() : [],
+      outputType: item?.output == null ? null : Array.isArray(item.output) ? "array" : typeof item.output,
+      outputBytes: item?.output == null ? 0 : Buffer.byteLength(JSON.stringify(item.output)),
+      contentType: item?.content == null ? null : Array.isArray(item.content) ? "array" : typeof item.content,
+      contentBytes: item?.content == null ? 0 : Buffer.byteLength(JSON.stringify(item.content)),
+    }));
     const metadata = {
+      at: startedAt,
       host,
       official: host === "chatgpt.com",
       bodyShape: body && typeof body === "object" && !Buffer.isBuffer(body)
@@ -194,6 +487,10 @@ export async function startIsolatedGateway({
       opencodeSession: Boolean(headers["x-opencode-session"]),
       path: parsedUrl.pathname,
       transport: options.transport ?? "http",
+      model: body?.model ?? null,
+      reasoningEffort: body?.reasoning?.effort ?? null,
+      generate: body?.generate ?? null,
+      requestBytes: requestBytes.length,
       requestFingerprint: createHash("sha256")
         .update(options.method ?? "POST")
         .update(parsedUrl.pathname)
@@ -209,8 +506,6 @@ export async function startIsolatedGateway({
     }
     beforeOutbound?.({
       ...metadata,
-      model: body?.model,
-      generate: body?.generate,
       requestFingerprint: metadata.requestFingerprint,
     });
     outbound.push(metadata);
@@ -221,7 +516,16 @@ export async function startIsolatedGateway({
     payloads.push({
       host,
       path: parsedUrl.pathname,
+      thread: threadId,
+      turn: turnId,
+      session: headers["x-opencode-session"] ?? headers["session-id"] ?? null,
       model: body?.model,
+      reasoningEffort: body?.reasoning?.effort ?? null,
+      generate: body?.generate ?? null,
+      markerMatches,
+      toolCallNames: [...new Set(toolCallNames)],
+      toolResultMarkers,
+      toolResultShapes,
       bytes: Buffer.isBuffer(options.body)
         ? options.body.length
         : Buffer.byteLength(JSON.stringify(options.body ?? "")),
@@ -241,12 +545,13 @@ export async function startIsolatedGateway({
       additionalToolSurface: {
         carriers: additionalToolCarriers.length,
         definitions: additionalToolDefinitions.length,
+        names: [...new Set(additionalToolDefinitions.flatMap(collectToolNames))],
         hasWebRun: additionalToolDefinitions.some((tool) =>
           tool?.type === "namespace" &&
           (tool.name ?? tool.namespace) === "web" &&
           tool.tools?.some((nested) => nested?.name === "run")),
       },
-      toolSizes: (body?.tools ?? []).map((x) => ({
+      toolSizes: [...(body?.tools ?? []), ...additionalToolDefinitions].map((x) => ({
         name: x.name ?? x.function?.name ?? x.type,
         type: x.type ?? null,
         bytes: Buffer.byteLength(JSON.stringify(x)),
@@ -262,6 +567,26 @@ export async function startIsolatedGateway({
       ],
     });
     return metadata;
+  };
+  const observeResponseBody = (response, metadata) => {
+    let bytes = 0;
+    let complete = false;
+    const body = response.body;
+    response.body = (async function* () {
+      try {
+        for await (const chunk of body) {
+          const value = Buffer.from(chunk);
+          bytes += value.length;
+          yield value;
+        }
+        complete = true;
+      } finally {
+        metadata.responseBytes = bytes;
+        metadata.responseComplete = complete;
+        metadata.totalMs = Date.now() - metadata.at;
+      }
+    })();
+    return response;
   };
   const observeSearchResponse = (response, metadata) => {
     const chunks = [];
@@ -286,6 +611,9 @@ export async function startIsolatedGateway({
           searchMarkers.set(candidate, hashes[index]);
         metadata.searchResponseComplete = complete;
         metadata.searchResponseBytes = bytes;
+        metadata.responseBytes = bytes;
+        metadata.responseComplete = complete;
+        metadata.totalMs = Date.now() - metadata.at;
         metadata.searchResultFingerprints = hashes;
         searchEvidence.push({
           host: metadata.host,
@@ -308,41 +636,51 @@ export async function startIsolatedGateway({
     send: async (url, options) => {
       const metadata = recordOutbound(url, options);
       try {
-        const response = await request(url, options);
+        const response = await sendRequest(url, options);
         metadata.status = response.status;
-        return response;
+        metadata.responseHeadersMs = Date.now() - metadata.at;
+        return observeResponseBody(response, metadata);
       } catch (error) {
-        metadata.error = error?.type ?? "transport_error";
+        finalizeTransportFailure(metadata, error);
         throw error;
       }
     },
     officialRequest: async (url, options) => {
       const metadata = recordOutbound(url, options);
       try {
-        const response = await requestRaw(url, options);
+        const response = await officialRequest(url, options);
         metadata.status = response.status;
+        metadata.responseHeadersMs = Date.now() - metadata.at;
         return metadata.path.endsWith("/alpha/search")
           ? observeSearchResponse(response, metadata)
-          : response;
+          : observeResponseBody(response, metadata);
       } catch (error) {
-        metadata.error = error?.type ?? "transport_error";
+        finalizeTransportFailure(metadata, error);
         throw error;
       }
     },
     providerSearchRequest: async (url, options) => {
       const metadata = recordOutbound(url, options);
       try {
-        const response = await requestRaw(url, options);
+        const response = await providerSearchRequest(url, options);
         metadata.status = response.status;
+        metadata.responseHeadersMs = Date.now() - metadata.at;
         return observeSearchResponse(response, metadata);
       } catch (error) {
-        metadata.error = error?.type ?? "transport_error";
+        finalizeTransportFailure(metadata, error);
         throw error;
       }
     },
     createOfficialWebSocket: (url, options) => {
-      const socket = new WebSocket(url, options);
+      const socket = createOfficialWebSocket(url, options);
       const send = socket.send.bind(socket);
+      const pending = [];
+      const finalize = (metadata, complete, terminationReason) => {
+        metadata.responseBytes ??= 0;
+        metadata.responseComplete = complete;
+        metadata.terminationReason = terminationReason;
+        metadata.totalMs ??= Date.now() - metadata.at;
+      };
       socket.send = (data, sendOptions, callback) => {
         const metadata = recordOutbound(url, {
           headers: options.headers,
@@ -350,8 +688,58 @@ export async function startIsolatedGateway({
           transport: "websocket",
         });
         metadata.status = 101;
-        return send(data, sendOptions, callback);
+        metadata.responseBytes = 0;
+        metadata.responseComplete = false;
+        pending.push(metadata);
+        return send(data, sendOptions, (error) => {
+          if (error) {
+            finalize(metadata, false, "send-error");
+            const index = pending.indexOf(metadata);
+            if (index >= 0) pending.splice(index, 1);
+          }
+          callback?.(error);
+        });
       };
+      socket.on("message", (data, isBinary) => {
+        const metadata = pending[0];
+        if (metadata) {
+          const bytes = typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
+          metadata.responseBytes += bytes;
+          metadata.responseHeadersMs ??= Date.now() - metadata.at;
+        }
+        if (isBinary) return;
+        try {
+          const event = JSON.parse(Buffer.from(data).toString("utf8"));
+          if (metadata && isSubstantiveResponseEvent(event))
+            metadata.firstSubstantiveMs ??= Date.now() - metadata.at;
+          if (metadata && event.type === "response.output_text.delta")
+            metadata.firstTextMs ??= Date.now() - metadata.at;
+          websocketEvents.push({
+            at: Date.now(),
+            type: event.type,
+            sequence_number: event.sequence_number,
+            response_status: event.response?.status,
+            error_type: event.error?.type,
+            error_code: event.error?.code,
+          });
+          if (metadata && ["response.completed", "response.incomplete", "error"].includes(event.type)) {
+            finalize(metadata, true, "terminal-event");
+            pending.shift();
+          }
+        } catch {
+          // Observe only structural JSON metadata; forward the original frame.
+        }
+      });
+      socket.on("close", () => {
+        for (const metadata of pending)
+          finalize(metadata, false, "socket-close");
+        pending.length = 0;
+      });
+      socket.on("error", () => {
+        for (const metadata of pending)
+          finalize(metadata, false, "socket-error");
+        pending.length = 0;
+      });
       return socket;
     },
     log: (event) => logs.push(event),
@@ -368,6 +756,7 @@ export async function startIsolatedGateway({
     logs,
     outbound,
     payloads,
+    websocketEvents,
     searchEvidence,
     historyWrites,
     subscriptionToken,
@@ -462,16 +851,31 @@ export async function runCliExec({
   timeoutMs = 600000,
   prompt,
   signal,
+  onEvent,
 }) {
   const child = spawn(corePath, [...globalArgs, "exec", "--json", ...args, prompt], {
     cwd,
-    env: { ...process.env, CODEX_HOME: home, ...env },
+    // Codex core may resolve auxiliary caches through $HOME even when
+    // CODEX_HOME is overridden. Keep both roots inside this run's temp home.
+    env: isolatedChildEnv(home, env),
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
   let stderr = "";
+  const rows = [];
   child.stdout.on("data", (x) => (stdout += x));
   child.stderr.on("data", (x) => (stderr += x));
+  const lines = createInterface({ input: child.stdout });
+  lines.on("line", (line) => {
+    try {
+      const row = JSON.parse(line);
+      rows.push(row);
+      onEvent?.(row);
+    } catch {
+      // Non-JSON diagnostic output remains available in stdout but cannot be
+      // used as structured cancellation evidence.
+    }
+  });
   const abort = () => child.kill();
   signal?.addEventListener("abort", abort, { once: true });
   if (signal?.aborted) abort();
@@ -479,23 +883,16 @@ export async function runCliExec({
   const code = await new Promise((resolve) => child.on("close", resolve));
   clearTimeout(timer);
   signal?.removeEventListener("abort", abort);
-  const rows = stdout
-    .split("\n")
-    .filter(Boolean)
-    .flatMap((line) => {
-      try {
-        return [JSON.parse(line)];
-      } catch {
-        return [];
-      }
-    });
   return { code, rows, stdout, stderr };
 }
 
 // B harness：同一二进制的 app-server --stdio（App 真实客户端协议）。
 export function startAppServer({ corePath, home, cwd }) {
   const child = spawn(corePath, ["app-server", "--stdio"], {
-    env: { ...process.env, CODEX_HOME: home },
+    cwd,
+    // Match runCliExec isolation: App-server startup can refresh model
+    // metadata through $HOME rather than CODEX_HOME.
+    env: isolatedChildEnv(home),
     stdio: ["pipe", "pipe", "ignore"],
   });
   const notifications = [];
@@ -510,7 +907,12 @@ export function startAppServer({ corePath, home, cwd }) {
     } catch {
       return;
     }
-    notifications.push({ at: Date.now(), method: message.method, id: message.id });
+    notifications.push({
+      at: Date.now(),
+      method: message.method,
+      id: message.id,
+      itemType: message.params?.item?.type,
+    });
     if (message.id != null && pending.has(message.id)) {
       const entry = pending.get(message.id);
       pending.delete(message.id);
@@ -519,13 +921,29 @@ export function startAppServer({ corePath, home, cwd }) {
     }
     const record = threads.get(message.params?.threadId);
     if (!record) return;
+    if (message.method?.startsWith("item/")) {
+      const itemType = message.params?.item?.type ?? message.params?.itemType;
+      if (itemType) record.itemTypes.add(itemType);
+      record.itemMethods.add(message.method);
+    }
     if (message.method === "item/agentMessage/delta") {
       record.text += message.params.delta;
+      record.receivedAgentDelta = true;
       record.firstTextAt ??= Date.now();
     }
     if (message.method === "item/completed") {
       const item = message.params.item ?? {};
-      if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type)) {
+      if (
+        !record.receivedAgentDelta &&
+        ["agentMessage", "agent_message"].includes(item.type) &&
+        typeof item.text === "string"
+      ) {
+        record.text += item.text;
+        record.firstTextAt ??= Date.now();
+      }
+      const normalizedType = String(item.type ?? "").replaceAll("_", "");
+      if (["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(item.type) ||
+        ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"].includes(normalizedType)) {
         record.items.push({
           type: item.type,
           id: item.id,
@@ -552,13 +970,38 @@ export function startAppServer({ corePath, home, cwd }) {
       child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     });
   const request = (threadId, model, text, { timeoutMs = 600000 } = {}) => {
-    const record = { threadId, model, text: "", items: [], compactions: 0, startedAt: Date.now(), firstTextAt: null };
+    const record = {
+      threadId,
+      model,
+      text: "",
+      items: [],
+      itemTypes: new Set(),
+      itemMethods: new Set(),
+      compactions: 0,
+      startedAt: Date.now(),
+      firstTextAt: null,
+      receivedAgentDelta: false,
+    };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(Error(`turn timeout for ${threadId}`)), timeoutMs);
       record.finish = (turn) => {
         clearTimeout(timer);
         threads.delete(threadId);
-        resolve({ ...record, turn: turn.id, status: turn.status, endedAt: Date.now() });
+        const failure = turn?.error && typeof turn.error === "object"
+          ? Object.fromEntries(
+              ["type", "code", "status", "kind"].filter((key) => turn.error[key] !== undefined)
+                .map((key) => [key, turn.error[key]]),
+            )
+          : null;
+        resolve({
+          ...record,
+          itemTypes: [...record.itemTypes],
+          itemMethods: [...record.itemMethods],
+          turnFailure: failure,
+          turn: turn.id,
+          status: turn.status,
+          endedAt: Date.now(),
+        });
       };
       threads.set(threadId, record);
       rpc("turn/start", { threadId, model, input: [{ type: "text", text, text_elements: [] }] }).then(
@@ -653,37 +1096,24 @@ export function captureProxy({ target }) {
       (proxyRes) => {
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         const streaming = (proxyRes.headers["content-type"] ?? "").includes("text/event-stream");
-        let buffer = "";
+        const encodedChunks = [];
+        let encodedBytes = 0;
         proxyRes.on("data", (chunk) => {
-          if (streaming) {
-            buffer += chunk.toString("utf8");
-            for (;;) {
-              const end = buffer.indexOf("\n\n");
-              if (end < 0) break;
-              const block = buffer.slice(0, end);
-              buffer = buffer.slice(end + 2);
-              const line = block.split("\n").find((x) => x.startsWith("data: "));
-              if (!line) continue;
-              try {
-                const event = JSON.parse(line.slice(6));
-                frames.push({
-                  at: Date.now(),
-                  stream,
-                  type: event.type,
-                  sequence_number: event.sequence_number,
-                  itemType: event.item?.type,
-                  // 用量元数据（数字，不含正文）
-                  inputTokens: event.response?.usage?.input_tokens ?? event.usage?.input_tokens,
-                  outputTokens: event.response?.usage?.output_tokens ?? event.usage?.output_tokens,
-                  phase: event.item?.phase,
-                  itemId: event.item?.id,
-                });
-              } catch {}
-            }
+          if (streaming && encodedBytes <= 8 * 1024 * 1024) {
+            const value = Buffer.from(chunk);
+            encodedChunks.push(value);
+            encodedBytes += value.length;
           }
           res.write(chunk);
         });
-        proxyRes.on("end", () => res.end());
+        proxyRes.on("end", () => {
+          if (streaming && encodedBytes <= 8 * 1024 * 1024) {
+            const encoding = String(proxyRes.headers["content-encoding"] ?? "identity").toLowerCase();
+            for (const event of decodeSseFrames(Buffer.concat(encodedChunks), encoding))
+              frames.push({ at: Date.now(), stream, ...event });
+          }
+          res.end();
+        });
       },
     );
     proxyReq.on("error", () => res.destroy());
@@ -701,6 +1131,101 @@ export function captureProxy({ target }) {
           }),
       }),
     );
+  });
+}
+
+// WebSocket capture proxy for clients (notably Codex CLI) that use the
+// subscription Responses WebSocket rather than HTTP/SSE. It forwards opaque
+// message bytes and records only structural event metadata.
+export function captureWebSocketProxy({ target }) {
+  const upstreamBase = new URL(target);
+  upstreamBase.protocol = upstreamBase.protocol === "https:" ? "wss:" : "ws:";
+  const frames = [];
+  let streamIndex = -1;
+  const clients = new Set();
+  const server = createServer();
+  const wss = new WebSocketServer({ noServer: true });
+  const hopByHop = new Set([
+    "host", "connection", "upgrade", "sec-websocket-key", "sec-websocket-version",
+    "sec-websocket-extensions", "sec-websocket-protocol", "content-length",
+  ]);
+  const forwardedHeaders = (headers) => Object.fromEntries(
+    Object.entries(headers).filter(([name]) => !hopByHop.has(name.toLowerCase())),
+  );
+  server.on("upgrade", (req, socket, head) => {
+    wss.handleUpgrade(req, socket, head, (client) => {
+      // A Codex CLI WebSocket connection carries multiple response.create
+      // turns.  Treat each request as its own logical stream, matching the
+      // HTTP/SSE capture contract, rather than grouping every turn by socket.
+      let activeStream = null;
+      clients.add(client);
+      const upstream = new WebSocket(new URL(req.url ?? "/", upstreamBase).toString(), {
+        headers: forwardedHeaders(req.headers),
+      });
+      const queued = [];
+      const closeBoth = () => {
+        clients.delete(client);
+        if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING)
+          upstream.close();
+        if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING)
+          client.close();
+      };
+      client.on("message", (data, isBinary) => {
+        if (!isBinary) {
+          try {
+            const message = JSON.parse(data.toString("utf8"));
+            if (message.type === "response.create") activeStream = ++streamIndex;
+          } catch {
+            // Forward opaque client messages without interpreting them.
+          }
+        }
+        if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
+        else if (upstream.readyState === WebSocket.CONNECTING) queued.push({ data, isBinary });
+      });
+      upstream.on("open", () => {
+        for (const item of queued) upstream.send(item.data, { binary: item.isBinary });
+        queued.length = 0;
+      });
+      upstream.on("message", (data, isBinary) => {
+        if (!isBinary) {
+          try {
+            const event = JSON.parse(data.toString("utf8"));
+            // Keep the same structural evidence as SSE capture: only
+            // sequenced response events participate in H1/H5.  Opaque
+            // metadata/rate-limit events are still forwarded untouched.
+            if (activeStream !== null && Number.isInteger(event.sequence_number)) {
+              frames.push({
+                at: Date.now(),
+                stream: activeStream,
+                type: event.type,
+                sequence_number: event.sequence_number,
+                phase: event.item?.phase,
+              });
+            }
+          } catch {
+            // Preserve opaque messages; only JSON event metadata is observed.
+          }
+        }
+        if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+      });
+      client.on("close", closeBoth);
+      client.on("error", closeBoth);
+      upstream.on("close", () => {
+        clients.delete(client);
+        if (client.readyState === WebSocket.OPEN) client.close();
+      });
+      upstream.on("error", closeBoth);
+    });
+  });
+  return new Promise((resolvePromise) => {
+    server.listen(0, "127.0.0.1", () => resolvePromise({
+      url: `http://127.0.0.1:${server.address().port}`,
+      frames,
+      close: () => new Promise((done) => {
+        for (const client of clients) client.close();
+        wss.close(() => server.close(done));
+      }),
+    }));
   });
 }
 

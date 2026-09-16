@@ -109,6 +109,7 @@ export function createGateway(config, options = {}) {
         instance: process.env.GATEWAY_INSTANCE_ID ?? null,
         accepting,
         activeTurns: controllers.size,
+        websocketConnections: wss.clients.size,
       });
     const entry = entryOf(req.url);
     try {
@@ -168,6 +169,7 @@ export function createGateway(config, options = {}) {
         });
       }
 
+      const routePolicyStartedAt = Date.now();
       if (entry === "subscription") {
         if (pathname === "/subscription/v1/alpha/search") {
           phase = "standalone_search_relay";
@@ -214,6 +216,15 @@ export function createGateway(config, options = {}) {
               officialClassification,
             );
           phase = "official_relay";
+          log({
+            event: "official_relay_started",
+            transport: "http",
+            request_id: requestId,
+            path: pathname,
+            request_bytes: bodyStats.wire_bytes ?? wire.length,
+            request_setup_ms: Date.now() - startedAt,
+            route_policy_ms: Date.now() - routePolicyStartedAt,
+          });
           const requestWire = wire.length || req.headers["content-length"] || req.headers["transfer-encoding"]
             ? wire
             : undefined;
@@ -412,13 +423,24 @@ export function createGateway(config, options = {}) {
           busy = true;
           active = controller();
           const startedAt = Date.now(),
+            requestId = randomUUID(),
             wireBytes = typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
           let seq = 0,
             requestModel,
             phase = "request";
           try {
+            const routePolicyStartedAt = Date.now();
             if (entry === "subscription" && pathname !== "/subscription/v1/responses") {
               phase = "official_relay";
+              log({
+                event: "official_ws_relay_started",
+                transport: "websocket",
+                request_id: requestId,
+                path: pathname,
+                request_bytes: wireBytes,
+                request_setup_ms: Date.now() - startedAt,
+                route_policy_ms: Date.now() - routePolicyStartedAt,
+              });
               await officialSession.run(data, isBinary, {
                 signal: active.signal,
                 forward: sendRaw,
@@ -453,6 +475,15 @@ export function createGateway(config, options = {}) {
                 officialClassification,
               );
               phase = "official_relay";
+              log({
+                event: "official_ws_relay_started",
+                transport: "websocket",
+                request_id: requestId,
+                path: pathname,
+                request_bytes: wireBytes,
+                request_setup_ms: Date.now() - startedAt,
+                route_policy_ms: Date.now() - routePolicyStartedAt,
+              });
               await officialSession.run(data, isBinary, {
                 signal: active.signal,
                 forward: sendRaw,
@@ -555,7 +586,11 @@ export function createGateway(config, options = {}) {
       accepting = true;
     },
     status() {
-      return { accepting, activeTurns: controllers.size };
+      return {
+        accepting,
+        activeTurns: controllers.size,
+        websocketConnections: wss.clients.size,
+      };
     },
     async close() {
       for (const c of controllers) c.abort();

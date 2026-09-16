@@ -10,6 +10,11 @@ import {
   resolveStandaloneSearchPolicy,
   validateStandaloneSearchSource,
 } from "./standalone-search.mjs";
+import {
+  resolveAppCapabilityProfile,
+  validateAppCapabilityProfile,
+  validateResolvedAppCapabilityProfile,
+} from "./app-capability-profile.mjs";
 const loopback = (h) => ["127.0.0.1", "localhost", "[::1]"].includes(h);
 const conditions = new Set([
   "modelID",
@@ -300,6 +305,23 @@ export function validate(input) {
       typeof t.app.supportsSearchTool !== "boolean"
     )
       throw Error(`invalid App search tool support for target ${name}`);
+    if (
+      t.app?.useResponsesLite != null &&
+      typeof t.app.useResponsesLite !== "boolean"
+    )
+      throw Error(`invalid App Responses Lite flag for target ${name}`);
+    if (t.app?.capabilityProfile != null) {
+      validateAppCapabilityProfile(
+        t.app.capabilityProfile,
+        `App capability profile for target ${name}`,
+      );
+      if (t.modelFamily !== "openai-gpt" || t.app.enabled !== true)
+        throw Error(
+          `App capability profile requires an App-enabled openai-gpt target ${name}`,
+        );
+      if (t.wireApi !== "responses")
+        throw Error(`App capability profile requires Responses target ${name}`);
+    }
     if (t.standaloneSearch != null) {
       if (
         !t.standaloneSearch ||
@@ -317,14 +339,41 @@ export function validate(input) {
           throw Error(`conflicting standalone search policy for target ${name}`);
       }
     }
+    const explicitProfile = t.app?.capabilityProfile;
+    if (
+      (explicitProfile === "standard-tools" ||
+        (explicitProfile == null &&
+          t.modelFamily === "openai-gpt" &&
+          t.app?.enabled === true &&
+          t.wireApi === "responses" &&
+          t.app.useResponsesLite !== true &&
+          c.standaloneSearch?.thirdPartyGpt?.defaultSource == null)) &&
+      t.standaloneSearch == null &&
+      t.app.supportsSearchTool == null
+    )
+      t.standaloneSearch = { source: "disabled" };
     const search = resolveStandaloneSearchPolicy(c, t);
-    const requiresStandaloneLite =
-      search.advertised && search.reason !== "legacy-native-search-compatibility";
-    if (requiresStandaloneLite && t.app?.enabled === true) {
-      if (t.app.useResponsesLite === false)
-        throw Error(`standalone search requires Responses Lite for target ${name}`);
-      t.app.useResponsesLite ??= true;
+    if (explicitProfile === "standard-tools") {
+      if (t.app.useResponsesLite == null) t.app.useResponsesLite = false;
+    } else if (explicitProfile === "lite-search") {
+      if (t.app.useResponsesLite == null) t.app.useResponsesLite = true;
+    } else {
+      const requiresStandaloneLite =
+        search.advertised && search.reason !== "legacy-native-search-compatibility";
+      if (requiresStandaloneLite && t.app?.enabled === true) {
+        if (t.app.useResponsesLite === false)
+          throw Error(`standalone search requires Responses Lite for target ${name}`);
+        t.app.useResponsesLite ??= true;
+      }
     }
+    // Validate the effective profile, including profiles inferred from legacy
+    // transport/search fields.  A derived profile must never bypass the same
+    // transport and search invariants enforced for an explicit profile.
+    validateResolvedAppCapabilityProfile(
+      t,
+      resolveAppCapabilityProfile(c, t),
+      name,
+    );
     if (search.source === "provider") {
       if (t.wireApi !== "responses" || t.app?.enabled !== true)
         throw Error(`provider standalone search requires an App-enabled Responses target ${name}`);

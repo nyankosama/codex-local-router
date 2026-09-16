@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-09-16
+
+- Keep Engine-managed, local-prewarm, compaction, and legacy unlabelled official response IDs on Gateway history replay, while allowing only successfully observed opaque official-relay responses to retain native `previous_response_id` continuation. This prevents an Engine response from being handed to a fresh official WebSocket session that cannot resolve it.
+- Preserve an explicitly configured `NODE_EXTRA_CA_CERTS` path with proxy variables in the Router and one-shot switcher LaunchAgents, combine Node default and system trust for official WSS without disabling certificate or hostname verification, and expose only allowlisted TLS error codes for diagnosis.
+- Make G3.5 fail closed when per-case local/upstream timing, byte accounting, archive observation, health, or lifecycle evidence is missing; WebSocket turns finalize response bytes and total time on terminal or close, and pre-header transport failures explicitly settle at zero response bytes without converting external degradation into a Core failure.
+- Detect Router-injected model-cache state from stable catalog fields (and fail closed on invalid JSON) instead of relying only on product/port text.
+- Ship every declared test, package-audit, and E2E script target in the tarball, and make package audit reject dangling script entries.
+- Bound the official natural-search canary to one requested search and give the official-only run a strict 2-turn / 6-generation / 1-search hard budget, so provider-driven multi-query exploration cannot consume the general live-call allowance before producing its short acceptance answer.
+
+- Rebuilt L1/L2 qualification around injected deterministic official, Provider, and search transports; default E2E commands are credential-free and network-isolated, while installed-service and real-channel cases now require an explicit live confirmation.
+- Isolated Codex harness children from ambient proxy and credential variables, distinguished WebSocket prewarm from generation evidence, and tightened official cancellation accounting so a zero-generation prewarm cannot satisfy a live generation-cancel claim.
+- Forced every Codex acceptance child to temporary HOME, Codex, XDG, Router config/state, and instance-ID roots; made qualification receipts create-once and bound promotion evidence to both the exact commit and Git tree.
+- Preserved legacy transport-only Responses Lite targets without mislabeling them as the qualified `lite-search` profile, and tightened live channel attribution so a truncated HTTP 200 or any ambiguous retry remains `UNVERIFIED` instead of being blamed on the Provider.
+- Corrected official WebSocket cancellation qualification to permit a separate non-generating prewarm while still requiring exactly one real generation send before client cancellation.
+- Required explicit upstream event provenance before a synthetic Gateway error status can classify a third-party channel as externally degraded; a successful HTTP response followed by a locally detected truncated stream remains `UNVERIFIED`.
+- Made the bounded live qualification gate fail closed on disallowed `models_cache.json` drift and every case-local routing, identity, catalog, payload-adaptation, search-result forwarding, and lifecycle invariant; on macOS it now write-denies real Codex, Router, installed-Skill, LaunchAgent, and Keychain roots while keeping Codex state in temporary roots.
+- Added bounded Gateway Core qualification receipts with independent official, Provider-channel, local-gray, local-use, and release outcomes plus normal-health performance attribution; external channel instability no longer hides or automatically fails deterministic Core behavior.
+- Added explicit `standard-tools` and `lite-search` capability profiles for third-party GPT App targets. New CLI-created GPT targets default to Standard Responses with the policy-filtered core/Plugin/user-MCP surface and no standalone-search advertisement; Lite search is an explicit, visibly reduced-tool-surface opt-in.
+- Added capability-profile validation and effective profile/reason/tool-surface reporting to the generated custom catalog, `model list`, non-live `model probe`, `status`, and `doctor`, while preserving existing explicit or legacy-implied Responses Lite configurations.
+- Split focused acceptance evidence by capability profile: Standard tool-definition preflight can no longer be promoted to call/result qualification, while Lite search cases disclose their reduced tool surface and cannot be combined into a full-tools-plus-search claim.
+- Applied capability invariants to inferred as well as explicit profiles, reported the new Standard default without a false legacy label, and kept non-Responses legacy targets unprofiled instead of overstating their tool surface.
+- Preserved explicit space-level search defaults as Lite compatibility signals, rejected non-boolean transport flags, and exposed profile/reason/tool-surface details in both JSON and human-readable diagnostics.
+- Limited CLI profile defaults to Responses targets and made `--no-app` transitions clear all target-level App profile/search state while retaining the hidden routing target; App-disabled GPT targets no longer re-inherit space-level or legacy native-search advertisement and report that state truthfully, app-absent legacy targets remain distinguishable, and persisted CLI defaults are documented as `target-explicit` versus inferred `standard-default`.
+
 ## 0.4.0 - 2026-09-13
 
 - Added a general standalone-search policy for third-party OpenAI GPT targets: subscription search by default, explicit Provider or disabled overrides, configuration-space versioning, CLI management, and effective catalog/diagnostic reporting while keeping embedded hosted search separate.

@@ -4,7 +4,7 @@
 |---|---|---|
 | Official subscription request or auxiliary API | Fixed ChatGPT Codex backend | Successful Responses are observed into encrypted local history; auxiliary bodies are not archived |
 | Custom-model request | The target's configured third-party provider | Encrypted local history plus that provider's processing |
-| Standalone search from a custom GPT turn | Effective source: ChatGPT Codex backend by default, or an explicitly configured Provider endpoint | Search result may enter the custom model's subsequent conversation input |
+| Standalone search from a `lite-search` custom GPT turn | Selected ChatGPT Codex backend or explicit Provider endpoint; `standard-tools` does not advertise it | Search result may enter the custom model's subsequent conversation input |
 | ChatGPT credential | Official subscription adapter only | Managed by Codex, not copied into router configuration |
 | Third-party credential | Its configured provider only | Environment variable or macOS Keychain |
 | Conversation and tool history | Local SQLite archive | AES-256-GCM until explicit prune |
@@ -29,6 +29,8 @@ Codex App
 The subscription bearer and account header are retained only on the fixed official leg. Provider credentials are retained only on their configured provider leg. When Provider search is selected, the Router removes the subscription identity and inserts only that Provider's key. It stores only the route source, target, endpoint reference, credential-reference name, configuration digest, correlation identifiers, and TTL—not the search query, result, or credential. The router never upgrades a local `/v1` API-key request into subscription identity.
 
 There is no automatic failover between subscription, Provider, Tavily, or Exa search. The selected source either succeeds or returns a typed error. Search observations used by the acceptance harness stay in memory and persist only response/URL hashes, byte counts, destinations, and booleans.
+
+The deterministic L0-L2 and capability-profile qualification gates do not use this production data flow. They give Codex a temporary synthetic identity, strip ambient network and credential variables from its child process, and inject local official, Provider, and search transports. Explicit live canaries are separate, budgeted operations; they copy only the required auth material into a temporary 0600 file and persist metadata-only receipts.
 
 The default archive quota is 10 GiB and is measured from the archive files on disk. At 80% the router logs a warning. At the quota it rejects new durable history rather than deleting old content. Export never includes provider or subscription credentials.
 

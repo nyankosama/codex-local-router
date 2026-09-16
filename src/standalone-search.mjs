@@ -69,7 +69,10 @@ export function resolveStandaloneSearchPolicy(config, target, options = {}) {
   };
 
   let source = null;
-  let reason = "non-gpt-unchanged";
+  let reason =
+    target?.modelFamily === "openai-gpt" && target?.app?.enabled === false
+      ? "app-disabled"
+      : "non-gpt-unchanged";
   if (target?.standaloneSearch?.source != null) {
     source = validateStandaloneSearchSource(
       target.standaloneSearch.source,
@@ -79,7 +82,20 @@ export function resolveStandaloneSearchPolicy(config, target, options = {}) {
   } else if (target?.app?.supportsSearchTool != null) {
     source = target.app.supportsSearchTool ? "subscription" : "disabled";
     reason = "legacy-app-support";
-  } else if (target?.modelFamily === "openai-gpt") {
+  } else if (
+    target?.modelFamily === "openai-gpt" &&
+    target?.app?.enabled === false
+  ) {
+    // An explicitly hidden GPT target cannot use the Codex App standalone
+    // search carrier. Keep explicit target and legacy alias precedence above,
+    // but do not let space defaults or the old native-search compatibility
+    // bridge re-advertise a capability that the App cannot reach.
+    source = null;
+    reason = "app-disabled";
+  } else if (
+    target?.modelFamily === "openai-gpt" &&
+    target?.app?.enabled !== false
+  ) {
     source = validateStandaloneSearchSource(
       config?.standaloneSearch?.thirdPartyGpt?.defaultSource ?? "subscription",
       "standaloneSearch.thirdPartyGpt.defaultSource",

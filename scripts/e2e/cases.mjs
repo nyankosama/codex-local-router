@@ -1,5 +1,5 @@
 // 6 条 E2E 用例。每条返回 observation，由 run.mjs 套用 H1-H10 判据。
-import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
@@ -18,6 +18,7 @@ import {
   startAppServer,
   wsProbe,
   captureProxy,
+  captureWebSocketProxy,
   readGatewayLogWindow,
   derivePhases,
   groupStreams,
@@ -32,6 +33,11 @@ import {
   unknownEventTypes,
 } from "./lib/harness.mjs";
 import { solidPng, dataUrl } from "./lib/png.mjs";
+import {
+  DeterministicOfficialWebSocket,
+  deterministicOfficialRequest,
+  deterministicProviderRequest,
+} from "./lib/deterministic-upstream.mjs";
 
 export const GPT = "gpt-5.6-sol";
 export const DS = "deepseek-v4.1-flash";
@@ -81,16 +87,66 @@ function workRoot(ctx, name) {
   return join(tmpdir(), "codex-router-e2e", ctx.runId, name);
 }
 
-async function setup(ctx, name, mutate) {
+async function setup(ctx, name, mutate, options = {}) {
   const root = workRoot(ctx, name);
   await mkdir(root, { recursive: true, mode: 0o700 });
+  const configPath = join(root, "gateway.json");
+  const fixtureConfig = JSON.parse(await readFile(ctx.fixtureConfigPath, "utf8"));
+  fixtureConfig.subscription.catalogPath = ctx.catalogSource;
+  await writeFile(configPath, `${JSON.stringify(fixtureConfig, null, 2)}\n`, { mode: 0o600 });
   const gateway = await startIsolatedGateway({
-    configPath: ctx.prodConfigPath,
+    configPath,
     authSource: ctx.authSource,
     tokenFile: join(root, "access-token"),
     archivePath: join(root, "history.sqlite"),
     archiveKey: createHash("sha256").update(`e2e-archive-${name}`).digest(),
-    mutate,
+    mutate: (config) => {
+      config.subscription.catalogPath = ctx.catalogSource;
+      for (const provider of Object.values(config.providers ?? {})) {
+        delete provider.apiKeyEnv;
+        delete provider.keychain;
+      }
+      config.targets.strong = {
+        provider: "opencode-go",
+        model: "gpt-5.6-luna",
+        wireApi: "responses",
+        contextWindow: 131072,
+        maxContextWindow: 131072,
+        capabilities: { responses: true, streaming: true, toolCalling: true, nativeWebSearch: false },
+        effectiveContextWindowPercent: 95,
+        outputReserveTokens: 16384,
+        inputModalities: ["text"],
+        compression: { mode: "unsupported" },
+      };
+      config.targets.balanced = {
+        provider: "opencode-go",
+        model: CHAT,
+        wireApi: "chat_completions",
+        contextWindow: 131072,
+        maxContextWindow: 131072,
+        capabilities: { responses: false, streaming: true, toolCalling: true, nativeWebSearch: false },
+        effectiveContextWindowPercent: 95,
+        outputReserveTokens: 16384,
+        inputModalities: ["text"],
+        compression: { mode: "unsupported" },
+      };
+      config.webSearch = {
+        backend: "fake",
+        maxRounds: 3,
+        maxExtractCharacters: 20000,
+        results: [{
+          title: "Deterministic qualification result",
+          url: "https://example.com/deterministic-qualification",
+          snippet: "Local fixture result",
+        }],
+      };
+      mutate?.(config);
+    },
+    sendRequest: deterministicProviderRequest,
+    officialRequest: deterministicOfficialRequest,
+    providerSearchRequest: deterministicOfficialRequest,
+    createOfficialWebSocket: () => new DeterministicOfficialWebSocket(),
+    ...options,
   });
   return { root, ...gateway };
 }
@@ -197,15 +253,23 @@ export async function e2e1(ctx) {
   try {
     const home = join(gw.root, "home");
     await mkdir(home, { recursive: true, mode: 0o700 });
-    await symlink(ctx.authSource, join(home, "auth.json"));
     const catalogPath = join(home, "models.json");
     await writeCatalog({ sourceCatalogPath: ctx.catalogSource, config: gw.config, targetPath: catalogPath });
+    await isolatedCodexHome({
+      home,
+      baseUrl: `${gw.url}/subscription/v1`,
+      catalogPath,
+      authSource: ctx.authSource,
+      model: GPT,
+      reasoningEffort: "low",
+      webSearch: null,
+    });
     const health = startHealthSampling(gw.url, ctx.thresholds.healthSampleIntervalMs);
     const loop = monitorEventLoop();
     const versions0 = gw.archive.stats().versions;
 
     // 真实 CLI 客户端经由协议捕获代理访问 Gateway，H5 使用客户端实际收到的帧。
-    const proxy = await captureProxy({ target: gw.url });
+    const proxy = await captureWebSocketProxy({ target: gw.url });
     const cli = await runCliExec({
       corePath: ctx.core.path,
       home,
@@ -258,7 +322,6 @@ export async function e2e2(ctx) {
   try {
     const home = join(gw.root, "home");
     await mkdir(home, { recursive: true, mode: 0o700 });
-    await symlink(ctx.authSource, join(home, "auth.json"));
     const catalogPath = join(home, "models.json");
     await writeCatalog({ sourceCatalogPath: ctx.catalogSource, config: gw.config, targetPath: catalogPath });
     await isolatedCodexHome({
@@ -361,14 +424,25 @@ export async function e2e2(ctx) {
 
 // E2E-3 跨模型切换 + 历史与工具（B harness）
 export async function e2e3(ctx) {
-  const gw = await setup(ctx, "e2e3");
+  // Keep the tool/history branch deterministic: the DeepSeek thread is the
+  // explicit tool-execution subject; the official thread is a text-only
+  // history subject.  An official model declining an otherwise optional shell
+  // call must not make the migration assertion unknowable.
+  const tokens = [0, 1].map((i) => ({
+    memory: `MEM_${createHash("sha256").update(`${ctx.runId}:m${i}`).digest("hex").slice(0, 8)}`,
+    tool: `FILE_${createHash("sha256").update(`${ctx.runId}:t${i}`).digest("hex").slice(0, 8)}`,
+  }));
+  const markerObservations = tokens.flatMap((token, i) => [
+    { label: `memory${i}`, value: token.memory },
+    { label: `file${i}`, value: token.tool },
+  ]);
+  const gw = await setup(ctx, "e2e3", undefined, { markerObservations });
   const assertions = [];
   try {
     const home = join(gw.root, "home");
     const fixture = join(gw.root, "fixture");
     await mkdir(home, { recursive: true, mode: 0o700 });
     await mkdir(fixture, { recursive: true, mode: 0o700 });
-    await symlink(ctx.authSource, join(home, "auth.json"));
     const catalogPath = join(home, "models.json");
     await writeCatalog({ sourceCatalogPath: ctx.catalogSource, config: gw.config, targetPath: catalogPath });
     await isolatedCodexHome({ home, baseUrl: `${gw.url}/subscription/v1`, catalogPath, authSource: ctx.authSource, model: GPT });
@@ -388,10 +462,6 @@ export async function e2e3(ctx) {
           })
         ).thread.id,
       );
-    const tokens = [0, 1].map(() => ({
-      memory: `MEM_${createHash("sha256").update(`m${Math.random()}`).digest("hex").slice(0, 8)}`,
-      tool: `FILE_${createHash("sha256").update(`t${Math.random()}`).digest("hex").slice(0, 8)}`,
-    }));
     for (let i = 0; i < 2; i++) await writeFile(join(fixture, `marker-${i}.txt`), `${tokens[i].tool}\n`);
 
     const turns = [];
@@ -401,7 +471,9 @@ export async function e2e3(ctx) {
           app.request(
             id,
             i ? DS : GPT,
-            `Remember the conversation code ${tokens[i].memory}. Use the shell tool to read only ${join(fixture, `marker-${i}.txt`)}. Report the conversation code and the file code; remember both.`,
+            i === 1
+              ? `Remember the conversation code ${tokens[i].memory}. You must call exec_command exactly once with the command cat ${join(fixture, `marker-${i}.txt`)}. Then report the conversation code and copy the exact line returned by that command; remember both.`
+              : `Remember the conversation code ${tokens[i].memory}. Do not use tools. Report the conversation code and remember it.`,
           ),
         ),
       )),
@@ -420,13 +492,80 @@ export async function e2e3(ctx) {
         )),
       );
     const recalls = turns.slice(2);
-    const recallOk = recalls.every((turn, index) => {
-      const i = index % 2;
-      return turn.text.includes(tokens[i].memory) && turn.text.includes(tokens[i].tool);
+    const recallChecks = recalls.map((turn, index) => {
+      const i = threads.indexOf(turn.threadId);
+      const memory = turn.text.includes(tokens[i].memory);
+      const file = turn.text.includes(tokens[i].tool);
+      const context = gw.payloads
+        .filter((payload) => payload.thread === threads[i] && payload.turn === turn.turn)
+        .flatMap((payload) => payload.markerMatches ?? []);
+      return {
+        model: turn.model,
+        status: turn.status,
+        expectsFile: i === 1,
+        sourceHistoryHasMarkers: Boolean(
+          turns[i].text.includes(tokens[i].memory) &&
+          (i === 0 || turns[i].text.includes(tokens[i].tool)),
+        ),
+        destinationContextHasMarkers: context.includes(`memory${i}`) &&
+          (i === 0 || context.includes(`file${i}`)),
+        answerHasMarkers: { memory, file },
+      };
     });
+    const recallOk = recallChecks.every((check) =>
+      check.sourceHistoryHasMarkers &&
+      check.destinationContextHasMarkers &&
+      check.answerHasMarkers.memory &&
+      (!check.expectsFile || check.answerHasMarkers.file),
+    );
     assertion(assertions, "all_turns_completed", turns.every((x) => x.status === "completed"), turns.map((x) => x.status).join(","));
-    assertion(assertions, "cross_model_recall_after_file_removal", recallOk, recalls.map((x) => x.text.slice(0, 60)).join(" | "));
-    assertion(assertions, "tool_executed_in_first_turn", turns.slice(0, 2).every((x) => x.items.length > 0), JSON.stringify(turns.slice(0, 2).map((x) => x.items.length)));
+    assertion(assertions, "cross_model_recall_after_file_removal", recallOk, JSON.stringify(recallChecks));
+    const firstDeepSeekRoute = gw.logs.find((event) =>
+      event.event === "route" && event.thread === identityHash(threads[1]) && event.model === DS,
+    );
+    const firstDeepSeekTurn = turns[1]?.turn;
+    const firstDeepSeekToolPayloads = gw.payloads.filter((payload) =>
+      payload.thread === threads[1] && payload.turn === firstDeepSeekTurn,
+    );
+    const firstCallEntries = firstDeepSeekToolPayloads.flatMap((payload) =>
+      (payload.callIds ?? []).filter((value) => value.startsWith("function_call:")),
+    );
+    const firstResultEntries = firstDeepSeekToolPayloads.flatMap((payload) =>
+      (payload.callIds ?? []).filter((value) => value.startsWith("function_call_output:")),
+    );
+    const firstCallIds = new Set(firstCallEntries.map((value) => value.slice("function_call:".length)));
+    const firstResultIds = new Set(firstResultEntries.map((value) => value.slice("function_call_output:".length)));
+    const matchedCallIds = [...firstCallIds].filter((callId) => firstResultIds.has(callId));
+    const firstToolNames = [...new Set(firstDeepSeekToolPayloads.flatMap((payload) => payload.toolCallNames ?? []))];
+    const firstDeepSeekToolEvidence = {
+      thread: Boolean(firstDeepSeekRoute?.thread),
+      turn: Boolean(firstDeepSeekTurn),
+      definitions: Number(firstDeepSeekRoute?.tool_definitions ?? 0) > 0,
+      callAndResult: firstCallEntries.length === 1 &&
+        firstResultEntries.length === 1 &&
+        matchedCallIds.length === 1,
+      singleExecCommand: firstToolNames.length === 1 && firstToolNames[0] === "exec_command",
+      markerMatched: firstDeepSeekToolPayloads.some((payload) =>
+        (payload.toolResultMarkers ?? []).includes("file1"),
+      ),
+      callEntryCount: firstCallEntries.length,
+      resultEntryCount: firstResultEntries.length,
+      matchedCallIdCount: matchedCallIds.length,
+      toolNames: firstToolNames,
+    };
+    assertion(
+      assertions,
+      "tool_executed_in_first_turn",
+      [
+        firstDeepSeekToolEvidence.thread,
+        firstDeepSeekToolEvidence.turn,
+        firstDeepSeekToolEvidence.definitions,
+        firstDeepSeekToolEvidence.callAndResult,
+        firstDeepSeekToolEvidence.singleExecCommand,
+        firstDeepSeekToolEvidence.markerMatched,
+      ].every(Boolean),
+      JSON.stringify(firstDeepSeekToolEvidence),
+    );
     const toolIds = turns.flatMap((x) => x.items.map((i) => i.id));
     assertion(assertions, "no_duplicate_tool_execution", new Set(toolIds).size === toolIds.length, `${toolIds.length} executions`);
     assertion(assertions, "no_summary_or_compaction", !gw.logs.some((x) => ["summary_started", "migration_summary_installed", "compaction_completed"].includes(x.event)), JSON.stringify(gw.logs.filter((x) => ["summary_started", "migration_summary_installed"].includes(x.event)).map((x) => x.event)));
@@ -458,8 +597,18 @@ export async function e2e3(ctx) {
         historyVersionsDelta: gw.archive.stats().versions - versions0,
         toolsExecutedLocally: true,
         detail: {
-          turns: turns.map((x) => ({ model: x.model, status: x.status, tools: x.items.length })),
+          turns: turns.map((x) => ({
+            model: x.model,
+            status: x.status,
+            tools: x.items.length,
+            itemTypes: x.itemTypes,
+            itemMethods: x.itemMethods,
+            failure: x.turnFailure,
+          })),
+          recallChecks,
+          firstDeepSeekToolEvidence,
           migrations: gw.logs.filter((x) => x.event === "full_history_migrated").length,
+          officialWebSocketEvents: gw.websocketEvents,
         },
       },
     });
@@ -533,9 +682,6 @@ export async function e2e4(ctx) {
   const gw = await setup(ctx, "e2e4");
   const assertions = [];
   try {
-    const health = startHealthSampling(gw.url, ctx.thresholds.healthSampleIntervalMs);
-    const loop = monitorEventLoop();
-    const versions0 = gw.archive.stats().versions;
     const filler = "The quick brown fox jumps over the lazy dog while the auditor records every clause of the specification. ";
     const build = (targetTokens, salt) => {
       const input = [];
@@ -550,8 +696,16 @@ export async function e2e4(ctx) {
       input.push({ type: "message", role: "user", content: [{ type: "input_text", text: `Reply exactly E2E_CAPACITY_${salt}_OK and nothing else.` }] });
       return { input, tokens: estimateRequestTokens({ input }) };
     };
+    // Building hundreds of thousands of synthetic tokens is harness setup, not
+    // Gateway work. Finish it before measuring the shared process event loop so
+    // H8 reflects request handling rather than fixture construction.
     const within = build(360000, "WITHIN");
     const over = build(430000, "OVER");
+    const health = startExternalHealthSampling(gw.url, {
+      intervalMs: ctx.thresholds.healthSampleIntervalMs,
+      timeoutMs: 5000,
+    });
+    const versions0 = gw.archive.stats().versions;
     const proxy = await captureProxy({ target: gw.url });
 
     const probe = await httpProbe({
@@ -596,7 +750,11 @@ export async function e2e4(ctx) {
       extra: {
         assertions,
         health: healthSamples,
-        eventLoopDelayP99Ms: loop.stop(),
+        // The capacity driver and embedded Gateway share one event loop, so a
+        // histogram here would primarily measure client-side serialization of
+        // the 360K/430K-token fixtures. External health samples remain valid;
+        // independent event-loop health is covered by G2 and the live G3 run.
+        eventLoopDelayP99Ms: null,
         historyVersionsDelta: versionsAfterWithin - versions0,
         expectedFailure: false,
         detail: {
@@ -604,6 +762,7 @@ export async function e2e4(ctx) {
           overTokens: over.tokens,
           overflowCompleted,
           overflowStatus: overflow.status,
+          eventLoopMeasurement: "n/a (shared-process large-fixture driver; external health sampled)",
         },
       },
     });
@@ -620,7 +779,6 @@ export async function e2e6(ctx) {
   await mkdir(root, { recursive: true, mode: 0o700 });
   const home = join(root, "home");
   await mkdir(home, { recursive: true, mode: 0o700 });
-  await symlink(ctx.authSource, join(home, "auth.json"));
   await isolatedCodexHome({ home, baseUrl: `${url}/subscription/v1`, catalogPath, authSource: ctx.authSource, model: GPT });
 
   const idle = await awaitIdle(url, 20000);

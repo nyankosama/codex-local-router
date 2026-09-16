@@ -70,10 +70,14 @@ function feeiMutation(config) {
   config.targets["feei-sol"] = {
     provider: "feei",
     preset: "feei/gpt-5.6-sol",
+    app: { capabilityProfile: "lite-search", useResponsesLite: true },
+    standaloneSearch: { source: "subscription" },
   };
   config.targets["feei-astra"] = {
     provider: "feei",
     preset: "feei/gpt-6-astra",
+    app: { capabilityProfile: "lite-search", useResponsesLite: true },
+    standaloneSearch: { source: "subscription" },
   };
 }
 

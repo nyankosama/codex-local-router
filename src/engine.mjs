@@ -121,6 +121,33 @@ export class Engine {
       : undefined;
     return identity(entry, headers, body, trustedAccount);
   }
+  saveResponse(
+    ctx,
+    response,
+    input,
+    target,
+    archiveInput,
+    correlation = {},
+    persistence = {},
+  ) {
+    const startedAt = Date.now();
+    const saved = this.state.save(
+      ctx,
+      response,
+      input,
+      target,
+      archiveInput,
+      persistence,
+    );
+    this.log({
+      event: "history_commit_completed",
+      ...correlation,
+      provider: target?.provider ?? correlation.provider ?? null,
+      model: target?.model ?? correlation.model ?? null,
+      duration_ms: Date.now() - startedAt,
+    });
+    return saved;
+  }
   allVisibleTargetsUseSubscriptionSearch(config = this.config) {
     const visible = Object.values(config.targets).filter((target) => target.app?.enabled);
     return visible.every(
@@ -413,11 +440,35 @@ export class Engine {
     const virtualInput = context.body.input.some((item) =>
       ["compaction_trigger", "compaction", "summary"].includes(item?.type),
     );
+    // App-server model switches may send a full input delta without
+    // previous_response_id.  In that shape the previous response lookup is
+    // unavailable, but the per-thread last-target lease still tells us that
+    // the conversation crossed from a third-party target.  Keep ordinary
+    // official turns transparent; only enter Engine when the request carries
+    // history/tool items that cannot be safely replayed by the official relay.
+    const lastTarget = this.state.get(`last-target:${context.ctx.owner}`);
+    const crossProviderItem = context.body.input.some((item) =>
+      [
+        "function_call",
+        "function_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+      ].includes(item?.type),
+    );
+    const crossProviderHistory =
+      lastTarget?.provider &&
+      lastTarget.provider !== "chatgpt-subscription" &&
+      (context.body.input.length > 1 || crossProviderItem);
+    const previousNeedsReplay =
+      context.previous &&
+      (context.previous.target?.provider !== "chatgpt-subscription" ||
+        context.previous.continuationProvenance !== "official-relay");
     return {
       ...context,
       needsEngine:
         virtualInput ||
-        (context.previous && context.previous.target?.provider !== "chatgpt-subscription"),
+        previousNeedsReplay ||
+        crossProviderHistory,
     };
   }
   async requireObservedHistory(headers, body) {
@@ -446,9 +497,17 @@ export class Engine {
   }
   queueOfficialObservation(prepared, work) {
     const key = prepared.ctx.owner;
+    const startedAt = Date.now();
     let task;
     task = Promise.resolve()
       .then(work)
+      .then((result) => {
+        this.log({
+          event: "official_history_observation_completed",
+          duration_ms: Date.now() - startedAt,
+        });
+        return result;
+      })
       .finally(() => {
         if (this.officialObservations.get(key) === task)
           this.officialObservations.delete(key);
@@ -509,12 +568,14 @@ export class Engine {
     const input = prepared.previous
       ? [...prepared.previous.input, ...prepared.body.input]
       : prepared.body.input;
-    this.state.save(
+    this.saveResponse(
       prepared.ctx,
       response,
       input,
       this.officialTarget(request.model),
       input,
+      { provider: "chatgpt-subscription", model: request.model },
+      { continuationProvenance: "official-relay" },
     );
     if (prepared.ctx.requestKind === "turn") {
       this.state.set(
@@ -588,17 +649,20 @@ export class Engine {
         ":" +
         ctx.requestKind +
         (ctx.requestKind === "compaction" ? ":" + body.model : "");
+    let routeMs = 0;
     let lease = leaseKey && this.state.get(leaseKey);
     if (lease && lease.model !== body.model)
       throw fail("model_change_during_turn", 409);
     if (!lease) {
       const c = (turnKey && this.state.get("config:" + turnKey)) || this.config;
       if (turnKey) this.state.set("config:" + turnKey, c);
+      const routeStartedAt = Date.now();
       lease = {
         config: c,
         model: body.model,
         ...this.route(c, entry, body, ctx),
       };
+      routeMs = Date.now() - routeStartedAt;
       if (leaseKey) this.state.set(leaseKey, lease);
     }
     const config = lease.config,
@@ -782,6 +846,7 @@ export class Engine {
       migrationSummaryAttempted = false;
     for (;;) {
       if (signal.aborted) throw fail("cancelled", 499);
+      const policyStartedAt = Date.now();
       const standaloneSearch = resolveStandaloneSearchPolicy(config, target);
       const plan = planCapabilities(target, contextFromRequest(body, headers), {
         standaloneSearchSource: standaloneSearch.source,
@@ -799,6 +864,7 @@ export class Engine {
         toolPolicy,
         this.toolRegistry,
       );
+      const policyMs = Date.now() - policyStartedAt;
       let adapted = filtered.body;
       if (filtered.diagnostics.removed.length)
         this.log({
@@ -873,6 +939,8 @@ export class Engine {
         input_bytes: jsonBytes(adapted.input),
         tools_bytes: jsonBytes(adapted.tools),
         request_setup_ms: Date.now() - startedAt,
+        route_ms: routeMs,
+        policy_ms: policyMs,
         identity_ms: identityMs,
         history_replay_ms: replayMs,
         estimated_input_tokens: estimateRequestTokens(body),
@@ -906,7 +974,7 @@ export class Engine {
           ) {
             response = event.response;
             if (!search) {
-              this.state.save(ctx, response, body.input, target, archiveInput);
+              this.saveResponse(ctx, response, body.input, target, archiveInput, correlation);
               if (ctx.requestKind === "turn") {
                 this.state.set("last-target:" + ctx.owner, { ...target }, ctx);
                 this.state.set("last-provider:" + ctx.owner, target.provider, ctx);
@@ -1013,7 +1081,7 @@ export class Engine {
             output = true;
             yield event;
           }
-        this.state.save(ctx, response, body.input, target, archiveInput);
+        this.saveResponse(ctx, response, body.input, target, archiveInput, correlation);
         if (ctx.requestKind === "turn") {
           this.state.set("last-target:" + ctx.owner, { ...target }, ctx);
           this.state.set("last-provider:" + ctx.owner, target.provider, ctx);
@@ -1142,12 +1210,13 @@ export class Engine {
           ...response,
           output: response.output.filter((x) => !calls.includes(x)),
         };
-        this.state.save(
+        this.saveResponse(
           ctx,
           providerResponse,
           body.input,
           target,
           archiveInput,
+          correlation,
         );
         for (const e of completedEvents(clientResponse)) yield e;
         return;
@@ -1478,12 +1547,13 @@ export class Engine {
       this.log({ event: "portable_cache_unavailable", ...correlation, type: error.type });
     }
     // A compaction response represents replacement history, not an append to it.
-    this.state.save(
+    this.saveResponse(
       ctx,
       response,
       [],
       target,
       this.archive ? (original ?? []) : [],
+      correlation,
     );
     this.log({
       event: "compaction_completed",

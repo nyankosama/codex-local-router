@@ -116,6 +116,16 @@ function sourceLabels(tool) {
     .filter(Boolean);
 }
 
+function registeredMcpSource(value, registry) {
+  const label = String(value ?? "").trim();
+  const candidate = label.replace(/^mcp__/, "");
+  if (!candidate) return null;
+  const user = registry?.userMcpServers?.has(candidate);
+  const plugin = registry?.pluginMcpServers?.has(candidate);
+  if (!user && !plugin) return null;
+  return { server: candidate, user, plugin };
+}
+
 function appSource(name, registry) {
   if (!name.startsWith("mcp__codex_apps__")) return null;
   const suffix = name.slice("mcp__codex_apps__".length);
@@ -160,6 +170,38 @@ export function classifyTool(tool, registry = {}) {
         source: namespace,
         plugin: canonicalPluginName(namespace),
       };
+    const registered = registeredMcpSource(name, registry);
+    if (registered) {
+      if (registered.user && registered.plugin)
+        return { kind: "collision", name, source: registered.server };
+      if (registered.user)
+        return { kind: "user-mcp", name, source: registered.server };
+      return {
+        kind: "plugin",
+        name,
+        source: registered.server,
+        plugin: canonicalPluginName(
+          registry.pluginMcpOwners?.get(registered.server) ?? registered.server,
+        ),
+      };
+    }
+  }
+
+  for (const label of labels) {
+    const registered = registeredMcpSource(label, registry);
+    if (!registered) continue;
+    if (registered.user && registered.plugin)
+      return { kind: "collision", name, source: registered.server };
+    if (registered.user)
+      return { kind: "user-mcp", name, source: registered.server };
+    return {
+      kind: "plugin",
+      name,
+      source: registered.server,
+      plugin: canonicalPluginName(
+        registry.pluginMcpOwners?.get(registered.server) ?? registered.server,
+      ),
+    };
   }
 
   const servers = [

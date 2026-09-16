@@ -465,6 +465,8 @@ test("third-party GPT standalone search rejects the hosted-search carrier", asyn
   );
 
   c.targets.go.standaloneSearch = { source: "disabled" };
+  c.targets.go.app.capabilityProfile = "standard-tools";
+  c.targets.go.app.useResponsesLite = false;
   await assert.rejects(
     collect(new Engine(validate(c)), {
       model: "deepseek-v4.1-flash",

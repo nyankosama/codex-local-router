@@ -9,12 +9,14 @@ import { createGateway } from "../src/server.mjs";
 import {
   OFFICIAL_CODEX_ORIGIN,
   officialRelayUrl,
+  relayOfficialHttp,
   relayRequestHeaders,
   validateOfficialRelayPath,
 } from "../src/official-relay.mjs";
 import {
   createOfficialWebSocketAgent,
   OfficialWebSocketSession,
+  officialWebSocketCaCertificates,
   officialWebSocketProxyForUrl,
 } from "../src/official-websocket.mjs";
 
@@ -80,6 +82,7 @@ test("A5/A7 official URL is fixed, query-preserving and rejects path/method atta
   assert.throws(() => validateOfficialRelayPath("/subscription/v1/../secret", "GET"));
   assert.throws(() => validateOfficialRelayPath("/subscription/v1/%2e%2e/secret", "GET"));
   assert.throws(() => validateOfficialRelayPath("/subscription/v1/models", "CONNECT"));
+  assert.throws(() => validateOfficialRelayPath("/subscription/v1/models", "TRACE"));
   const headers = relayRequestHeaders({
     host: "127.0.0.1",
     connection: "keep-alive, x-remove",
@@ -94,6 +97,40 @@ test("A5/A7 official URL is fixed, query-preserving and rejects path/method atta
     "chatgpt-account-id": "acct",
     "x-end-to-end": "keep",
   });
+});
+
+test("A6 official relay waits for downstream drain before forwarding the next chunk", async () => {
+  const response = new EventEmitter();
+  const chunks = [];
+  let writes = 0;
+  response.writeHead = () => {};
+  response.write = (chunk) => {
+    chunks.push(Buffer.from(chunk));
+    writes++;
+    if (writes === 1) setImmediate(() => response.emit("drain"));
+    return writes !== 1;
+  };
+  response.end = () => {};
+  const req = { url: "/subscription/v1/future/events", method: "POST", headers: {} };
+  async function* body() {
+    yield Buffer.from("first");
+    yield Buffer.from("second");
+  }
+  const result = await relayOfficialHttp({
+    req,
+    res: response,
+    wire: Buffer.from("request"),
+    config: { timeoutMs: 1000 },
+    send: async () => ({
+      status: 200,
+      headers: new Headers({ "content-type": "text/event-stream" }),
+      rawHeaders: [["content-type", "text/event-stream"]],
+      body: body(),
+    }),
+  });
+  assert.equal(result.status, 200);
+  assert.deepEqual(Buffer.concat(chunks).toString(), "firstsecond");
+  assert.equal(writes, 2);
 });
 
 test("A5/A7 subscription auxiliary endpoints relay bytes and query; local API search stays closed", async (t) => {
@@ -242,6 +279,237 @@ test("A5/A8 ordinary official Responses stays byte-transparent and observed hist
   assert.equal(providerCalls.length, 1);
   assert.match(JSON.stringify(providerCalls[0].input), /fixture/);
   assert.match(JSON.stringify(providerCalls[0].input), /continue/);
+  const observed = await gateway.engine.officialRelayContext(
+    { authorization: "Bearer subscription" },
+    { previous_response_id: "resp_official_1", input: [] },
+  );
+  assert.equal(observed.previous.continuationProvenance, "official-relay");
+  assert.equal(
+    (await gateway.engine.officialRequestNeedsEngine(
+      { authorization: "Bearer subscription" },
+      {
+        model: "gpt-unlisted-future",
+        previous_response_id: "resp_official_1",
+        input: [{ role: "user", content: "native continuation" }],
+      },
+    )).needsEngine,
+    false,
+  );
+});
+
+test("A8 Engine-managed and legacy official response IDs stay on Engine replay", async () => {
+  const gateway = createGateway(config(), {
+    resolveIdentity: async () => "chatgpt:fixture",
+  });
+  const headers = {
+    authorization: "Bearer subscription",
+    "thread-id": "thread-engine-history",
+  };
+  const prepared = await gateway.engine.officialRelayContext(headers, {
+    model: "gpt-5.6-sol",
+    input: [{ role: "user", content: "fixture" }],
+  });
+  gateway.engine.state.save(
+    prepared.ctx,
+    {
+      id: "resp_engine_official",
+      status: "completed",
+      output: [{
+        type: "function_call",
+        call_id: "call_engine_official",
+        name: "read_fixture",
+        arguments: "{}",
+      }],
+    },
+    prepared.body.input,
+    gateway.engine.officialTarget("gpt-5.6-sol"),
+  );
+  assert.equal(
+    gateway.engine.state.get(
+      `response:${prepared.ctx.owner}:resp_engine_official`,
+    ).continuationProvenance,
+    "gateway-replay",
+  );
+  assert.equal(
+    (await gateway.engine.officialRequestNeedsEngine(headers, {
+      model: "gpt-5.6-sol",
+      previous_response_id: "resp_engine_official",
+      input: [{
+        type: "function_call_output",
+        call_id: "call_engine_official",
+        output: "fixture result",
+      }],
+    })).needsEngine,
+    true,
+  );
+
+  gateway.engine.state.set(
+    `response:${prepared.ctx.owner}:resp_legacy_official`,
+    {
+      input: prepared.body.input,
+      original: prepared.body.input,
+      target: gateway.engine.officialTarget("gpt-5.6-sol"),
+      provider: "chatgpt-subscription",
+    },
+    prepared.ctx,
+  );
+  assert.equal(
+    (await gateway.engine.officialRequestNeedsEngine(headers, {
+      model: "gpt-5.6-sol",
+      previous_response_id: "resp_legacy_official",
+      input: [{ role: "user", content: "legacy continuation" }],
+    })).needsEngine,
+    true,
+  );
+  await gateway.close();
+});
+
+test("A6/A8 WebSocket continuations after Engine-managed official responses replay every turn", async (t) => {
+  const upstreamSockets = [];
+  const providerCalls = [];
+  const gateway = createGateway(config(), {
+    resolveIdentity: async () => "chatgpt:fixture",
+    createOfficialWebSocket: (...args) => {
+      upstreamSockets.push(args);
+      throw Error("opaque official relay must not open");
+    },
+    send: async (_url, request) => {
+      providerCalls.push(request.body);
+      const first = providerCalls.length === 1;
+      return upstream(
+        200,
+        { "content-type": "application/json" },
+        Buffer.from(JSON.stringify({
+          id: first ? "resp_engine_continued_1" : "resp_engine_continued_2",
+          status: "completed",
+          output: first
+            ? [{
+                type: "custom_tool_call",
+                call_id: "call_engine_ws_2",
+                name: "custom_fixture",
+                input: "fixture",
+              }]
+            : [{
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "continued" }],
+              }],
+        })),
+      );
+    },
+  });
+  const port = await listen(gateway.server);
+  t.after(() => gateway.close());
+  const headers = {
+    authorization: "Bearer subscription",
+    "thread-id": "thread-engine-ws",
+  };
+  const prepared = await gateway.engine.officialRelayContext(headers, {
+    model: "gpt-5.6-sol",
+    input: [{ role: "user", content: "call a tool" }],
+  });
+  gateway.engine.state.save(
+    prepared.ctx,
+    {
+      id: "resp_engine_ws",
+      status: "completed",
+      output: [{
+        type: "function_call",
+        call_id: "call_engine_ws",
+        name: "read_fixture",
+        arguments: "{}",
+      }],
+    },
+    prepared.body.input,
+    gateway.engine.officialTarget("gpt-5.6-sol"),
+  );
+
+  const socket = new WebSocket(
+    `ws://127.0.0.1:${port}/subscription/v1/responses`,
+    { headers, perMessageDeflate: false },
+  );
+  await new Promise((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+  const messages = [];
+  const nextCompleted = () => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(Error("timed out waiting for response.completed"));
+    }, 2000);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("message", onMessage);
+      socket.off("error", onError);
+    };
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onMessage = (data) => {
+      const event = JSON.parse(data.toString());
+      messages.push(event);
+      if (event.type === "error") {
+        cleanup();
+        reject(Error(event.error?.type ?? "gateway WebSocket error"));
+      } else if (event.type === "response.completed") {
+        cleanup();
+        resolve(event);
+      }
+    };
+    socket.on("message", onMessage);
+    socket.on("error", onError);
+  });
+  const firstDone = nextCompleted();
+  socket.send(JSON.stringify({
+    type: "response.create",
+    model: "gpt-5.6-sol",
+    previous_response_id: "resp_engine_ws",
+    input: [{
+      type: "function_call_output",
+      call_id: "call_engine_ws",
+      output: "fixture result",
+    }],
+  }));
+  const first = await firstDone;
+  assert.equal(first.response.id, "resp_engine_continued_1");
+
+  const secondDone = nextCompleted();
+  socket.send(JSON.stringify({
+    type: "response.create",
+    model: "gpt-5.6-sol",
+    previous_response_id: "resp_engine_continued_1",
+    input: [{
+      type: "custom_tool_call_output",
+      call_id: "call_engine_ws_2",
+      output: "custom fixture result",
+    }],
+  }));
+  const second = await secondDone;
+  assert.equal(upstreamSockets.length, 0);
+  assert.equal(providerCalls.length, 2);
+  assert.equal(providerCalls[0].previous_response_id, undefined);
+  assert.equal(providerCalls[1].previous_response_id, undefined);
+  assert.equal(providerCalls[0].store, false);
+  assert.equal(providerCalls[1].store, false);
+  assert.deepEqual(
+    providerCalls[0].input.map((item) => item.type ?? item.role),
+    ["user", "function_call", "function_call_output"],
+  );
+  assert.deepEqual(
+    providerCalls[1].input.map((item) => item.type ?? item.role),
+    [
+      "user",
+      "function_call",
+      "function_call_output",
+      "custom_tool_call",
+      "custom_tool_call_output",
+    ],
+  );
+  assert.equal(second.response.id, "resp_engine_continued_2");
+  assert.equal(messages.filter((event) => event.type === "response.completed").length, 2);
+  socket.close();
 });
 
 test("A5 official Responses classifies a compressed copy but forwards the original request bytes", async (t) => {
@@ -292,6 +560,32 @@ test("A8 missing observed history fails cross-provider migration explicitly", as
   });
   assert.equal(response.status, 409);
   assert.equal((await response.json()).error.type, "history_observation_incomplete");
+});
+
+test("A8 WebSocket model switches enter Engine when the App omits previous_response_id", async () => {
+  const gateway = createGateway(config(), {
+    resolveIdentity: async () => "chatgpt:fixture",
+  });
+  const headers = {
+    authorization: "Bearer subscription",
+    "thread-id": "thread-fixture",
+    "turn-id": "turn-fixture",
+  };
+  const first = await gateway.engine.officialRelayContext(headers, {
+    model: "gpt-5.6-sol",
+    input: [{ role: "user", content: "first" }],
+  });
+  gateway.engine.state.set(
+    `last-target:${first.ctx.owner}`,
+    { provider: "opencode-go", model: "deepseek-v4.1-flash" },
+    first.ctx,
+  );
+  const classification = await gateway.engine.officialRequestNeedsEngine(headers, {
+    model: "gpt-5.6-sol",
+    input: [{ type: "custom_tool_call_output", call_id: "call_fixture", output: "ok" }],
+  });
+  assert.equal(classification.needsEngine, true);
+  await gateway.close();
 });
 
 test("A8 an observation write failure does not fail an ordinary official response", async (t) => {
@@ -404,6 +698,58 @@ test("A6 ProxyAgent callback adapts its request argument without changing proxy 
   );
 });
 
+test("A6 official WebSocket trust preserves default CAs and adds system CAs once", () => {
+  const calls = [];
+  assert.deepEqual(
+    officialWebSocketCaCertificates({
+      rootCertificates: ["fallback-only"],
+      getCACertificates: (type) => {
+        calls.push(type);
+        return type === "default"
+          ? ["bundled-a", "shared", "extra-a"]
+          : ["system-a", "shared"];
+      },
+    }),
+    ["bundled-a", "shared", "extra-a", "system-a"],
+  );
+  assert.deepEqual(calls, ["default", "system"]);
+  assert.deepEqual(
+    officialWebSocketCaCertificates({ rootCertificates: ["legacy-a", "legacy-a"] }),
+    null,
+  );
+});
+
+test("A6 official WebSocket passes local trust without disabling verification", async (t) => {
+  let socketOptions;
+  class OpenSocket extends EventEmitter {
+    constructor() {
+      super();
+      this.readyState = 0;
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.emit("open");
+      });
+    }
+    close() { this.readyState = 3; }
+  }
+  const agent = { destroy() {} };
+  const session = new OfficialWebSocketSession(
+    { authorization: "Bearer subscription" },
+    {
+      agent,
+      caCertificates: ["fixture-default", "fixture-system"],
+      createSocket: (_url, options) => {
+        socketOptions = options;
+        return new OpenSocket();
+      },
+    },
+  );
+  t.after(() => session.close());
+  await session.connect();
+  assert.deepEqual(socketOptions.ca, ["fixture-default", "fixture-system"]);
+  assert.equal(socketOptions.rejectUnauthorized, true);
+});
+
 test("A6 official WebSocket connection failures stay redacted and attributable", async () => {
   const logs = [];
   class FailingSocket extends EventEmitter {
@@ -437,6 +783,42 @@ test("A6 official WebSocket connection failures stay redacted and attributable",
   }]);
 });
 
+test("A6 official WebSocket exposes only allowlisted TLS error codes", async () => {
+  const logs = [];
+  class FailingSocket extends EventEmitter {
+    constructor() {
+      super();
+      queueMicrotask(() => {
+        const error = Error("private certificate and proxy detail");
+        error.code = "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
+        this.emit("error", error);
+      });
+    }
+    terminate() {}
+  }
+  const session = new OfficialWebSocketSession(
+    { authorization: "Bearer subscription" },
+    {
+      agent: {},
+      caCertificates: [],
+      createSocket: () => new FailingSocket(),
+      log: (event) => logs.push(event),
+    },
+  );
+  await assert.rejects(session.connect(), (error) =>
+    error.type === "upstream_connection_error" &&
+    error.transportCategory === "tls" &&
+    error.transportCode === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" &&
+    !error.message.includes("private certificate"),
+  );
+  assert.deepEqual(logs, [{
+    event: "official_ws_connect_failed",
+    transport: "websocket",
+    transport_code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    transport_category: "tls",
+  }]);
+});
+
 test("A6 official WebSocket relays message payloads and sequence without Engine rewriting", async (t) => {
   const upstreamSockets = [];
   const received = [];
@@ -454,15 +836,16 @@ test("A6 official WebSocket relays message payloads and sequence without Engine 
     send(data, options, callback) {
       received.push({ data: Buffer.from(data), options });
       callback();
+      const responseId = `resp_ws_${received.length}`;
       const first = Buffer.from(JSON.stringify({
         type: "response.created",
         sequence_number: 91,
-        response: { id: "resp_ws_1", status: "in_progress", output: [] },
+        response: { id: responseId, status: "in_progress", output: [] },
       }));
       const terminal = Buffer.from(JSON.stringify({
         type: "response.completed",
         sequence_number: 92,
-        response: { id: "resp_ws_1", status: "completed", output: [] },
+        response: { id: responseId, status: "completed", output: [] },
       }));
       queueMicrotask(() => {
         this.emit("message", first, false);
@@ -482,8 +865,12 @@ test("A6 official WebSocket relays message payloads and sequence without Engine 
   });
   const port = await listen(gateway.server);
   t.after(() => gateway.close());
+  const headers = {
+    authorization: "Bearer subscription",
+    "session-id": "session-official-relay",
+  };
   const socket = new WebSocket(`ws://127.0.0.1:${port}/subscription/v1/responses`, {
-    headers: { authorization: "Bearer subscription" },
+    headers,
     perMessageDeflate: false,
   });
   await new Promise((resolve, reject) => {
@@ -497,21 +884,101 @@ test("A6 official WebSocket relays message payloads and sequence without Engine 
     stream: true,
   }));
   const messages = [];
-  const done = new Promise((resolve, reject) => {
-    socket.on("message", (data) => {
-      messages.push(Buffer.from(data));
-      if (JSON.parse(data.toString()).type === "response.completed") resolve();
-    });
-    socket.once("error", reject);
+  socket.on("message", (data) => messages.push(Buffer.from(data)));
+  const nextCompleted = () => new Promise((resolve, reject) => {
+    const onError = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const onMessage = (data) => {
+      const event = JSON.parse(data.toString());
+      if (event.type !== "response.completed") return;
+      cleanup();
+      resolve(event);
+    };
+    const cleanup = () => {
+      socket.off("message", onMessage);
+      socket.off("error", onError);
+    };
+    socket.on("message", onMessage);
+    socket.on("error", onError);
   });
+  const done = nextCompleted();
   socket.send(request);
   await done;
+  await gateway.engine.requireObservedHistory(
+    headers,
+    { previous_response_id: "resp_ws_1", input: [] },
+  );
+  const context = await gateway.engine.officialRelayContext(
+    headers,
+    { previous_response_id: "resp_ws_1", input: [] },
+  );
+  assert.equal(context.previous.continuationProvenance, "official-relay");
+  const continuation = Buffer.from(JSON.stringify({
+    type: "response.create",
+    model: "gpt-future-ws",
+    previous_response_id: "resp_ws_1",
+    input: [{ role: "user", content: "continue" }],
+    stream: true,
+  }));
+  const continued = nextCompleted();
+  socket.send(continuation);
+  await continued;
   assert.equal(upstreamSockets[0].url, "wss://chatgpt.com/backend-api/codex/responses");
   assert.ok(upstreamSockets[0].options.agent);
   assert.equal(upstreamSockets[0].options.headers.authorization, "Bearer subscription");
   assert.equal(Buffer.compare(received[0].data, request), 0);
-  assert.deepEqual(messages.map((message) => JSON.parse(message).sequence_number), [91, 92]);
+  assert.equal(Buffer.compare(received[1].data, continuation), 0);
+  assert.deepEqual(
+    messages.map((message) => JSON.parse(message).sequence_number),
+    [91, 92, 91, 92],
+  );
   socket.close();
+});
+
+test("A6 official WebSocket queues upstream messages while downstream forward is backpressured", async () => {
+  class FixtureSocket extends EventEmitter {
+    constructor() {
+      super();
+      this.readyState = 0;
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.emit("open");
+      });
+    }
+    send(_data, _options, callback) { callback(); }
+    close() { this.readyState = 3; this.emit("close"); }
+    terminate() { this.close(); }
+  }
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const forwarded = [];
+  let socket;
+  const session = new OfficialWebSocketSession(
+    { authorization: "Bearer subscription" },
+    { createSocket: () => (socket = new FixtureSocket()) },
+  );
+  const turn = session.run(Buffer.from('{"type":"response.create"}'), false, {
+    forward: async (data) => {
+      const event = JSON.parse(Buffer.from(data).toString("utf8"));
+      forwarded.push(event.type);
+      if (event.type === "response.created") await gate;
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.emit("message", Buffer.from(JSON.stringify({ type: "response.created", sequence_number: 1 })), false);
+  socket.emit("message", Buffer.from(JSON.stringify({
+    type: "response.completed", sequence_number: 2,
+    response: { id: "resp_backpressure", status: "completed", output: [] },
+  })), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(forwarded, ["response.created"]);
+  release();
+  const terminal = await turn;
+  assert.equal(terminal.type, "response.completed");
+  assert.deepEqual(forwarded, ["response.created", "response.completed"]);
+  session.close();
 });
 
 test("A6 cancelling an official WebSocket turn terminates and releases the upstream", async () => {

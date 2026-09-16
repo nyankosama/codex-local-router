@@ -185,13 +185,24 @@ export class StateStore {
     return { body: next, previous, delta };
   }
 
-  save(ctx, response, viewInput, target, originalInput = viewInput) {
+  save(
+    ctx,
+    response,
+    viewInput,
+    target,
+    originalInput = viewInput,
+    { continuationProvenance = "gateway-replay" } = {},
+  ) {
     const record = {
       input: [...viewInput, ...(response.output ?? [])],
       original: [...originalInput, ...(response.output ?? [])],
       target: target ? structuredClone(target) : null,
       // Old cache compatibility for sessions created before target identities.
       provider: target?.provider ?? null,
+      // Only responses observed on the opaque official relay can safely retain
+      // their upstream previous_response_id. Engine and local responses must be
+      // replayed from this record before the next provider request.
+      continuationProvenance,
     };
     const responseKey = response.id
       ? "response:" + ctx.owner + ":" + response.id

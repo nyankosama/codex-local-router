@@ -1,11 +1,18 @@
 // E2E 运行入口：G0 门禁 + 6 条用例，统一输出 artifacts/e2e/<runId>/。
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import { evaluate, loadThresholds, verdict } from "./lib/criteria.mjs";
-import { resolveCore } from "./lib/harness.mjs";
+import {
+  createEvidenceDirectory,
+  persistCaseVerdict,
+  resolveCore,
+  verifyAcceptanceRevision,
+  writeDeterministicCodexInputs,
+  writeImmutableJson,
+} from "./lib/harness.mjs";
 import { parseNodeTestSummary } from "./lib/process-output.mjs";
 import { CASES } from "./cases.mjs";
 
@@ -23,7 +30,13 @@ const artifactsRoot = value("out")
 const GROUP = value("group") ?? "all";
 const ONLY = value("case");
 const INCLUDE_PRE_RELEASE = flag("include-pre-release");
+const INCLUDE_LIVE = flag("include-live");
 const runId = value("run") ?? new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
+
+if ((GROUP === "live" || INCLUDE_LIVE) && !flag("run")) {
+  console.error("Live E2E uses the installed Gateway and requires an explicit --run confirmation.");
+  process.exit(2);
+}
 
 const ok = (name, pass, detail = "") => ({ name, ok: Boolean(pass), detail: String(detail).slice(0, 400) });
 
@@ -149,7 +162,16 @@ function safeObservation(observation) {
 
 async function main() {
   const runDir = join(artifactsRoot, runId);
-  await mkdir(join(runDir, "raw"), { recursive: true });
+  const implementation = await verifyAcceptanceRevision(
+    projectRoot,
+    process.env.ACCEPTANCE_COMMIT,
+  );
+  await createEvidenceDirectory(runDir);
+  await mkdir(join(runDir, "raw"), { recursive: false, mode: 0o700 });
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "codex-router-e2e-inputs-"));
+  const fixtureInputs = await writeDeterministicCodexInputs(fixtureRoot);
+  const realAuthSource = join(homedir(), ".codex", "auth.json");
+  const realCatalogSource = join(homedir(), ".codex", "models_cache.json");
   const { thresholds, sha256: thresholdsSha256 } = await loadThresholds();
   const core = GROUP === "l0" ? null : await resolveCore();
   const summary = {
@@ -157,7 +179,12 @@ async function main() {
     startedAt: new Date().toISOString(),
     group: GROUP,
     caseFilter: ONLY ?? null,
+    execution: {
+      upstreamMode: GROUP === "live" ? "installed-live-service" : GROUP === "l0" ? "none" : "injected-deterministic",
+      productionConfigUsed: GROUP === "live",
+    },
     thresholdsSha256,
+    implementation,
     harness: core ? { kind: core.source, version: core.version, sha256: core.sha256 } : null,
     gate: null,
     cases: [],
@@ -182,7 +209,11 @@ async function main() {
 
   const selected = Object.entries(CASES)
     .filter(([id, spec]) =>
-      ONLY ? id === ONLY : GROUP === "all" ? INCLUDE_PRE_RELEASE || !spec.preRelease : GROUP === spec.group,
+      ONLY
+        ? id === ONLY && (GROUP === "all" || GROUP === spec.group) && (spec.group !== "live" || INCLUDE_LIVE || GROUP === "live")
+        : GROUP === "all"
+          ? (spec.group !== "live" || INCLUDE_LIVE) && (INCLUDE_PRE_RELEASE || !spec.preRelease)
+          : GROUP === spec.group,
     )
     // 发布前用例（容量边界）始终最后执行。
     .sort(([, a], [, b]) => Number(Boolean(a.preRelease)) - Number(Boolean(b.preRelease)))
@@ -194,8 +225,9 @@ async function main() {
     core,
     thresholds,
     prodConfigPath: join(homedir(), "Library", "Application Support", "Codex Local Router", "config.json"),
-    authSource: join(homedir(), ".codex", "auth.json"),
-    catalogSource: join(homedir(), ".codex", "models_cache.json"),
+    fixtureConfigPath: join(projectRoot, "config", "gateway.example.json"),
+    authSource: fixtureInputs.authPath,
+    catalogSource: fixtureInputs.catalogPath,
     live: {
       url: "http://127.0.0.1:8788",
       logPath: join(homedir(), "Library", "Application Support", "Codex Local Router", "logs", "gateway.log"),
@@ -206,6 +238,8 @@ async function main() {
 
   for (const [id, spec] of selected) {
     const startedAt = Date.now();
+    ctx.authSource = spec.group === "live" ? realAuthSource : fixtureInputs.authPath;
+    ctx.catalogSource = spec.group === "live" ? realCatalogSource : fixtureInputs.catalogPath;
     ctx.entryKind = id === "E2E-1" || id === "E2E-4" || id === "E2E-5" ? "A" : "B";
     console.log(JSON.stringify({ event: "case_start", case: id, title: spec.title }));
     let record;
@@ -230,8 +264,14 @@ async function main() {
         },
         detail: observation.detail ?? {},
       };
-      await writeFile(join(runDir, `${id}.json`), JSON.stringify(safeObservation(observation), null, 2) + "\n");
-      await writeFile(join(runDir, "raw", `${id}.jsonl`), sanitize(observation));
+      // The case verdict is authoritative.  buildObservation's default PASS
+      // is only a probe shape and must not contradict a failed assertion.
+      const persistedObservation = persistCaseVerdict(safeObservation(observation), finalVerdict);
+      await writeImmutableJson(join(runDir, `${id}.json`), persistedObservation);
+      await writeFile(join(runDir, "raw", `${id}.jsonl`), sanitize(observation), {
+        flag: "wx",
+        mode: 0o600,
+      });
     } catch (error) {
       record = {
         case: id,
@@ -257,8 +297,9 @@ async function main() {
       ? "ANOMALY"
       : summary.gate && !summary.gate.passed
         ? "FAIL"
-        : "PASS";
-  await writeFile(join(runDir, "summary.json"), JSON.stringify(summary, null, 2) + "\n");
+      : "PASS";
+  await writeImmutableJson(join(runDir, "summary.json"), summary);
+  await rm(fixtureRoot, { recursive: true, force: true });
   console.log(JSON.stringify({ event: "summary", runId, verdict: summary.verdict, cases: summary.cases.map((x) => `${x.case}:${x.verdict}`) }));
   // 显式退出：失败路径可能残留监听句柄，不能阻塞门禁与 CI。
   process.exit(summary.verdict === "FAIL" ? 1 : 0);

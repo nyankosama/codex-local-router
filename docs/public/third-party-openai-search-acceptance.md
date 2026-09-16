@@ -4,13 +4,15 @@ Date: 2026-09-13
 Live-tested candidate: the final committed candidate (the exact commit is recorded by the acceptance runner)
 Overall verdict: **PASS for the isolated CLI/App protocol gate**
 
+This is the frozen v0.4.0 `lite-search` evidence, not a claim about the current default profile. New third-party GPT App targets now default to `standard-tools`; the search canary selects `lite-search` explicitly. A future candidate must report the two profiles separately and must not combine this search receipt with a different Standard-Responses turn to claim simultaneous full tools and search.
+
 ## Resolved protocol boundary
 
 The first successful-generation probe exposed an important distinction. With `use_responses_lite: false`, Codex sent a top-level hosted `web_search` tool to ai.feei. ai.feei completed that tool inside its own Responses request, so no request reached the user's Codex subscription `/alpha/search` endpoint. A completed client search item alone was therefore insufficient evidence of the selected search source.
 
 Current Codex standalone search is exposed through the Responses Lite `input[].additional_tools` carrier as the `web.run` namespace. The ai.feei presets now use Responses Lite. The model call still goes to ai.feei, while Codex invokes the Gateway's `/subscription/v1/alpha/search`; the frozen search-route lease then sends that request to the selected subscription or Provider endpoint. For a target that does not declare native hosted search, a top-level hosted-search carrier is rejected with `standalone_search_protocol_mismatch` when a standalone source is selected, preventing a silent source change.
 
-Runtime configuration remains schema 3, configuration spaces remain schema 1, and integration state remains schema 4. The generic CLI defaults an App-enabled `openai-gpt` target to Responses Lite when standalone search is active; an explicit incompatible `--no-responses-lite` configuration is rejected.
+Runtime configuration remains schema 3, configuration spaces remain schema 1, and integration state remains schema 4. The recorded candidate used what is now named `lite-search`. New App-enabled `openai-gpt` targets default to `standard-tools`; Lite and active standalone search are an explicit paired choice, and incompatible combinations are rejected.
 
 ## Live acceptance
 

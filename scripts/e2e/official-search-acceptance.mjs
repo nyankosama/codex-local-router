@@ -77,6 +77,7 @@ async function probeOfficialWebSocket() {
       path: "/backend-api/codex/responses",
       durationMs: Date.now() - startedAt,
       error: error?.type ?? error?.code ?? "websocket_probe_failed",
+      transportCode: error?.transportCode ?? null,
       transportCategory: error?.transportCategory ?? null,
       diagnostics: logs,
     };

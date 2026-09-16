@@ -13,8 +13,15 @@ const packageJson = JSON.parse(await readFile("package.json", "utf8"));
 for (const command of ["codex-local-router", "llm-auto-gateway"])
   if (packageJson.bin?.[command] !== "scripts/gateway-admin.mjs")
     throw Error(`package is missing the ${command} executable`);
+for (const [name, command] of Object.entries(packageJson.scripts ?? {})) {
+  const match = /^node\s+([^\s]+)/.exec(command);
+  if (match && !names.includes(match[1]))
+    throw Error(`package script ${name} references missing file ${match[1]}`);
+}
+if (!names.some((name) => name.startsWith("test/") && name.endsWith(".test.mjs")))
+  throw Error("package test script has no packaged test files");
 const denied = names.filter((name) =>
-  /(^|\/)(artifacts|test|\.runtime|node_modules)(\/|$)/.test(name) ||
+  /(^|\/)(artifacts|\.runtime|node_modules)(\/|$)/.test(name) ||
   /(^|\/)(auth\.json|history\.sqlite|gateway\.subscription\.local\.json)$/.test(name) ||
   /\.before-|\.bak$|(?:^|\/)rollout-[^/]*\.jsonl$/i.test(name),
 );

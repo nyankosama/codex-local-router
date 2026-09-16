@@ -4,13 +4,15 @@
 真实验收候选：最终已提交候选（精确提交由验收驱动记录）
 总体结论：**隔离 CLI/App 协议门禁 PASS**
 
+这是冻结的 v0.4.0 `lite-search` 证据，不代表当前默认画像。新建第三方 GPT App target 现默认 `standard-tools`；搜索 canary 会显式选择 `lite-search`。后续候选必须分别报告两种画像，不能把本搜索回执与另一个标准 Responses turn 拼接成“完整工具与搜索同时成立”的结论。
+
 ## 已解决的协议边界
 
 首次生成成功的探针暴露了一个关键区别：当 `use_responses_lite: false` 时，Codex 会把顶层 hosted `web_search` 工具发给 ai.feei；ai.feei 在自己的 Responses 请求内完成搜索，因此用户 Codex 订阅的 `/alpha/search` 完全不会被调用。由此也确认：只有客户端搜索 item 完成，不能证明选定的搜索来源生效。
 
 当前 Codex 的独立搜索通过 Responses Lite 的 `input[].additional_tools` 载体，以 `web.run` namespace 暴露。ai.feei 两款预设现已启用 Responses Lite：模型生成仍去 ai.feei，Codex 调用 Gateway 的 `/subscription/v1/alpha/search`，冻结的搜索租约再把请求送到选定的订阅或 Provider endpoint。对未声明原生 hosted search 的 target，选择独立搜索来源后如果收到顶层 hosted-search 载体，Gateway 会返回 `standalone_search_protocol_mismatch`，避免静默改用第三方 hosted search。
 
-运行时配置仍是 Schema 3，配置空间仍是 Schema 1，integration 仍是 Schema 4。通用 CLI 在 App-enabled `openai-gpt` target 启用独立搜索时默认使用 Responses Lite；显式组合不兼容的 `--no-responses-lite` 会被拒绝。
+运行时配置仍是 Schema 3，配置空间仍是 Schema 1，integration 仍是 Schema 4。记录中的候选使用了现在命名为 `lite-search` 的画像。新建 App-enabled `openai-gpt` target 默认 `standard-tools`；Lite 与启用的独立搜索需要成对显式选择，冲突组合会被拒绝。
 
 ## 真实验收
 

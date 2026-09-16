@@ -28,11 +28,21 @@
     },
     "feei-sol": {
       "provider": "feei",
-      "preset": "feei/gpt-5.6-sol"
+      "preset": "feei/gpt-5.6-sol",
+      "app": {
+        "capabilityProfile": "standard-tools",
+        "useResponsesLite": false
+      },
+      "standaloneSearch": { "source": "disabled" }
     },
     "feei-astra": {
       "provider": "feei",
-      "preset": "feei/gpt-6-astra"
+      "preset": "feei/gpt-6-astra",
+      "app": {
+        "capabilityProfile": "standard-tools",
+        "useResponsesLite": false
+      },
+      "standaloneSearch": { "source": "disabled" }
     }
   },
   "rules": [],
