@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import { ProxyAgent } from "proxy-agent";
 import { getProxyForUrl } from "proxy-from-env";
+import * as tls from "node:tls";
 import { fail } from "./errors.mjs";
 import { relayRequestHeaders } from "./official-relay.mjs";
 
@@ -10,13 +11,57 @@ export const OFFICIAL_RESPONSES_WEBSOCKET =
 const terminal = (event) =>
   ["response.completed", "response.incomplete", "error"].includes(event?.type);
 
+const TLS_FAILURE_CODES = new Set([
+  "CERT_HAS_EXPIRED",
+  "CERT_NOT_YET_VALID",
+  "CERT_REVOKED",
+  "CERT_SIGNATURE_FAILURE",
+  "CERT_UNTRUSTED",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "ERR_SSL_WRONG_VERSION_NUMBER",
+  "ERR_TLS_CERT_ALTNAME_FORMAT",
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "INVALID_CA",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+]);
+
+const rawConnectionCode = (error) => error?.code ?? error?.cause?.code;
+const safeConnectionCode = (error) => {
+  const code = rawConnectionCode(error);
+  return typeof code === "string" && TLS_FAILURE_CODES.has(code) ? code : undefined;
+};
+
+export function officialWebSocketCaCertificates(tlsApi = tls) {
+  if (typeof tlsApi.getCACertificates !== "function") return null;
+  const unique = new Set();
+  const append = (certificates) => {
+    for (const certificate of certificates ?? [])
+      if (typeof certificate === "string" && certificate.length) unique.add(certificate);
+  };
+  try {
+    append(tlsApi.getCACertificates("default"));
+    append(tlsApi.getCACertificates("system"));
+  } catch { return null; }
+  return [...unique];
+}
+
+let cachedOfficialCaCertificates;
+const defaultOfficialCaCertificates = () => {
+  cachedOfficialCaCertificates ??= officialWebSocketCaCertificates();
+  return cachedOfficialCaCertificates;
+};
+
 const connectionFailureCategory = (error) => {
-  const code = error?.code ?? error?.cause?.code;
+  const code = rawConnectionCode(error);
   const message = String(error?.message ?? error?.cause?.message ?? "");
   if (code === "ETIMEDOUT" || /timed?\s*out/i.test(message)) return "timeout";
   if (["ENOTFOUND", "EAI_AGAIN"].includes(code) || /getaddrinfo/i.test(message)) return "dns";
   if (code === "ECONNREFUSED") return "connect";
   if (["ECONNRESET", "EPIPE"].includes(code)) return "receive";
+  if (TLS_FAILURE_CODES.has(code)) return "tls";
   if (/\b407\b|proxy authentication/i.test(message)) return "proxy_auth";
   if (/proxy|tunnel/i.test(message)) return "proxy_connect";
   if (/certificate|ssl|tls/i.test(message)) return "tls";
@@ -26,8 +71,14 @@ const connectionFailureCategory = (error) => {
 const connectionFailure = (error) => {
   const failure = fail("upstream_connection_error", 502);
   failure.transportCategory = connectionFailureCategory(error);
+  failure.transportCode = safeConnectionCode(error);
   return failure;
 };
+
+const connectionFailureDiagnostics = (failure) => ({
+  ...(failure.transportCode ? { transport_code: failure.transportCode } : {}),
+  transport_category: failure.transportCategory,
+});
 
 export function officialWebSocketProxyForUrl(
   url,
@@ -64,6 +115,7 @@ export class OfficialWebSocketSession {
     this.createSocket =
       options.createSocket ??
       ((url, socketOptions) => new WebSocket(url, socketOptions));
+    this.caCertificates = options.caCertificates ?? defaultOfficialCaCertificates();
     this.url = options.url ?? OFFICIAL_RESPONSES_WEBSOCKET;
     this.maxPayload = options.maxPayload ?? 20 * 1024 * 1024;
     this.log = options.log ?? (() => {});
@@ -86,13 +138,15 @@ export class OfficialWebSocketSession {
           perMessageDeflate: false,
           followRedirects: false,
           maxPayload: this.maxPayload,
+          ...(this.caCertificates ? { ca: this.caCertificates } : {}),
+          rejectUnauthorized: true,
         });
       } catch (error) {
         const failure = connectionFailure(error);
         this.log({
           event: "official_ws_connect_failed",
           transport: "websocket",
-          transport_category: failure.transportCategory,
+          ...connectionFailureDiagnostics(failure),
         });
         reject(failure);
         return;
@@ -115,7 +169,7 @@ export class OfficialWebSocketSession {
         this.log({
           event: "official_ws_connect_failed",
           transport: "websocket",
-          transport_category: failure.transportCategory,
+          ...connectionFailureDiagnostics(failure),
         });
         reject(failure);
       };

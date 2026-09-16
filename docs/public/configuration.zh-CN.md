@@ -23,7 +23,7 @@ transactions/space-switch.json    唯一待完成或待恢复事务
 | `feei/gpt-5.6-sol` | `feei-gpt-5.6-sol` | `gpt-5.6-sol` | 272,000 |
 | `feei/gpt-6-astra` | `feei-gpt-6-astra` | `gpt-6-astra` | 272,000 |
 
-两者使用 Responses Lite 工具传输、文本/图片输入、freeform 工具、`summary` 压缩、`modelFamily: "openai-gpt"` 和 `useResponsesLite: true`。272,000 是保守配置，不代表已验证更大的容量。
+两者声明文本/图片输入、freeform 工具、`summary` 压缩、`modelFamily: "openai-gpt"` 和 272,000 的保守窗口。CLI 新建 target 时会叠加 `standard-tools`；旧的纯 preset 或显式 Lite 配置保留原传输，只有搜索生效时才按 `lite-search` 解析，避免静默迁移或能力夸大。272,000 不代表已验证更大容量。
 
 ```bash
 printf '%s' "$FEEI_API_KEY" | codex-local-router provider add \
@@ -35,15 +35,35 @@ codex-local-router model add --id feei-astra --provider feei \
   --preset feei/gpt-6-astra --yes
 ```
 
+以上命令创建 `standard-tools` target。若要让其中一款显式改用独立订阅搜索：
+
+```bash
+codex-local-router model edit --id feei-sol \
+  --app-profile lite-search --search-source subscription --yes
+```
+
 API Key 保存在独立 Keychain 项或由 `FEEI_API_KEY` 提供，不得写入配置。App 模型 ID 带 `feei-` 前缀，不冒用官方模型 ID。
 
-两款预设通过 `modelFamily: "openai-gpt"` 继承第三方 GPT 的搜索默认策略，不再维护 ai.feei 专属布尔值。Responses Lite 让 Codex 以 `input[].additional_tools` 中的 `web.run` 暴露独立搜索；`capabilities.nativeWebSearch: false` 表示不宣称 ai.feei 支持嵌入模型请求的 hosted search。搜索是否发生仍由 Codex 运行时、catalog 和用户搜索设置共同决定。为兼容 Codex 感知型中转，第三方 GPT Responses 请求只保留不含身份的客户端协商 Header；订阅凭证及账号/session/request/install 关联均留在本机。OpenAI 文档同样要求自定义 Provider、模型和运行时共同支持独立搜索：[Web search](https://learn.chatgpt.com/docs/web-search)。
+CLI 新建两款 target 时默认写入 `app.capabilityProfile: "standard-tools"`、`useResponsesLite: false` 与禁用的独立搜索；显式增加 `--app-profile lite-search` 才启用 Responses Lite 和选定的订阅/Provider 搜索。`capabilities.nativeWebSearch: false` 表示不宣称 ai.feei 支持嵌入模型请求的 hosted search。既有显式 Lite 配置不变。搜索是否发生仍由 Codex 运行时、catalog 和用户设置共同决定。为兼容 Codex 感知型中转，第三方 GPT Responses 请求只保留不含身份的客户端协商 Header；订阅凭证及账号/session/request/install 关联均留在本机。OpenAI 文档同样要求自定义 Provider、模型和运行时共同支持独立搜索：[Web search](https://learn.chatgpt.com/docs/web-search)。
+
+## 第三方 GPT App 能力画像
+
+| 画像 | 传输与工具面 | 独立搜索 |
+|---|---|---|
+| `standard-tools` | 标准 Responses；按策略保留核心工具、允许 Plugin 和用户 MCP | 不向 App 广告 |
+| `lite-search` | Responses Lite；诊断中明确标为缩减工具面 | 必须启用选定的订阅或 Provider 来源 |
+
+通过 `model add` 新建的 Responses target 会持久化 `standard-tools`，因此诊断原因是 `target-explicit`；没有显式 Lite 兼容信号的新验证 App-enabled GPT Responses target 同样默认使用 `standard-tools`，但原因是 `standard-default`。需要独立搜索时显式使用 `--app-profile lite-search`。既有 Responses target 的 `useResponsesLite: true` 保持传输行为且不自动改写持久化配置：搜索生效时解析为 `lite-search`；若明确禁用搜索，则保持未画像，原因是 `legacy-responses-lite-transport-only`，工具面为 `legacy-responses-lite`。显式选择 `lite-search` 却禁用搜索，或 `standard-tools` 启用搜索，仍会 fail closed。旧的非 Responses GPT target 保持原传输行为，并报告 `profile: null`、原因 `non-responses-unchanged`、工具面 `unchanged`，不会冒充任一已准出画像。`model list`、非 live `model probe`、`status`、`doctor` 的 JSON 与人类可读输出，以及自定义 catalog entry，都会输出最终画像、选择原因和工具面。官方订阅模型不参与这组画像拆分，继续透明转发。
+
+画像不会因上游失败、重试、重连或工具请求而切换。`standard-tools` 与启用的独立搜索、显式 `lite-search` 与禁用搜索或标准传输等冲突组合会直接校验失败。未画像的旧 Lite 纯传输是兼容状态，不是第三种已准出画像。
+
+`--no-app` 会保留 target 的路由能力，但将其显式标为 App-disabled，并清理 target 级画像、Responses Lite 与搜索状态。App-disabled target 不继承空间级 App 搜索默认；同一空间中其他 App-enabled target 继续使用该默认值。
 
 ## 独立搜索路由
 
-独立搜索与 `capabilities.nativeWebSearch` 分离。当前 Codex 通过 Responses Lite 的 `web.run` namespace 提供独立搜索，因此 App-enabled target 启用独立来源时会默认使用 Responses Lite；显式配置 `useResponsesLite: false` 会校验失败。官方模型固定使用官方订阅搜索；第三方 `modelFamily: "openai-gpt"` 默认使用用户自己的 Codex 订阅搜索。第一版因此仍要求有效的 Codex 官方登录。非 GPT 和旧 target 不会被自动切换到新策略。
+独立搜索与 `capabilities.nativeWebSearch` 分离。当前 Codex 通过 Responses Lite 的 `web.run` namespace 提供独立搜索；因此新建 `standard-tools` target 不广告搜索，显式 `lite-search` target 才启用选定来源。官方模型固定使用官方订阅搜索；既有 Responses target 的 `useResponsesLite: true` 或显式旧搜索策略推导出的 Lite 组合保持原有订阅搜索行为，没有这些兼容信号的未画像 App-enabled GPT Responses target 使用新的 Standard 默认值。Lite 订阅搜索仍要求有效的 Codex 官方登录；非 Responses、非 GPT 和其他旧 target 保持原行为。
 
-优先级为：官方模型、target 显式策略、旧 `app.supportsSearchTool` 显式值、第三方 GPT 空间默认、旧行为。可选来源只有 `subscription`、`provider`、`disabled`：
+优先级为：官方模型、target 显式策略、旧 `app.supportsSearchTool` 显式值、显式 App-disabled 截断、第三方 GPT 空间/缺省值、旧 `nativeWebSearch` 兼容层、其他旧行为。只有前两项 target 声明都不存在时才进入 App-disabled 截断，避免已隐藏 GPT 继承仅供 App 使用的搜索广告。可选来源只有 `subscription`、`provider`、`disabled`：
 
 ```json
 {
@@ -96,6 +116,8 @@ Provider 模式只接受显式声明：target 必须是 App-enabled Responses，
 
 `history.observationWaitMs` 可设置紧接着跨 Provider 切换时等待官方历史旁路提交的上限，默认 2,000 ms。普通官方响应不会等待观察解析或写盘完成才结束。
 
-`model list --json` 和非 live 的 `model probe --json` 会显示最终 Plugin/搜索策略、选择原因、是否向 App 广告、Provider endpoint 和凭证就绪状态。CLI 相关参数包括 `--model-family`、`--plugin-policy`、`--allowed-plugins`、`--search-source` 和兼容的 `--supports-search-tool`。只有搜索来源为 `disabled` 或不使用独立搜索时才能显式选择 `--no-responses-lite`。
+`model list --json` 和非 live 的 `model probe --json` 会显示最终 Plugin/搜索策略、App 能力画像、选择原因、工具面、是否向 App 广告、Provider endpoint 和凭证就绪状态；`status` 与 `doctor` 也输出画像摘要。CLI 相关参数包括 `--model-family`、`--plugin-policy`、`--allowed-plugins`、`--app-profile`、`--search-source` 和兼容旧参数。
+
+Provider 凭证不得依赖受管 LaunchAgent 继承 Shell 环境，应存入 Keychain。服务只保留代理变量及安装进程显式配置的 `NODE_EXTRA_CA_CERTS` 路径；这两者共同构成网络信任边界，不会连带复制 `NODE_OPTIONS` 或 Provider Key。
 
 英文完整配置参考见 [configuration.md](configuration.md)。

@@ -40,6 +40,15 @@ export async function discoverToolSources(options = {}) {
     "codex_document_control",
     "spreadsheets",
     "safety_settings",
+    // These App namespaces are shipped by known Codex Plugins and can be
+    // advertised by the App even when the isolated CODEX_HOME does not carry
+    // the corresponding cached manifest. Keep this list explicit: unknown
+    // mcp__codex_apps__ names still fail open with a diagnostic rather than
+    // being guessed from their prefix.
+    "gmail",
+    "plugin_management",
+    "deep_research_work",
+    "default_templates",
   ]);
   const pluginMcpServers = new Set();
   const pluginMcpOwners = new Map();

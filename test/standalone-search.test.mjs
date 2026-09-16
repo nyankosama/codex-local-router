@@ -56,9 +56,9 @@ test("standalone search policy preserves official priority and scopes GPT defaul
     advertised: true,
     providerEndpointConfigured: false,
   });
-  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.gpt).source, "subscription");
-  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.gpt).reason, "third-party-gpt-default");
-  assert.equal(config.targets.gpt.app.useResponsesLite, true);
+  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.gpt).source, "disabled");
+  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.gpt).reason, "target-explicit");
+  assert.equal(config.targets.gpt.app.useResponsesLite, undefined);
   assert.equal(resolveStandaloneSearchPolicy(config, config.targets.other).source, null);
   assert.equal(resolveStandaloneSearchPolicy(config, config.targets.other).advertised, false);
 });
@@ -88,15 +88,88 @@ test("target policy, legacy flags and space default follow the fixed precedence"
   const compatible = fixture();
   compatible.targets.gpt.app.supportsSearchTool = true;
   compatible.targets.gpt.standaloneSearch = { source: "subscription" };
-  assert.doesNotThrow(() => validate(compatible));
+  const compatibleConfig = validate(compatible);
+  assert.equal(
+    resolveStandaloneSearchPolicy(compatibleConfig, compatibleConfig.targets.gpt).reason,
+    "target-explicit",
+  );
   compatible.targets.gpt.standaloneSearch.source = "disabled";
   assert.throws(() => validate(compatible), /conflicting standalone search policy/);
 
   const incompatible = fixture();
   incompatible.targets.gpt.app.useResponsesLite = false;
+  incompatible.targets.gpt.standaloneSearch = { source: "subscription" };
   assert.throws(
     () => validate(incompatible),
     /standalone search requires Responses Lite/,
+  );
+});
+
+test("an App-disabled target does not inherit the space search default", () => {
+  const input = fixture();
+  input.providers.vendor.standaloneSearch = { endpoint: "alpha/search" };
+  input.standaloneSearch = { thirdPartyGpt: { defaultSource: "provider" } };
+  input.targets.hidden = {
+    ...structuredClone(input.targets.gpt),
+    model: "hidden-upstream",
+    capabilities: {
+      ...structuredClone(input.targets.gpt.capabilities),
+      nativeWebSearch: true,
+    },
+    app: { enabled: false, modelId: "hidden-gpt", useResponsesLite: false },
+  };
+  input.targets.gpt.app.useResponsesLite = true;
+
+  const config = validate(input);
+  const visible = resolveStandaloneSearchPolicy(config, config.targets.gpt);
+  const hidden = resolveStandaloneSearchPolicy(config, config.targets.hidden);
+  assert.equal(visible.source, "provider");
+  assert.equal(visible.advertised, true);
+  assert.equal(hidden.source, null);
+  assert.equal(hidden.advertised, false);
+  assert.equal(hidden.reason, "app-disabled");
+});
+
+test("App-disabled precedence and app-absent native compatibility stay explicit", () => {
+  const explicit = fixture();
+  explicit.standaloneSearch = { thirdPartyGpt: { defaultSource: "provider" } };
+  explicit.targets.gpt.app = { enabled: false, modelId: "hidden-gpt" };
+  explicit.targets.gpt.capabilities.nativeWebSearch = true;
+  explicit.targets.gpt.standaloneSearch = { source: "subscription" };
+  let config = validate(explicit);
+  assert.deepEqual(resolveStandaloneSearchPolicy(config, config.targets.gpt), {
+    source: "subscription",
+    reason: "target-explicit",
+    advertised: true,
+    providerEndpointConfigured: false,
+  });
+
+  const legacyAlias = fixture();
+  legacyAlias.standaloneSearch = { thirdPartyGpt: { defaultSource: "provider" } };
+  legacyAlias.targets.gpt.app = {
+    enabled: false,
+    modelId: "hidden-gpt",
+    supportsSearchTool: false,
+  };
+  legacyAlias.targets.gpt.capabilities.nativeWebSearch = true;
+  config = validate(legacyAlias);
+  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.gpt).source, "disabled");
+  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.gpt).reason, "legacy-app-support");
+
+  const appAbsent = fixture();
+  delete appAbsent.targets.gpt.app;
+  appAbsent.targets.gpt.capabilities.nativeWebSearch = true;
+  config = validate(appAbsent);
+  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.gpt).source, "subscription");
+  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.gpt).reason, "third-party-gpt-default");
+
+  const nonGptNative = fixture();
+  nonGptNative.targets.other.capabilities.nativeWebSearch = true;
+  config = validate(nonGptNative);
+  assert.equal(resolveStandaloneSearchPolicy(config, config.targets.other).source, "subscription");
+  assert.equal(
+    resolveStandaloneSearchPolicy(config, config.targets.other).reason,
+    "legacy-native-search-compatibility",
   );
 });
 

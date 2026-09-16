@@ -1,4 +1,5 @@
 import { resolveStandaloneSearchPolicy } from "./standalone-search.mjs";
+import { resolveAppCapabilityProfile } from "./app-capability-profile.mjs";
 
 const defaultReasoningLevels = ["low", "medium", "high", "xhigh"].map((effort) => ({
   effort,
@@ -42,6 +43,7 @@ function customModel(target, source, config) {
     1,
     ...source.models.map((model) => Number(model.priority ?? 1)),
   );
+  const capabilityProfile = resolveAppCapabilityProfile(config, target);
   return {
     slug: target.app.modelId,
     display_name: target.app.displayName ?? `${target.model} (custom)`,
@@ -76,6 +78,9 @@ function customModel(target, source, config) {
     input_modalities: target.inputModalities,
     supports_search_tool: resolveStandaloneSearchPolicy(config, target).advertised,
     use_responses_lite: target.app.useResponsesLite ?? false,
+    gateway_capability_profile: capabilityProfile.profile,
+    gateway_capability_profile_reason: capabilityProfile.reason,
+    gateway_tool_surface: capabilityProfile.toolSurface,
   };
 }
 

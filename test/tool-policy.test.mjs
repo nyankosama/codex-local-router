@@ -122,6 +122,7 @@ test("A2 identifies core, user MCP, plugin, alias, unknown and collision sources
     "user-mcp",
   );
   assert.equal(classifyTool({ name: "mcp__unregistered__read" }, registry).kind, "unknown");
+  assert.equal(classifyTool({ name: "mcp__codex_apps__hotline" }, registry).kind, "unknown");
   assert.equal(classifyTool({ name: "mcp__collision__read" }, registry).kind, "collision");
   assert.equal(
     classifyTool(
@@ -129,6 +130,35 @@ test("A2 identifies core, user MCP, plugin, alias, unknown and collision sources
       { ...registry, userMcpServers: new Set([...registry.userMcpServers, "codex_apps"]) },
     ).kind,
     "collision",
+  );
+});
+
+test("A2 identifies current Codex namespace carriers for Plugin and user MCP sources", () => {
+  const registry = {
+    pluginApps: new Set(),
+    pluginMcpServers: new Set(["acceptance_github", "acceptance_gmail"]),
+    pluginMcpOwners: new Map([
+      ["acceptance_github", "github"],
+      ["acceptance_gmail", "gmail"],
+    ]),
+    userMcpServers: new Set(["router_acceptance"]),
+    coreNamespaces: new Set(),
+  };
+  assert.deepEqual(
+    classifyTool({ type: "namespace", name: "mcp__acceptance_github", tools: [] }, registry),
+    { kind: "plugin", name: "mcp__acceptance_github", source: "acceptance_github", plugin: "github" },
+  );
+  assert.deepEqual(
+    classifyTool({ type: "namespace", name: "mcp__acceptance_gmail", tools: [] }, registry),
+    { kind: "plugin", name: "mcp__acceptance_gmail", source: "acceptance_gmail", plugin: "gmail" },
+  );
+  assert.deepEqual(
+    classifyTool({ type: "namespace", name: "mcp__router_acceptance", tools: [] }, registry),
+    { kind: "user-mcp", name: "mcp__router_acceptance", source: "router_acceptance" },
+  );
+  assert.equal(
+    classifyTool({ type: "function_call", namespace: "mcp__acceptance_gmail", name: "read" }, registry).plugin,
+    "gmail",
   );
 });
 
@@ -246,6 +276,8 @@ test("A2 discovers enabled Plugin manifests and user MCP config without executin
   const found = await discoverToolSources({ codexHome: root });
   assert.equal(found.status, "loaded");
   assert.equal(found.pluginApps.has("fixture_app"), true);
+  assert.equal(found.pluginApps.has("plugin_management"), true);
+  assert.equal(found.pluginApps.has("gmail"), true);
   assert.equal(found.pluginMcpServers.has("fixture_plugin_mcp"), true);
   assert.equal(found.userMcpServers.has("user_tools"), true);
 });

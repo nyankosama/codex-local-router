@@ -84,12 +84,15 @@ test("ai.feei presets use distinct App IDs, conservative windows and standalone 
     assert.equal(target.capabilities.nativeWebSearch, false);
     assert.equal(target.app.supportsSearchTool, undefined);
     assert.equal(target.app.useResponsesLite, true);
+    assert.equal(target.app.capabilityProfile, undefined);
   }
   const catalog = buildModelCatalog({
     models: [{ slug: "gpt-official", priority: 10 }],
   }, normalized);
   assert.equal(catalog.models[1].supports_search_tool, true);
   assert.equal(catalog.models[1].use_responses_lite, true);
+  assert.equal(catalog.models[1].gateway_capability_profile, "lite-search");
+  assert.equal(catalog.models[1].gateway_tool_surface, "reduced-responses-lite");
   assert.equal(catalog.models[1].description.includes("ai.feei"), true);
 });
 
@@ -199,6 +202,8 @@ test("LaunchAgent uses installed paths, user-level logs and safe network setting
     env: {
       https_proxy: "http://127.0.0.1:7897/?a=1&b=2",
       wss_proxy: "socks5://127.0.0.1:7898",
+      NODE_EXTRA_CA_CERTS: "/data/Proxy CA & trust.pem",
+      NODE_OPTIONS: "--tls-keylog=/private/keylog",
       API_KEY: "secret",
     },
   });
@@ -207,10 +212,15 @@ test("LaunchAgent uses installed paths, user-level logs and safe network setting
   assert.match(plist, /Ring &amp; log/);
   assert.match(plist, /<key>https_proxy<\/key><string>http:\/\/127\.0\.0\.1:7897\/\?a=1&amp;b=2<\/string>/);
   assert.match(plist, /<key>wss_proxy<\/key><string>socks5:\/\/127\.0\.0\.1:7898<\/string>/);
-  assert.doesNotMatch(plist, /API_KEY|secret/);
+  assert.match(plist, /<key>NODE_EXTRA_CA_CERTS<\/key><string>\/data\/Proxy CA &amp; trust\.pem<\/string>/);
+  assert.doesNotMatch(plist, /NODE_OPTIONS|tls-keylog|API_KEY|secret/);
 });
 
 test("space switcher is a one-shot LaunchAgent and never copies provider secrets", () => {
+  const proxyVariables = Object.fromEntries([
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "WS_PROXY", "WSS_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy", "ws_proxy", "wss_proxy",
+  ].map((key) => [key, `http://proxy.invalid/${key}`]));
   const plist = renderSpaceSwitcherLaunchAgent({
     node: "/node",
     admin: "/pkg/gateway-admin.mjs",
@@ -218,13 +228,79 @@ test("space switcher is a one-shot LaunchAgent and never copies provider secrets
     env: {
       CODEX_HOME: "/isolated/codex",
       CODEX_LOCAL_ROUTER_HOME: "/isolated/router",
+      ...proxyVariables,
+      HTTPS_PROXY: "http://127.0.0.1:7897/?a=1&b=2",
+      WSS_PROXY: "socks5://127.0.0.1:7898",
+      no_proxy: "localhost,127.0.0.1",
+      NODE_EXTRA_CA_CERTS: "/data/router-ca.pem",
+      NODE_OPTIONS: "--tls-keylog=/private/keylog",
       FEEI_API_KEY: "secret",
     },
   });
   assert.match(plist, /com\.nyankosama\.codex-local-router\.space-switcher/);
   assert.match(plist, /<string>space<\/string><string>resume<\/string><string>--coordinator<\/string>/);
   assert.match(plist, /<key>KeepAlive<\/key><false\/>/);
-  assert.doesNotMatch(plist, /launchctl submit|FEEI_API_KEY|secret/);
+  for (const key of Object.keys(proxyVariables))
+    assert.match(plist, new RegExp(`<key>${key}</key>`));
+  assert.match(plist, /<key>HTTPS_PROXY<\/key><string>http:\/\/127\.0\.0\.1:7897\/\?a=1&amp;b=2<\/string>/);
+  assert.match(plist, /<key>WSS_PROXY<\/key><string>socks5:\/\/127\.0\.0\.1:7898<\/string>/);
+  assert.match(plist, /<key>no_proxy<\/key><string>localhost,127\.0\.0\.1<\/string>/);
+  assert.match(plist, /<key>NODE_EXTRA_CA_CERTS<\/key><string>\/data\/router-ca\.pem<\/string>/);
+  assert.doesNotMatch(plist, /launchctl submit|NODE_OPTIONS|tls-keylog|FEEI_API_KEY|secret/);
+});
+
+test("pending coordinator preserves its complete network boundary in the final Router LaunchAgent", () => {
+  const network = {
+    HTTP_PROXY: "http://upper-http.invalid",
+    HTTPS_PROXY: "http://upper-https.invalid",
+    ALL_PROXY: "socks5://upper-all.invalid",
+    NO_PROXY: "localhost,127.0.0.1",
+    WS_PROXY: "http://upper-ws.invalid",
+    WSS_PROXY: "http://upper-wss.invalid",
+    http_proxy: "http://lower-http.invalid",
+    https_proxy: "http://lower-https.invalid",
+    all_proxy: "socks5://lower-all.invalid",
+    no_proxy: "::1",
+    ws_proxy: "http://lower-ws.invalid",
+    wss_proxy: "http://lower-wss.invalid",
+    NODE_EXTRA_CA_CERTS: "/data/proxy-ca.pem",
+  };
+  const switcher = renderSpaceSwitcherLaunchAgent({
+    node: "/node",
+    admin: "/pkg/gateway-admin.mjs",
+    log: "/data/switcher.log",
+    env: {
+      CODEX_LOCAL_ROUTER_HOME: "/isolated/router",
+      ...network,
+      NODE_OPTIONS: "--tls-keylog=/private/keylog",
+      PROVIDER_API_KEY: "secret",
+    },
+  });
+  const environmentBlock = switcher.match(
+    /<key>EnvironmentVariables<\/key><dict>\n([\s\S]*?)\n  <\/dict>/,
+  )?.[1];
+  assert.ok(environmentBlock);
+  const decode = (value) => value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&gt;", ">")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&amp;", "&");
+  const coordinatorEnv = Object.fromEntries(
+    [...environmentBlock.matchAll(/<key>([^<]+)<\/key><string>([^<]*)<\/string>/g)]
+      .map(([, key, value]) => [decode(key), decode(value)]),
+  );
+  const router = renderLaunchAgent({
+    node: "/node",
+    server: "/pkg/server.mjs",
+    config: "/data/config.json",
+    log: "/data/router.log",
+    env: coordinatorEnv,
+  });
+  for (const [key, value] of Object.entries(network)) {
+    assert.equal(coordinatorEnv[key], value);
+    assert.match(router, new RegExp(`<key>${key}</key>`));
+  }
+  assert.doesNotMatch(switcher + router, /NODE_OPTIONS|tls-keylog|PROVIDER_API_KEY|secret/);
 });
 
 test("reinstalling an unchanged space switcher never terminates a running coordinator", async (t) => {

@@ -13,6 +13,12 @@ const exec = promisify(execFile);
 export const SERVICE_LABEL = "com.nyankosama.codex-local-router";
 export const SPACE_SWITCHER_LABEL = "com.nyankosama.codex-local-router.space-switcher";
 
+const NETWORK_BOUNDARY_ENV_KEYS = [
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "WS_PROXY", "WSS_PROXY",
+  "http_proxy", "https_proxy", "all_proxy", "no_proxy", "ws_proxy", "wss_proxy",
+  "NODE_EXTRA_CA_CERTS",
+];
+
 const xml = (value) => String(value)
   .replaceAll("&", "&amp;")
   .replaceAll("<", "&lt;")
@@ -38,10 +44,8 @@ export function renderLaunchAgent({
   env = {},
 }) {
   const variables = { GATEWAY_CONFIG: config, GATEWAY_STATE_PATH: state };
-  for (const key of [
-    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "WS_PROXY", "WSS_PROXY",
-    "http_proxy", "https_proxy", "all_proxy", "no_proxy", "ws_proxy", "wss_proxy",
-  ]) if (env[key]) variables[key] = env[key];
+  for (const key of NETWORK_BOUNDARY_ENV_KEYS)
+    if (env[key]) variables[key] = env[key];
   const environment = Object.entries(variables)
     .map(([key, value]) => `    <key>${key}</key><string>${xml(value)}</string>`)
     .join("\n");
@@ -81,6 +85,7 @@ export function renderSpaceSwitcherLaunchAgent({
     "CODEX_LOCAL_ROUTER_LAUNCH_AGENT",
     "CODEX_LOCAL_ROUTER_SPACE_SWITCHER_LAUNCH_AGENT",
     "CODEX_APP_EXECUTABLE",
+    ...NETWORK_BOUNDARY_ENV_KEYS,
   ]) if (env[key]) variables[key] = env[key];
   const environment = Object.entries(variables)
     .map(([key, value]) => `    <key>${key}</key><string>${xml(value)}</string>`)

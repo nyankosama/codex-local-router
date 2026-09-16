@@ -13,10 +13,13 @@ import {
   runCliExec,
   startAppServer,
   startIsolatedGateway,
+  verifyAcceptanceRevision,
   writeCatalog,
+  writeImmutableJson,
 } from "./lib/harness.mjs";
 import { solidPng } from "./lib/png.mjs";
 import { FocusedAcceptanceBudget } from "./lib/focused-budget.mjs";
+import { summarizeFocusedProfiles } from "./lib/focused-profile-summary.mjs";
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(`--${name}`);
@@ -40,6 +43,10 @@ if (!toolShapeOnly && !process.env.FEEI_API_KEY)
   throw Error("FEEI_API_KEY is required in the environment");
 
 const budget = new FocusedAcceptanceBudget();
+const implementation = await verifyAcceptanceRevision(
+  projectRoot,
+  process.env.ACCEPTANCE_COMMIT,
+);
 
 const root = await mkdtemp(join(tmpdir(), "codex-router-focused-"));
 const codexHome = join(root, "codex-home");
@@ -64,6 +71,43 @@ function cliText(run) {
     .filter((row) => row.type === "item.completed" && row.item?.type === "agent_message")
     .map((row) => row.item.text ?? "")
     .join("\n");
+}
+
+function classifyCliFailure(run) {
+  const text = `${run.stderr ?? ""}\n${run.stdout ?? ""}`;
+  const category = /image|vision|multimodal/i.test(text)
+    ? "image_or_multimodal"
+    : /401|403|unauthori[sz]ed|forbidden|api.?key|credential/i.test(text)
+      ? "authentication_or_credential"
+      : /400|unsupported|invalid.?request|bad.?request/i.test(text)
+        ? "request_or_capability"
+        : /timeout|timed.?out|deadline/i.test(text)
+          ? "timeout"
+          : run.code === 0 ? null : "unclassified_process_failure";
+  return {
+    exit: run.code,
+    category,
+    stdoutBytes: Buffer.byteLength(run.stdout ?? ""),
+    stderrBytes: Buffer.byteLength(run.stderr ?? ""),
+    rowTypes: [...new Set(run.rows.map((row) => row.type).filter(Boolean))],
+    errorTypes: [...new Set(run.rows.flatMap((row) => [
+      row.error?.type, row.error?.code, row.error?.status,
+      row.item?.status === "failed" ? row.item?.type : null,
+    ]).filter((value) => value != null).map(String))],
+  };
+}
+
+function gatewayDiagnostics(gateway, outboundStart, logStart) {
+  const outbound = gateway.outbound.slice(outboundStart);
+  const logs = gateway.logs.slice(logStart);
+  return {
+    outboundCount: outbound.length,
+    outboundPaths: [...new Set(outbound.map((event) => event.path))],
+    logEvents: [...new Set(logs.map((event) => event.event).filter(Boolean))],
+    errorCategories: [...new Set(logs.map((event) =>
+      event.transport_category ?? event.category ?? event.type,
+    ).filter((value) => value && ["provider_error", "upstream_transport_error", "request_error", "ws_error"].includes(value)))],
+  };
 }
 
 function appExtra() {
@@ -95,8 +139,34 @@ function feeiMutation(config) {
     apiKeyEnv: "FEEI_API_KEY",
     concurrency: 2,
   };
-  config.targets["feei-sol"] = { provider: "feei", preset: "feei/gpt-5.6-sol" };
-  config.targets["feei-astra"] = { provider: "feei", preset: "feei/gpt-6-astra" };
+  // Keep the production App-enabled target metadata (modalities, reasoning
+  // levels, search advertisement and policy fields).  Only redirect the
+  // provider/preset for this isolated run; replacing the object would test a
+  // CLI-only target and make App evidence meaningless.
+  config.targets["feei-sol"] = {
+    ...(config.targets["feei-sol"] ?? {}),
+    provider: "feei",
+    preset: "feei/gpt-5.6-sol",
+    app: {
+      ...(config.targets["feei-sol"]?.app ?? {}),
+      enabled: true,
+      capabilityProfile: "lite-search",
+      useResponsesLite: true,
+    },
+    standaloneSearch: { source: "subscription" },
+  };
+  config.targets["feei-astra"] = {
+    ...(config.targets["feei-astra"] ?? {}),
+    provider: "feei",
+    preset: "feei/gpt-6-astra",
+    app: {
+      ...(config.targets["feei-astra"]?.app ?? {}),
+      enabled: true,
+      capabilityProfile: "lite-search",
+      useResponsesLite: true,
+    },
+    standaloneSearch: { source: "subscription" },
+  };
 }
 
 async function preparePlugin() {
@@ -162,9 +232,10 @@ async function captureCurrentToolShape() {
           enabled: true,
           modelId: "shape-gpt",
           displayName: "Shape Fixture",
-          supportsSearchTool: false,
+          capabilityProfile: "standard-tools",
           useResponsesLite: false,
         },
+        standaloneSearch: { source: "disabled" },
       };
     },
   });
@@ -207,6 +278,9 @@ async function captureCurrentToolShape() {
     const passed = turn.status === "completed" && allowedPlugin && userMcp && forbiddenRemoved;
     return {
       passed,
+      profile: "standard-tools",
+      evidenceLevel: "definition-preflight-only",
+      callResultClosure: false,
       client: core.version,
       carrierPayloads: shapeGateway.payloads.length,
       forwardedToolCount: tools.size,
@@ -236,7 +310,10 @@ async function cliCase(name, model, prompt, image, options = {}) {
       args: [
         "--ephemeral", "--skip-git-repo-check", "-C", work, "-s", "read-only",
         "-c", 'approval_policy="never"', "-m", model,
-        ...(image ? ["-i", image] : []),
+        // Codex's --image accepts a variadic list.  Terminate that list before
+        // the positional prompt, otherwise the prompt is consumed as another
+        // image path and the CLI exits before contacting the Gateway.
+        ...(image ? ["-i", image, "--"] : []),
       ],
       timeoutMs: 300000,
       signal: controller.signal,
@@ -264,10 +341,8 @@ async function appCase(name, model) {
       model,
       [
         "This is a controlled read-only acceptance turn using synthetic/public data only.",
-        "You must call the router_acceptance read_marker MCP tool and include its returned marker verbatim.",
-        "You must use the GitHub Plugin read-only on the public nyankosama/codex-local-router repository.",
         "You must use standalone web search for the public OpenAI Codex web-search documentation and mention a source host.",
-        "Do not use shell, files, private repositories, messages, or write actions.",
+        "End with LITE_SEARCH_OK. Do not use shell, files, Plugins, MCP, private repositories, messages, or write actions.",
       ].join(" "),
       { timeoutMs: 360000 },
     );
@@ -337,6 +412,8 @@ try {
     ["feei-sol-cli", "feei-gpt-5.6-sol", "FEEI_SOL_OK"],
     ["feei-astra-cli", "feei-gpt-6-astra", "FEEI_ASTRA_OK"],
   ]) {
+    const beforeOutbound = gateway.outbound.length;
+    const beforeLogs = gateway.logs.length;
     const checked = await cliCase(
       name,
       model,
@@ -346,6 +423,8 @@ try {
     result(name, checked.run.code === 0 && /red/i.test(checked.text) && checked.text.includes(markerText), {
       cliExit: checked.run.code,
       imageRecognized: /red/i.test(checked.text),
+      cliDiagnostics: classifyCliFailure(checked.run),
+      gatewayDiagnostics: gatewayDiagnostics(gateway, beforeOutbound, beforeLogs),
     });
     if (budget.generations >= budget.maxGenerations)
       throw Object.assign(Error("generation_budget_exhausted"), { code: "generation_budget_exhausted" });
@@ -363,7 +442,10 @@ try {
     const turn = await appCase(name, model);
     const payloads = gateway.payloads.slice(beforePayloads);
     const logs = gateway.logs.slice(beforeLogs);
-    const toolNames = new Set(payloads.flatMap((payload) => payload.tools ?? []));
+    const toolNames = new Set(payloads.flatMap((payload) => [
+      ...(payload.tools ?? []),
+      ...(payload.additionalToolSurface?.names ?? []),
+    ]));
     const filtered = logs.filter((event) => event.event === "plugin_tools_filtered");
     const calls = turn.items.filter((item) => ["mcpToolCall", "dynamicToolCall"].includes(item.type));
     const searches = gateway.outbound
@@ -374,27 +456,44 @@ try {
     const forbiddenAbsent = [...toolNames].every((tool) =>
       !["gmail", "safety_settings", "plugin_management", "alpaca"].some((name) => tool.includes(name)),
     );
+    const standaloneCarrierPresent = payloads.some(
+      (payload) => payload.additionalToolSurface?.hasWebRun,
+    );
     result(name, [
       turn.status === "completed",
-      turn.text.includes(marker),
-      calls.length >= 2,
-      allowedPluginPresent,
-      userMcpPresent,
-      forbiddenAbsent,
-      filtered.some((event) => event.removed_count > 0),
+      turn.text.includes("LITE_SEARCH_OK"),
+      standaloneCarrierPresent,
       searches.length > 0 && searches.every(
         (event) => event.official && event.status >= 200 && event.status < 300,
       ),
     ].every(Boolean), {
+      capabilityProfile: "lite-search",
+      toolSurface: "reduced-responses-lite",
+      fullToolCompatibilityClaimed: false,
       status: turn.status,
-      mcpMarkerReturned: turn.text.includes(marker),
+      completionMarker: turn.text.includes("LITE_SEARCH_OK"),
       completedToolCalls: calls.length,
       allowedPluginPresent,
       userMcpPresent,
+      forbiddenPluginAbsent: forbiddenAbsent,
       forbiddenPluginObservedBeforeAndRemoved: filtered.some((event) => event.removed_count > 0) && forbiddenAbsent,
+      standaloneCarrierPresent,
       standaloneSearchCompleted: searches.some(
         (event) => event.official && event.status >= 200 && event.status < 300,
       ),
+      itemTypes: turn.itemTypes,
+      itemMethods: turn.itemMethods,
+      turnFailure: turn.turnFailure,
+      payloadCount: payloads.length,
+      payloadToolCount: payloads.reduce((sum, payload) =>
+        sum + (payload.tools?.length ?? 0) + (payload.additionalToolSurface?.definitions ?? 0), 0),
+      payloadToolNames: [...new Set(payloads.flatMap((payload) => [
+        ...(payload.tools ?? []),
+        ...(payload.additionalToolSurface?.names ?? []),
+      ]))],
+      additionalToolCarriers: payloads.reduce((sum, payload) =>
+        sum + (payload.additionalToolSurface?.carriers ?? 0), 0),
+      gatewayDiagnostics: gatewayDiagnostics(gateway, beforeOutbound, beforeLogs),
     });
     if (budget.generations >= budget.maxGenerations && name !== "feei-astra-app")
       throw Object.assign(Error("generation_budget_exhausted"), { code: "generation_budget_exhausted" });
@@ -407,6 +506,9 @@ try {
   const summary = {
     runId,
     verdict: cases.length === 5 && cases.every((entry) => entry.passed) ? "PASS" : "FAIL",
+    scope: "five-turn-routing-and-channel-canary",
+    capabilityProfileQualification: "not-established-by-this-harness",
+    implementation,
     harness: typeof core === "object" ? {
       source: core.source,
       version: core.version,
@@ -421,12 +523,12 @@ try {
         (event) => !event.official && (event.subscriptionBearer || event.accountHeader),
       ),
     } : null,
+    capabilityProfiles: summarizeFocusedProfiles(toolShape, cases),
     cases,
     harnessError: harnessError ?? null,
     appUi: "not-tested",
   };
-  await mkdir(dirname(output), { recursive: true, mode: 0o700 });
-  await writeFile(output, `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
+  await writeImmutableJson(output, summary);
   await rm(root, { recursive: true, force: true });
   console.log(JSON.stringify({ event: "focused_summary", verdict: summary.verdict, turns: budget.turns, generations: budget.generations }));
   process.exitCode = summary.verdict === "PASS" ? 0 : 1;

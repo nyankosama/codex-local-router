@@ -41,6 +41,11 @@ import {
   resolveStandaloneSearchPolicy,
   validateStandaloneSearchSource,
 } from "../src/standalone-search.mjs";
+import {
+  resolveAppCapabilityProfile,
+  validateAppCapabilityProfile,
+} from "../src/app-capability-profile.mjs";
+import { preset as loadPreset } from "../src/presets.mjs";
 import { discoverToolSources } from "../src/tool-sources.mjs";
 import {
   DEFAULT_SPACE,
@@ -124,6 +129,46 @@ function requestedSearchSource() {
   if (legacyEnabled) return "subscription";
   if (legacyDisabled) return "disabled";
   return undefined;
+}
+
+function requestedAppProfile() {
+  const profile = value("app-profile");
+  if (profile == null) return undefined;
+  try {
+    return validateAppCapabilityProfile(profile, "--app-profile");
+  } catch {
+    throw Object.assign(
+      Error("--app-profile must be standard-tools or lite-search"),
+      { code: "usage_error" },
+    );
+  }
+}
+
+function requestedResponsesLite() {
+  if (flag("responses-lite") && flag("no-responses-lite"))
+    throw Object.assign(Error("Responses Lite flags conflict"), {
+      code: "usage_error",
+    });
+  if (flag("responses-lite")) return true;
+  if (flag("no-responses-lite")) return false;
+  return undefined;
+}
+
+function capabilityProfileSummaries(config) {
+  return Object.values(config.targets).map((target) => ({
+    target: target.id,
+    ...resolveAppCapabilityProfile(config, target),
+  }));
+}
+
+function humanCapabilityProfile(profile) {
+  return `${profile?.profile ?? "unchanged"} (${profile?.reason ?? "unknown"}; ${profile?.toolSurface ?? "unchanged"})`;
+}
+
+function humanCapabilityProfileLines(profiles) {
+  return (profiles ?? [])
+    .map((profile) => `${profile.target}=${humanCapabilityProfile(profile)}`)
+    .join(", ");
 }
 
 function searchSummaries(config, credentials) {
@@ -564,6 +609,9 @@ async function modelCommand() {
     const searches = new Map(
       searchSummaries(config, credentials).map((search) => [search.target, search]),
     );
+    const profiles = new Map(
+      capabilityProfileSummaries(config).map((profile) => [profile.target, profile]),
+    );
     return emit(Object.values(config.targets).map((target) => ({
       id: target.id, provider: target.provider, model: target.model,
       protocol: target.wireApi, contextWindow: target.contextWindow,
@@ -573,7 +621,11 @@ async function modelCommand() {
       pluginToolPolicy: resolvePluginToolPolicy(config, target),
       toolSourceRecognition: toolSourceStatus(registry),
       standaloneSearch: searches.get(target.id),
-    })), (rows) => rows.map((row) => `${row.id}\t${row.provider}\t${row.model}\t${row.contextWindow}`).join("\n"));
+      appCapabilityProfile: profiles.get(target.id),
+    })), (rows) => rows.map((row) =>
+      `${row.id}\t${row.provider}\t${row.model}\t${row.contextWindow}` +
+      `\tprofile=${humanCapabilityProfile(row.appCapabilityProfile)}`,
+    ).join("\n"));
   }
   if (command === "probe") {
     if (!id) throw Object.assign(Error("model probe requires --id"), { code: "usage_error" });
@@ -591,9 +643,17 @@ async function modelCommand() {
       toolSourceRecognition: toolSourceStatus(registry),
       standaloneSearch: searchSummaries(config, credentials)
         .find((search) => search.target === id),
+      appCapabilityProfile: capabilityProfileSummaries(config)
+        .find((profile) => profile.target === id),
       live: false,
     };
-    if (!flag("live")) return emit(configured, () => `Model ${id} configuration is valid. Use --live to spend model quota on an end-to-end probe.`);
+    if (!flag("live")) return emit(configured, (row) =>
+      `Model ${id} configuration is valid. ` +
+      `Profile: ${humanCapabilityProfile(row.appCapabilityProfile)}. ` +
+      `Standalone search: ${row.standaloneSearch.source ?? "unchanged"} ` +
+      `(${row.standaloneSearch.reason}; ${row.standaloneSearch.advertised ? "advertised" : "not advertised"}). ` +
+      `Use --live to spend model quota on an end-to-end probe.`,
+    );
     const { auth } = await loadCodexAuth();
     const model = target.app?.modelId;
     if (!model) throw Object.assign(Error("live probe requires an App-enabled model"), { code: "model_probe_unavailable" });
@@ -610,6 +670,15 @@ async function modelCommand() {
   }
   if (!["add", "edit", "remove"].includes(command) || !id)
     throw Object.assign(Error("model add|edit|remove requires --id"), { code: "usage_error" });
+  const requestedProfile = requestedAppProfile();
+  const requestedLite = requestedResponsesLite();
+  if (
+    flag("no-app") &&
+    (requestedProfile != null || requestedLite != null || requestedSearchSource() != null)
+  )
+    throw Object.assign(Error("App profile or search flags cannot be combined with --no-app"), {
+      code: "usage_error",
+    });
   await mutateConfig((config) => {
     config.targets ??= {};
     if (command === "add" && config.targets[id]) throw Object.assign(Error(`model already exists: ${id}`), { code: "model_exists" });
@@ -622,22 +691,85 @@ async function modelCommand() {
     }
     const current = config.targets[id] ?? {};
     const searchSource = requestedSearchSource();
+    const presetId = value("preset");
+    const presetTarget = presetId ? loadPreset(presetId).target : null;
+    const modelFamily = value("model-family") ?? current.modelFamily ?? presetTarget?.modelFamily;
+    const wireApi = value("protocol") ?? current.wireApi ?? presetTarget?.wireApi ?? "responses";
+    const appEnabled = !flag("no-app") &&
+      (current.app?.enabled === true || presetTarget?.app?.enabled === true || command === "add");
+    let profile = requestedProfile;
+    if (
+      modelFamily === "openai-gpt" &&
+      appEnabled &&
+      wireApi === "responses" &&
+      profile == null
+    ) {
+      if (["subscription", "provider"].includes(searchSource) || requestedLite === true)
+        profile = "lite-search";
+      else if (searchSource === "disabled" || requestedLite === false || command === "add")
+        profile = "standard-tools";
+    }
+    if (
+      (profile === "standard-tools" && requestedLite === true) ||
+      (profile === "lite-search" && requestedLite === false) ||
+      (profile === "standard-tools" && ["subscription", "provider"].includes(searchSource)) ||
+      (profile === "lite-search" && searchSource === "disabled")
+    )
+      throw Object.assign(Error("App capability profile conflicts with search or Responses Lite flags"), {
+        code: "usage_error",
+      });
+    const clearStandaloneSearch = flag("no-app") || (
+      profile === "lite-search" &&
+      searchSource == null &&
+      !["subscription", "provider"].includes(current.standaloneSearch?.source)
+    );
+    const profileSearchSource = profile === "standard-tools"
+      ? "disabled"
+      : profile === "lite-search"
+        ? (["subscription", "provider"].includes(searchSource)
+            ? searchSource
+            : ["subscription", "provider"].includes(current.standaloneSearch?.source)
+              ? current.standaloneSearch.source
+              : undefined)
+        : searchSource;
     if (value("preset")) {
-      config.targets[id] = { ...current, provider: value("provider") ?? current.provider, preset: value("preset") };
-      if (searchSource != null) {
-        config.targets[id].standaloneSearch = { source: searchSource };
-        if (config.targets[id].app) delete config.targets[id].app.supportsSearchTool;
+      config.targets[id] = { ...current, provider: value("provider") ?? current.provider, preset: presetId };
+      if (flag("no-app")) {
+        config.targets[id].app = {
+          ...(current.app ?? {}),
+          enabled: false,
+          useResponsesLite: false,
+        };
+        delete config.targets[id].app.capabilityProfile;
+        delete config.targets[id].app.supportsSearchTool;
+      } else if (profile != null) {
+        config.targets[id].app = {
+          ...(current.app ?? {}),
+          capabilityProfile: profile,
+          useResponsesLite: profile === "lite-search",
+        };
+      } else if (requestedLite != null) {
+        config.targets[id].app = {
+          ...(current.app ?? {}),
+          useResponsesLite: requestedLite,
+        };
+      }
+      if (profileSearchSource != null) {
+        config.targets[id].standaloneSearch = { source: profileSearchSource };
+        if (config.targets[id].app)
+          delete config.targets[id].app.supportsSearchTool;
+      } else if (clearStandaloneSearch) {
+        delete config.targets[id].standaloneSearch;
+        if (config.targets[id].app)
+          delete config.targets[id].app.supportsSearchTool;
       }
       return;
     }
-    const modelFamily = value("model-family") ?? current.modelFamily;
-    const impliedSearchSource = searchSource ?? current.standaloneSearch?.source ??
-      (modelFamily === "openai-gpt" ? "subscription" : null);
     const next = {
       ...current,
       provider: value("provider") ?? current.provider,
       model: value("upstream-model") ?? current.model,
-      wireApi: value("protocol") ?? current.wireApi ?? "responses",
+      wireApi,
       contextWindow: Number(value("context-window") ?? current.contextWindow),
       maxContextWindow: Number(value("max-context-window") ?? value("context-window") ?? current.maxContextWindow ?? current.contextWindow),
       inputModalities: (value("input-modalities") ?? current.inputModalities?.join(",") ?? "text").split(","),
@@ -646,28 +778,39 @@ async function modelCommand() {
       pluginToolPolicy: requestedPluginPolicy(current.pluginToolPolicy),
       capabilities: {
         ...current.capabilities,
-        responses: (value("protocol") ?? current.wireApi) === "responses",
+        responses: wireApi === "responses",
         streaming: !flag("no-streaming"),
         toolCalling: !flag("no-tools"),
         freeformTools: flag("freeform-tools") || current.capabilities?.freeformTools === true,
         nativeWebSearch: flag("native-search") || current.capabilities?.nativeWebSearch === true,
       },
-      app: flag("no-app") ? undefined : {
-        ...current.app,
-        enabled: true,
-        modelId: value("app-model") ?? current.app?.modelId ?? value("upstream-model"),
-        displayName: value("display-name") ?? current.app?.displayName,
-        reasoningLevels: (value("reasoning-levels") ?? current.app?.reasoningLevels?.join(",") ?? "low,medium,high,xhigh").split(","),
-        useResponsesLite: flag("responses-lite")
-          ? true
-          : flag("no-responses-lite")
-            ? false
-            : (current.app?.useResponsesLite ??
-              (["subscription", "provider"].includes(impliedSearchSource))),
-      },
+      app: flag("no-app")
+        ? {
+            ...(current.app ?? {}),
+            enabled: false,
+            useResponsesLite: false,
+          }
+        : {
+            ...current.app,
+            enabled: true,
+            modelId: value("app-model") ?? current.app?.modelId ?? value("upstream-model"),
+            displayName: value("display-name") ?? current.app?.displayName,
+            reasoningLevels: (value("reasoning-levels") ?? current.app?.reasoningLevels?.join(",") ?? "low,medium,high,xhigh").split(","),
+            useResponsesLite: profile != null
+              ? profile === "lite-search"
+              : requestedLite ?? current.app?.useResponsesLite,
+            ...(profile != null ? { capabilityProfile: profile } : {}),
+          },
     };
-    if (searchSource != null) {
-      next.standaloneSearch = { source: searchSource };
+    if (flag("no-app")) {
+      delete next.app.capabilityProfile;
+      delete next.app.supportsSearchTool;
+    }
+    if (profileSearchSource != null) {
+      next.standaloneSearch = { source: profileSearchSource };
+      if (next.app) delete next.app.supportsSearchTool;
+    } else if (clearStandaloneSearch) {
+      delete next.standaloneSearch;
       if (next.app) delete next.app.supportsSearchTool;
     }
     config.targets[id] = next;
@@ -1024,12 +1167,16 @@ async function doctor() {
     configurationSpace: await configurationSpaceStatus({ env, configPath }),
     credentials,
     standaloneSearch: config ? searchSummaries(config, credentials) : [],
+    appCapabilityProfiles: config ? capabilityProfileSummaries(config) : [],
     warnings,
     issues,
     liveModelCalls: 0,
   };
   const ok = discovery.configExists && !!config && issues.length === 0;
-  emit({ ok, ...checks }, (x) => `Doctor: ${x.ok ? "OK" : `${x.issues.length} issue(s) found`}${x.warnings.length ? `, ${x.warnings.length} warning(s)` : ""}. No model calls were made.`);
+  emit({ ok, ...checks }, (x) =>
+    `Doctor: ${x.ok ? "OK" : `${x.issues.length} issue(s) found`}${x.warnings.length ? `, ${x.warnings.length} warning(s)` : ""}. No model calls were made.` +
+    `\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}`,
+  );
   if (!ok) process.exitCode = 1;
 }
 
@@ -1056,8 +1203,9 @@ async function status() {
     configurationSpace: { ...configurationSpace, defaultModel, latestRevision },
     targets: Object.keys(config.targets),
     standaloneSearch: searchSummaries(config, credentials),
+    appCapabilityProfiles: capabilityProfileSummaries(config),
   },
-  (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nSpace: ${x.configurationSpace.active ? `${x.configurationSpace.active.space}@${x.configurationSpace.active.revision}` : "uninitialized"}\nModels: ${x.targets.join(", ")}`);
+  (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nSpace: ${x.configurationSpace.active ? `${x.configurationSpace.active.space}@${x.configurationSpace.active.revision}` : "uninitialized"}\nModels: ${x.targets.join(", ")}\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}`);
 }
 
 async function requireRouterServiceSpace() {

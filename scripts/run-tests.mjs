@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -10,9 +10,28 @@ const testFiles = (await readdir(join(projectRoot, "test")))
   .filter((name) => name.endsWith(".test.mjs"))
   .sort()
   .map((name) => join("test", name));
+
+const inheritedEnvNames = ["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR", "CI", "TZ", "USER", "LOGNAME", "SHELL"];
+const sanitizedParentEnv = Object.fromEntries(
+  inheritedEnvNames
+    .filter((name) => process.env[name] != null)
+    .map((name) => [name, process.env[name]]),
+);
+await mkdir(join(testRoot, "tmp"), { recursive: true });
 const env = {
-  ...process.env,
+  ...sanitizedParentEnv,
+  HOME: join(testRoot, "home"),
+  TMPDIR: join(testRoot, "tmp"),
+  TMP: join(testRoot, "tmp"),
+  TEMP: join(testRoot, "tmp"),
   CODEX_HOME: join(testRoot, "codex-home"),
+  XDG_CONFIG_HOME: join(testRoot, "xdg-config"),
+  XDG_CACHE_HOME: join(testRoot, "xdg-cache"),
+  XDG_DATA_HOME: join(testRoot, "xdg-data"),
+  XDG_STATE_HOME: join(testRoot, "xdg-state"),
+  XDG_RUNTIME_DIR: join(testRoot, "xdg-runtime"),
+  XDG_CONFIG_DIRS: join(testRoot, "xdg-config-dirs"),
+  XDG_DATA_DIRS: join(testRoot, "xdg-data-dirs"),
   CODEX_LOCAL_ROUTER_HOME: join(testRoot, "router-home"),
   CODEX_LOCAL_ROUTER_CONFIG: join(testRoot, "router-home", "config.json"),
   CODEX_LOCAL_ROUTER_LAUNCH_AGENT: join(testRoot, "LaunchAgents", "router.plist"),

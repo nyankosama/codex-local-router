@@ -27,6 +27,7 @@ test("raw API requires the independent local token while health stays readable",
   const health = await fetch(`${base}/healthz`).then((response) => response.json());
   assert.equal(health.service, "codex-local-router");
   assert.equal(health.activeTurns, 0);
+  assert.equal(health.websocketConnections, 0);
   assert.equal((await fetch(`${base}/v1/models`)).status, 401);
   const models = await fetch(`${base}/v1/models`, { headers: { authorization: "Bearer local-secret" } });
   assert.equal(models.status, 200);

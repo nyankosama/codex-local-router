@@ -199,6 +199,9 @@ export async function callProvider(
   const response = await send(url, {
     headers,
     body,
+    // Internal correlation for bounded diagnostics. The transport ignores
+    // this field; it is never serialized onto the provider wire.
+    context: { thread: ctx.thread, turn: ctx.turn },
     signal,
     timeoutMs: target.timeoutMs ?? config.timeoutMs ?? 180000,
   });

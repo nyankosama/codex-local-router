@@ -1,13 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { join, parse } from "node:path";
+import { join, parse, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import { exportPublic, publicEntries, sourceRoot } from "../scripts/export-public.mjs";
+import { fileURLToPath } from "node:url";
 
 const present = (path) => access(path).then(() => true, () => false);
+const sourceRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const repositoryCheckout = await present(join(sourceRoot, "package-lock.json"));
+const repositoryOnly = {
+  skip: repositoryCheckout ? false : "repository-only public-export check",
+};
+const exporter = () => import("../scripts/export-public.mjs");
 
-test("public manifest derives package files and excludes private evidence", async () => {
+test("public manifest derives package files and excludes private evidence", repositoryOnly, async () => {
+  const { publicEntries } = await exporter();
   const { entries } = await publicEntries();
   assert.ok(entries.includes("scripts/e2e"));
   assert.ok(entries.includes("docs/e2e/thresholds.json"));
@@ -16,7 +23,8 @@ test("public manifest derives package files and excludes private evidence", asyn
   assert.ok(!entries.includes("docs/e2e/acceptance.md"));
 });
 
-test("public export refuses destructive destinations", async (t) => {
+test("public export refuses destructive destinations", repositoryOnly, async (t) => {
+  const { exportPublic } = await exporter();
   const root = await mkdtemp(join(tmpdir(), "router-export-safety-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const repository = join(root, "repository");
@@ -38,7 +46,8 @@ test("public export refuses destructive destinations", async (t) => {
   assert.equal(await readFile(join(nonEmpty, "keep.txt"), "utf8"), "keep\n");
 });
 
-test("public export contains the installable source tree only", async (t) => {
+test("public export contains the installable source tree only", repositoryOnly, async (t) => {
+  const { exportPublic } = await exporter();
   const root = await mkdtemp(join(tmpdir(), "router-export-success-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const destination = join(root, "public");

@@ -74,6 +74,7 @@ test("encrypted SQLite history survives restart and preserves order, duplicates 
     previous_response_id: "resp-one",
     input: [message("user", "next")],
   });
+  assert.equal(replay.previous.continuationProvenance, "gateway-replay");
   assert.equal(
     replay.body.input.filter(
       (item) => item.content?.[0]?.text === "duplicate",
@@ -124,6 +125,41 @@ test("fresh persistent responses stay in memory without a redundant SQLite read"
     state.replay(ctx, { previous_response_id: response.id, input: [] })
       .body.input[0].content[0].text,
     "original",
+  );
+});
+
+test("continuation provenance survives encrypted archive reload", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-archive-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "history.sqlite");
+  let archive = new Archive(path, key);
+  let state = new StateStore({ maxBytes: 1024 * 1024 }, archive);
+  state.save(
+    ctx,
+    { id: "engine-response", status: "completed", output: [] },
+    [message("user", "engine")],
+    { ...target, provider: "chatgpt-subscription" },
+  );
+  state.save(
+    ctx,
+    { id: "relay-response", status: "completed", output: [] },
+    [message("user", "relay")],
+    { ...target, provider: "chatgpt-subscription" },
+    [message("user", "relay")],
+    { continuationProvenance: "official-relay" },
+  );
+  archive.close();
+
+  archive = new Archive(path, key);
+  t.after(() => archive.close());
+  state = new StateStore({ maxBytes: 1024 * 1024 }, archive);
+  assert.equal(
+    state.get(`response:${ctx.owner}:engine-response`).continuationProvenance,
+    "gateway-replay",
+  );
+  assert.equal(
+    state.get(`response:${ctx.owner}:relay-response`).continuationProvenance,
+    "official-relay",
   );
 });
 
