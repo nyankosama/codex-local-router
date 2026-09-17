@@ -13,7 +13,11 @@ const durablePrefixes = [
   "image-description:",
   "observation-incomplete:",
   "standalone-search-route:",
+  "prompt-cache-affinity:",
 ];
+
+export const threadOwner = (auth, thread) =>
+  auth + "\0" + (thread ?? "http");
 
 export function identity(entry, headers, body, trustedAccount) {
   const auth = trustedAccount
@@ -71,7 +75,7 @@ export function identity(entry, headers, body, trustedAccount) {
     thread,
     branch,
     parentThread,
-    owner: auth + "\0" + (thread ?? "http"),
+    owner: threadOwner(auth, thread),
     turn,
     requestKind:
       trigger || meta.request_kind === "compaction" ? "compaction" : "turn",

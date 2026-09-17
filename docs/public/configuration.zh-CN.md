@@ -6,6 +6,10 @@
 
 初始化、克隆、切换、回滚、drift、pending 事务和救援流程见[配置空间指南](configuration-spaces.zh-CN.md)。
 
+## 第三方默认模板
+
+新建 App-enabled 第三方模型在声明 Responses、工具调用和 freeform 工具能力且其 preset 已通过 Provider 准出时，默认使用 `codex-general-v1`，物化通用指令、标准 Responses、Code mode、多代理 v2、关闭的独立搜索和标准 Plugin 策略。`thirdPartyDefaults.template` 只允许 `codex-general-v1` 或 `legacy`，且只影响后续创建；已有 target 仅通过 `model apply-template` 改变。当前 OpenCode Go DeepSeek preset 虽有静态能力声明，仍只允许 `legacy`。详见[第三方模型模板](third-party-templates.zh-CN.md)。
+
 ```text
 spaces/index.json                 当前、上一次成功激活、各空间最新 revision
 spaces/<name>/<revision>.json     带 SHA-256 的不可变版本
@@ -15,6 +19,23 @@ transactions/space-switch.json    唯一待完成或待恢复事务
 空间名匹配 `[a-z0-9][a-z0-9._-]{0,63}`。revision 只保存环境变量名或 Keychain service/account，不保存明文 Provider 凭证、ChatGPT Token、`auth.json`、用户 MCP、Skills、Hooks、提示和会话历史。`official@1` 永久保留。
 
 ## ai.feei
+
+### 显式启用 code mode
+
+`targets.<id>.app.toolMode: "code_mode_only"` 只投影为 catalog 的 `tool_mode`，让兼容客户端使用 `exec`/`wait`。要求第三方、App-enabled、Responses 协议且声明 `toolCalling` 和 `freeformTools`；如果 preset 收窄了 Provider 准出范围，还必须通过对应准出。不再以 GPT 家族为准入条件。旧安装不自动迁移。诊断同时显示 `structured-only; embedded-exec-opaque` 边界。
+
+Plugin 白名单继续裁剪结构化工具定义，但不解析或改写 `exec.description` 内嵌的 schema，不分析 JavaScript，也不阻断间接调用。这里的目标是控制上下文体积，不是建立安全沙箱；不能因为有 `exec` 包装就认定上下文变小。
+
+启用前，固定客户端二进制、模型、Prompt、指令、传输方式及实际工具集合，对照开关前后 Provider 出站的 `{instructions, tools, input}` 序列化 UTF-8 字节与工具定义哈希。这是 Wire 体积代理指标，不是实测 token。建议准出线：首请求增量不超过 `max(8 KiB, 原上下文载荷的 10%)`，工具续接和下一 turn 的工具哈希稳定；超线或缺少 call/result 证据不启用。客户端或工具集合显著变化后重新预检。这是上线前门禁，不是运行时自动限额或自动降级。
+
+批量预览（仅在预检通过、App 已退出的上线窗口增加 `--yes`）：
+
+```bash
+codex-local-router model set-tool-mode --ids feei-sol,feei-astra \
+  --tool-mode code_mode_only --space default --json
+```
+
+两个 target 一次提交为同一个不可变空间版本，分别保留空间默认模型和 Codex 当前选模。`--tool-mode default` 清除覆盖；切回精确历史空间引用可恢复旧设置。安全激活并重开后使用新任务验收。App-server 协议通过不能替代 App UI 签核，批量调用也不保证每次任务都减少轮次。
 
 内置两个预设：
 
@@ -46,18 +67,51 @@ API Key 保存在独立 Keychain 项或由 `FEEI_API_KEY` 提供，不得写入�
 
 CLI 新建两款 target 时默认写入 `app.capabilityProfile: "standard-tools"`、`useResponsesLite: false` 与禁用的独立搜索；显式增加 `--app-profile lite-search` 才启用 Responses Lite 和选定的订阅/Provider 搜索。`capabilities.nativeWebSearch: false` 表示不宣称 ai.feei 支持嵌入模型请求的 hosted search。既有显式 Lite 配置不变。搜索是否发生仍由 Codex 运行时、catalog 和用户设置共同决定。为兼容 Codex 感知型中转，第三方 GPT Responses 请求只保留不含身份的客户端协商 Header；订阅凭证及账号/session/request/install 关联均留在本机。OpenAI 文档同样要求自定义 Provider、模型和运行时共同支持独立搜索：[Web search](https://learn.chatgpt.com/docs/web-search)。
 
-## 第三方 GPT App 能力画像
+## 第三方 App 能力画像
+
+具备能力的第三方 Responses target 可使用同一组画像；旧非 GPT target 只有在显式配置画像或物化通用模板后才进入。基础指令独立版本化，不继承源模型能力画像。标准 Responses 使用客户端交付；符合条件的 Lite target 可显式启用 `gateway-lite`。约束、证据和上线门禁见[指令快照](instruction-snapshots.zh-CN.md)。
 
 | 画像 | 传输与工具面 | 独立搜索 |
 |---|---|---|
 | `standard-tools` | 标准 Responses；按策略保留核心工具、允许 Plugin 和用户 MCP | 不向 App 广告 |
 | `lite-search` | Responses Lite；诊断中明确标为缩减工具面 | 必须启用选定的订阅或 Provider 来源 |
 
-通过 `model add` 新建的 Responses target 会持久化 `standard-tools`，因此诊断原因是 `target-explicit`；没有显式 Lite 兼容信号的新验证 App-enabled GPT Responses target 同样默认使用 `standard-tools`，但原因是 `standard-default`。需要独立搜索时显式使用 `--app-profile lite-search`。既有 Responses target 的 `useResponsesLite: true` 保持传输行为且不自动改写持久化配置：搜索生效时解析为 `lite-search`；若明确禁用搜索，则保持未画像，原因是 `legacy-responses-lite-transport-only`，工具面为 `legacy-responses-lite`。显式选择 `lite-search` 却禁用搜索，或 `standard-tools` 启用搜索，仍会 fail closed。旧的非 Responses GPT target 保持原传输行为，并报告 `profile: null`、原因 `non-responses-unchanged`、工具面 `unchanged`，不会冒充任一已准出画像。`model list`、非 live `model probe`、`status`、`doctor` 的 JSON 与人类可读输出，以及自定义 catalog entry，都会输出最终画像、选择原因和工具面。官方订阅模型不参与这组画像拆分，继续透明转发。
+通过 `model add` 新建的 Responses target 会持久化 `standard-tools`，因此诊断原因是 `target-explicit`；没有显式 Lite 兼容信号的新验证 App-enabled GPT Responses target 同样默认使用 `standard-tools`，但原因是 `standard-default`。非 GPT target 仅通过显式画像或通用模板 marker 进入。需要独立搜索时显式使用 `--app-profile lite-search`。既有 Responses target 的 `useResponsesLite: true` 保持传输行为且不自动改写持久化配置：搜索生效时解析为 `lite-search`；若明确禁用搜索，则保持未画像，原因是 `legacy-responses-lite-transport-only`，工具面为 `legacy-responses-lite`。显式选择 `lite-search` 却禁用搜索，或 `standard-tools` 启用搜索，仍会 fail closed。旧的非 Responses 与未配置的非 GPT target 保持原传输行为和未画像状态。`model list`、非 live `model probe`、`status`、`doctor` 的 JSON 与人类可读输出，以及自定义 catalog entry，都会输出最终画像、选择原因和工具面。官方订阅模型不参与这组画像拆分，继续透明转发。
 
 画像不会因上游失败、重试、重连或工具请求而切换。`standard-tools` 与启用的独立搜索、显式 `lite-search` 与禁用搜索或标准传输等冲突组合会直接校验失败。未画像的旧 Lite 纯传输是兼容状态，不是第三种已准出画像。
 
 `--no-app` 会保留 target 的路由能力，但将其显式标为 App-disabled，并清理 target 级画像、Responses Lite 与搜索状态。App-disabled target 不继承空间级 App 搜索默认；同一空间中其他 App-enabled target 继续使用该默认值。
+
+## 第三方 Prompt Cache 亲和
+
+缓存亲和是 Provider 级显式能力，作用于兼容的第三方 Responses target：`openai-gpt`，或已显式物化 `codex-general-v1` 的非 GPT target。旧的非 GPT target 保持不变：
+
+```json
+{
+  "providers": {
+    "example": {
+      "adapter": "openai-compatible",
+      "baseUrl": "https://provider.example/v1",
+      "promptCaching": { "affinity": "gateway-opaque" }
+    }
+  }
+}
+```
+
+`affinity` 只接受 `none`、`gateway-opaque`。未配置等价于 `none`；包括 ai.feei 在内的 preset 都不会因升级自动启用。通过配置空间 revision 显式修改：
+
+```bash
+codex-local-router provider edit --id example \
+  --prompt-cache-affinity gateway-opaque --yes
+```
+
+官方订阅请求继续透明保留客户端缓存字段。符合准入且显式启用的第三方 Responses 请求会先删除原始 `prompt_cache_key`、Codex metadata、账号/thread/turn/session/install 标识和 `comparison_response_id`，只向 Provider 发送 `clr-pc-v1-*` HMAC 键。`prompt_cache_options` 仅可保留安全的 `mode`（`implicit`/`explicit`）与 `ttl`（`30m`）。Chat Completions、OpenCode Go 和未启用通用模板的旧非 GPT 配置不会获得 Gateway 亲和键。
+
+第三方 GPT Responses 在 `none` 与 `gateway-opaque` 下都会在一次成功终态后写入一条脱敏 `prompt_cache_usage`；上游未返回 usage 时保持 `null`/未知，不转换成 0，错误和取消不写终态 usage。Responses Lite 按 HTTP 请求或 WebSocket frame 独立协商，只把规范化的 `true` 发给适用 Provider；缺失或 false 的 frame 不继承连接上一轮状态，内部摘要/图片辅助请求继续强制非 Lite。
+
+专用 32-byte secret 只在功能首次实际使用时生成，并写入 macOS Keychain：service 为 `com.nyankosama.codex-local-router.prompt-cache-v1`，account 为 `affinity`。谱系状态只含派生 ID，容量受限、30 分钟过期，并在可用时进入加密状态库。同一 turn 的工具续接冻结第一次策略和键。fork 只有在客户端 cache key 相同，或同账号父线程映射已存在时才继承；无法验证关系时创建独立谱系。
+
+`model list`、非 live `model probe`、`status` 和 `doctor` 会报告最终模式、选择原因、载体、可用谱系来源和重启稳定能力，不输出派生键或客户端标识。端到端效果仍取决于 Provider 行为；[账号池互操作建议](provider-cache-affinity.zh-CN.md)是条件性建议，只配置 Gateway 不能证明任何命中率。
 
 ## 独立搜索路由
 

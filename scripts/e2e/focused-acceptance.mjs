@@ -20,6 +20,7 @@ import {
 import { solidPng } from "./lib/png.mjs";
 import { FocusedAcceptanceBudget } from "./lib/focused-budget.mjs";
 import { summarizeFocusedProfiles } from "./lib/focused-profile-summary.mjs";
+import { evidencePath } from "./lib/evidence-path.mjs";
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(`--${name}`);
@@ -52,7 +53,7 @@ const root = await mkdtemp(join(tmpdir(), "codex-router-focused-"));
 const codexHome = join(root, "codex-home");
 const work = join(root, "workspace");
 const runId = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
-const output = resolve(value("out") ?? join(projectRoot, "artifacts", "focused", runId, "summary.json"));
+const output = evidencePath(value("out"), join("focused", runId, "summary.json"), { projectRoot });
 const marker = `MCP_${createHash("sha256").update(randomUUID()).digest("hex").slice(0, 12)}`;
 const cases = [];
 let app;

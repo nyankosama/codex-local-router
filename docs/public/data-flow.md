@@ -7,13 +7,17 @@
 | Standalone search from a `lite-search` custom GPT turn | Selected ChatGPT Codex backend or explicit Provider endpoint; `standard-tools` does not advertise it | Search result may enter the custom model's subsequent conversation input |
 | ChatGPT credential | Official subscription adapter only | Managed by Codex, not copied into router configuration |
 | Third-party credential | Its configured provider only | Environment variable or macOS Keychain |
+| Third-party GPT cache affinity | Opaque `clr-pc-v1-*` key to that configured Provider only | Dedicated Keychain secret plus bounded, derived-only encrypted lineage state |
 | Conversation and tool history | Local SQLite archive | AES-256-GCM until explicit prune |
+| Explicit rollout recovery | Selected local Codex JSONL files to the same encrypted archive | Streams metadata/events locally; writes only validated portable checkpoints |
 | Images | Capable target, or a configured source model for lossy description | Original stays encrypted locally |
 | Operational logs | User-level log directory | Metadata only; no body, image, credential, or encrypted state |
 | Configuration-space revision | Local Router data directory only | Immutable Router policy or managed official projection, content-addressed by SHA-256 |
 | Space-switch transaction | Local Router data directory only | Source/target refs and hashes, stage, sanitized failure, and Router config recovery data; no Codex auth or user MCP/prompt/history body |
 
-Before a third-party GPT generation request leaves the machine, the router may remove confirmed Plugin tool definitions outside the effective allowlist. Codex core tools, user-configured MCP tools, and uncertain/colliding sources remain. The diagnostic records policy reason, counts, and normalized Plugin identities only; it does not record tool schemas. The filter does not modify prompt text, Skills, Hooks, or historical tool content.
+Before a third-party generation request using the standard policy leaves the machine, the router may remove confirmed structured Plugin definitions outside the effective allowlist. Codex core tools, user-configured MCP tools, uncertain/colliding sources and definitions embedded in code-mode documentation remain. Diagnostics never record schemas. Prompt text, Skills, Hooks and historical tool content are unchanged.
+
+When `gateway-opaque` cache affinity is enabled, the original client cache key and Codex account/thread/turn/session/install metadata stay local. The router derives a Provider/model/lineage-scoped HMAC key without hashing the prompt, freezes it for the turn, and sends only that opaque key. Logs contain source enums and token counts/ratios, never the key or prompt. A pooled relay can use the opaque key for stable upstream-account or cache-shard selection; see the [Provider contract](provider-cache-affinity.md).
 
 This boundary intentionally treats search and generation differently:
 
@@ -37,3 +41,5 @@ The default archive quota is 10 GiB and is measured from the archive files on di
 The router is a local routing boundary, not an anonymity layer. A custom provider receives the conversation content required for that request, including any standalone-search result that Codex includes in a later generation. Users must decide whether that provider is appropriate for their data.
 
 Space switching changes only Router-managed Codex keys and Router-owned configuration fields. User MCP, Skills, Hooks, prompts, history, and authentication files remain in place. If Codex App is open, the switch has no data-plane effect until the App exits normally and the pending transaction succeeds.
+
+Rollout recovery makes no model or network request and never modifies the source JSONL. Preview output and recovery diagnostics contain only thread references, hashes, counts, status and error types. Message, tool, compaction and credential contents remain local and encrypted.

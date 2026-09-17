@@ -20,7 +20,7 @@
 | 本机候选生效 | 未执行 | 未安装候选、未初始化真实空间、未启动服务、未改集成、未写 Keychain |
 | Codex App UI | 未执行 | CLI/app-server 结果不替代菜单与 UI 签核 |
 
-全部自动测试使用临时 Codex Home、Router Home、配置/状态/LaunchAgent 路径、测试实例 ID、模拟 launchctl、本地上游和随机端口。测试总入口固定 `CODEX_APP_RUNNING=0`；pending 用例只在自己的临时 fixture 内覆盖该值。
+全部自动测试使用临时 Codex Home、Router Home、配置/状态/LaunchAgent 路径、测试实例 ID、注入的进程与服务替身、本地上游和随机端口。生产代码不读取测试专用的 App 或 launchctl 环境开关。
 
 ## 覆盖边界
 

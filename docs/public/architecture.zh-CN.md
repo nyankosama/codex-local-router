@@ -27,6 +27,8 @@ Relay 保留 query、HTTP 方法、响应状态、实体字节、压缩、错误
 
 官方 Responses 通过有界旁路观察写入既有加密历史。观察失败不影响普通官方响应；后续跨 Provider 需要该历史却无法确认完整时，明确返回 `history_observation_incomplete`。每条保留的 response 还记录内部续接来源：只有成功旁路观察到的官方透明 Relay response，后续官方请求才继续携带原生 `previous_response_id`；Engine 生成、本地预热、虚拟压缩及没有来源标记的旧记录都会重新进入 Engine，展开加密历史并在唯一一次上游发送前移除本地 response ID，后续 response 继续留在同一回放链。完全未知的官方 ID 在没有跨 Provider 历史要求时仍保持既有透明行为。Router 虚拟 response ID/checkpoint 因此不会发给官方。
 
+动态工具发现属于 Provider 控制历史，不是可直接跨渠道重放的工具结果。跨 Provider 或协议前，每个 `tool_search_call` 必须在后面存在唯一、同 `call_id` 的 `tool_search_output`。合法 pair 会转换成一条固定 assistant 标记；查询参数、执行状态、Provider item ID 和返回的工具 schema 全部省略，后续函数/custom-tool 调用与结果保持原顺序。缺失、重复、反序或畸形 pair 会在发送上游前返回 `tool_search_history_incomplete`。不可变原始流保留精确 pair，目标视图只保存标记，因此反复切换不会改写归档或叠加标记。
+
 工具策略在 target 确定后、每次上游发送前运行。回退时从未裁剪副本重新生成目标视图，同一 turn 使用固定配置/来源快照。来源识别只读取受信内置映射、已启用 Plugin manifest 与 Codex MCP 配置，不启动 Plugin，也不依据通用 `mcp__*` 前缀猜测。
 
 官方订阅不裁剪。第三方 GPT 默认只保留标准 Plugin 白名单，同时保留核心和用户 MCP。未知/冲突来源放行。筛选覆盖普通函数、namespace 和 `input[].additional_tools.tools`；被禁止的显式 `tool_choice` 返回 `tool_policy_conflict`，禁止的直接调用在交给客户端前返回 `disallowed_plugin_tool_call`。

@@ -379,6 +379,7 @@ export async function startIsolatedGateway({
   toolCodexHome,
   markerObservations = [],
   beforeOutbound,
+  promptCacheSecret,
   sendRequest = request,
   officialRequest = requestRaw,
   providerSearchRequest = requestRaw,
@@ -439,9 +440,15 @@ export async function startIsolatedGateway({
       ? options.body
       : Buffer.from(JSON.stringify(options.body ?? ""));
     const requestText = requestBytes.toString("utf8");
-    const markerMatches = markerObservations
-      .filter((marker) => marker && typeof marker.value === "string" && requestText.includes(marker.value))
-      .map((marker) => marker.label);
+    const markerCounts = Object.fromEntries(markerObservations
+      .filter((marker) => marker && typeof marker.value === "string")
+      .map((marker) => {
+        const encoded = JSON.stringify(marker.value).slice(1, -1);
+        return [marker.label, requestText.split(encoded).length - 1];
+      }));
+    const markerMatches = Object.entries(markerCounts)
+      .filter(([, count]) => count > 0)
+      .map(([label]) => label);
     const toolResultItems = [
       ...input,
       ...messages.filter((item) => item?.role === "tool"),
@@ -496,6 +503,10 @@ export async function startIsolatedGateway({
         .update(parsedUrl.pathname)
         .update(requestBytes)
         .digest("hex"),
+      promptCacheKeyFingerprint:
+        typeof body?.prompt_cache_key === "string"
+          ? createHash("sha256").update(body.prompt_cache_key).digest("hex")
+          : null,
     };
     if (!metadata.official && metadata.path.endsWith("/responses")) {
       const text = (Buffer.isBuffer(options.body)
@@ -523,6 +534,7 @@ export async function startIsolatedGateway({
       reasoningEffort: body?.reasoning?.effort ?? null,
       generate: body?.generate ?? null,
       markerMatches,
+      markerCounts,
       toolCallNames: [...new Set(toolCallNames)],
       toolResultMarkers,
       toolResultShapes,
@@ -743,6 +755,7 @@ export async function startIsolatedGateway({
       return socket;
     },
     log: (event) => logs.push(event),
+    promptCacheSecret,
   });
   await new Promise((r) => gateway.server.listen(0, "127.0.0.1", r));
   const url = `http://127.0.0.1:${gateway.server.address().port}`;
@@ -883,6 +896,34 @@ export async function runCliExec({
   const code = await new Promise((resolve) => child.on("close", resolve));
   clearTimeout(timer);
   signal?.removeEventListener("abort", abort);
+  return { code, rows, stdout, stderr };
+}
+
+export async function runCliExecResume({
+  corePath,
+  home,
+  cwd,
+  globalArgs = [],
+  args = [],
+  env = {},
+  timeoutMs = 600000,
+  prompt,
+}) {
+  const child = spawn(corePath, [...globalArgs, "exec", "resume", "--last", "--json", ...args, prompt], {
+    cwd,
+    env: isolatedChildEnv(home, env),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "";
+  const rows = [];
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  createInterface({ input: child.stdout }).on("line", (line) => {
+    try { rows.push(JSON.parse(line)); } catch {}
+  });
+  const timer = setTimeout(() => child.kill(), timeoutMs);
+  const code = await new Promise((done) => child.on("close", done));
+  clearTimeout(timer);
   return { code, rows, stdout, stderr };
 }
 

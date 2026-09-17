@@ -1,59 +1,34 @@
 #!/usr/bin/env node
-import {
-  cp,
-  lstat,
-  mkdir,
-  mkdtemp,
-  readFile,
-  readdir,
-  rename,
-  rm,
-} from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
 import { dirname, join, parse, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
+import { assertAllowedFiles, filesUnder, packageFiles, safeRelativePath } from "./public-boundary.mjs";
 
 export const sourceRoot = resolve(new URL("..", import.meta.url).pathname);
 
-const repositoryFiles = [
+const repositoryEntries = [
   "test",
   ".github",
+  "scripts/maintainer",
   "scripts/audit-package.mjs",
   "scripts/audit-public.mjs",
+  "scripts/audit-public-history.mjs",
   "scripts/export-public.mjs",
+  "scripts/public-boundary.mjs",
   "scripts/run-tests.mjs",
-  "package.json",
   "package-lock.json",
-  "README.md",
-  "README.zh-CN.md",
-  "LICENSE",
   "CONTRIBUTING.md",
-  "SECURITY.md",
-  "CHANGELOG.md",
   ".gitignore",
 ];
 
-const denied = (entry) =>
-  entry === "artifacts" ||
-  entry.startsWith("artifacts/") ||
-  (entry.startsWith("docs/e2e/") && entry !== "docs/e2e/thresholds.json") ||
-  /(^|\/)(?:auth\.json|history\.sqlite|gateway\.subscription\.local\.json)$/.test(entry) ||
-  /(^|\/)config\/.*(?:\.local\.json|\.before-)/.test(entry);
-
-async function exists(path) {
-  return lstat(path).then(() => true, () => false);
-}
+const exists = (path) => lstat(path).then(() => true, () => false);
 
 export async function publicEntries(root = sourceRoot) {
   const packageJson = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
-  const packageFiles = packageJson.files.map((entry) => entry.replace(/\/$/, ""));
-  const entries = [...new Set([...packageFiles, ...repositoryFiles])].sort();
-  const rejected = entries.filter(denied);
-  if (rejected.length)
-    throw Error(`public manifest contains denied paths:\n${rejected.join("\n")}`);
-  for (const entry of entries)
-    if (!(await exists(join(root, entry))))
-      throw Error(`public manifest path does not exist: ${entry}`);
+  const groups = await Promise.all(repositoryEntries.map((entry) => filesUnder(root, entry)));
+  const entries = [...new Set([...(await packageFiles(root)), ...groups.flat()])].sort();
+  assertAllowedFiles(entries);
   return { packageJson, entries };
 }
 
@@ -85,9 +60,12 @@ export async function exportPublic(destinationArg, options = {}) {
   const staging = await mkdtemp(join(dirname(destination), ".codex-local-router-export-"));
   try {
     for (const entry of entries) {
-      const source = join(root, entry), target = join(staging, entry);
+      const source = safeRelativePath(root, entry).absolute;
+      const target = join(staging, entry);
+      const info = await lstat(source);
+      if (info.isSymbolicLink()) throw Error(`public selection contains symbolic link: ${entry}`);
       await mkdir(dirname(target), { recursive: true });
-      await cp(source, target, { recursive: true });
+      await cp(source, target, { errorOnExist: true, force: false, preserveTimestamps: true });
     }
     if (destinationInfo) await rm(destination, { recursive: true });
     await rename(staging, destination);
@@ -95,13 +73,7 @@ export async function exportPublic(destinationArg, options = {}) {
     await rm(staging, { recursive: true, force: true });
     throw error;
   }
-  return {
-    ok: true,
-    name: packageJson.name,
-    version: packageJson.version,
-    destination,
-    files: entries,
-  };
+  return { ok: true, name: packageJson.name, version: packageJson.version, destination, files: entries };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

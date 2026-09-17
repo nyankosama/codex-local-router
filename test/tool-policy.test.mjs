@@ -43,6 +43,27 @@ const config = (extension = {}) => ({
   },
 });
 
+test("code mode leaves embedded exec documentation opaque while filtering structured Plugins", () => {
+  const policy = resolvePluginToolPolicy(config(), { provider: "vendor", modelFamily: "openai-gpt" });
+  const exec = { type: "custom", name: "exec", description: "SYNTHETIC tools.mcp__plugin_server__read(args)" };
+  const blocked = { type: "function", name: "mcp__plugin_server__read" };
+  for (const lite of [false, true]) {
+    const tools = [{ type: "namespace", name: "functions", tools: [exec] }, blocked];
+    const body = lite
+      ? { input: [{ type: "additional_tools", tools }, { role: "user", content: "UNCHANGED" }] }
+      : { tools, input: [{ role: "user", content: "UNCHANGED" }] };
+    const snapshot = structuredClone(body);
+    const result = applyPluginToolPolicy(body, policy, registry).body;
+    assert.deepEqual(body, snapshot);
+    assert.deepEqual(lite ? result.input[0].tools : result.tools, [tools[0]]);
+    assert.deepEqual(applyPluginToolPolicy(result, policy, registry).body, result);
+    assert.deepEqual(result.input.at(-1), body.input.at(-1));
+    assert.doesNotThrow(() => assertAllowedPluginToolCalls({
+      type: "custom_tool_call", name: "exec", input: "tools.mcp__plugin_server__read({})",
+    }, policy, registry), "the existing policy is not a JavaScript execution sandbox");
+  }
+});
+
 test("A1 resolves official, GPT, non-GPT, legacy and explicit policy precedence", () => {
   const c = config();
   assert.equal(
@@ -206,6 +227,44 @@ test("A3 filters function, namespace and additional_tools carriers without chang
     applyPluginToolPolicy(filtered.body, policy, registry).body,
     filtered.body,
   );
+});
+
+test("A2/A3 inherits namespace provenance for diagnostics without changing filtering", () => {
+  const body = {
+    input: [{
+      type: "additional_tools",
+      tools: [
+        { type: "namespace", name: "codex_app", tools: [{ type: "function", name: "future_core" }] },
+        { type: "namespace", name: "mcp__codex_apps__github", tools: [{ type: "function", name: "search" }] },
+        { type: "namespace", name: "mcp__node_repl", tools: [{ type: "function", name: "execute" }] },
+        { type: "namespace", name: "mcp__collision", tools: [{ type: "function", name: "inspect" }] },
+        { type: "namespace", name: "future_namespace", tools: [{ type: "function", name: "mystery" }] },
+        { type: "namespace", name: "mcp__codex_apps__gmail", tools: [{ type: "function", name: "read" }] },
+      ],
+    }],
+  };
+  const filtered = applyPluginToolPolicy(
+    body,
+    { mode: "allowlist", allowedPlugins: ["github"] },
+    registry,
+  );
+  assert.deepEqual(filtered.body.input[0].tools.map((tool) => tool.name), [
+    "codex_app",
+    "mcp__codex_apps__github",
+    "mcp__node_repl",
+    "mcp__collision",
+    "future_namespace",
+  ]);
+  assert.deepEqual(filtered.diagnostics.sourceCounts, {
+    core: 2,
+    user_mcp: 2,
+    allowed_plugin: 2,
+    removed_plugin: 1,
+    unknown: 2,
+    collision: 2,
+  });
+  assert.equal(filtered.diagnostics.inheritedSourceCount, 4);
+  assert.equal(filtered.diagnostics.passedUncertain.length, 4);
 });
 
 test("A3 removes empty additional_tools and rejects an explicit removed tool_choice", () => {

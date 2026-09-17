@@ -1,11 +1,57 @@
 import { createHash } from "node:crypto";
 import { fail } from "./errors.mjs";
+import { threadOwner } from "./state.mjs";
 
 export const isCompaction = (item) =>
   ["compaction", "compaction_summary", "context_compaction"].includes(
     item.type,
   );
 const digest = (value) => createHash("sha256").update(value).digest("hex");
+export const TOOL_SEARCH_HISTORY_MARKER =
+  "[Dynamic tool discovery occurred on the previous provider. Provider-specific discovery metadata and tool schemas were omitted during migration; subsequent tool calls and results remain in history.]";
+
+const incompleteToolSearchHistory = () =>
+  fail(
+    "tool_search_history_incomplete",
+    409,
+    "Dynamic tool discovery history is incomplete or malformed; continue on the source provider or start a new task",
+  );
+
+const toolSearchMarker = () => ({
+  type: "message",
+  role: "assistant",
+  content: [{ type: "output_text", text: TOOL_SEARCH_HISTORY_MARKER }],
+});
+
+export function canonicalizeToolSearchHistory(input, diagnostics) {
+  const calls = new Map();
+  const outputs = new Set();
+  for (const [index, item] of input.entries()) {
+    if (!["tool_search_call", "tool_search_output"].includes(item?.type))
+      continue;
+    if (typeof item.call_id !== "string" || !item.call_id.trim())
+      throw incompleteToolSearchHistory();
+    if (item.type === "tool_search_call") {
+      if (calls.has(item.call_id) || outputs.has(item.call_id))
+        throw incompleteToolSearchHistory();
+      calls.set(item.call_id, index);
+      continue;
+    }
+    if (outputs.has(item.call_id) || !calls.has(item.call_id))
+      throw incompleteToolSearchHistory();
+    outputs.add(item.call_id);
+  }
+  if ([...calls.keys()].some((callId) => !outputs.has(callId)))
+    throw incompleteToolSearchHistory();
+  if (diagnostics) diagnostics.toolSearchPairs = calls.size;
+  if (!calls.size) return input;
+  return input.flatMap((item) => {
+    if (item?.type === "tool_search_call") return [toolSearchMarker()];
+    if (item?.type === "tool_search_output") return [];
+    return [item];
+  });
+}
+
 const key = (ctx, item) => {
   if (typeof item.encrypted_content !== "string" || !item.encrypted_content)
     throw fail("invalid_compaction_item", 400);
@@ -28,12 +74,37 @@ export function saveCheckpoint(state, ctx, item, checkpoint) {
   state.set(key(ctx, item), checkpoint, ctx);
 }
 
+const portableSource = (checkpoint) =>
+  checkpoint?.original ?? checkpoint?.portable;
+
+function checkpointFor(state, ctx, item, diagnostics) {
+  const currentKey = key(ctx, item);
+  const current = state.get(currentKey);
+  if (portableSource(current) || !ctx.parentThread)
+    return { checkpoint: current, parentReason: null };
+
+  const parent = state.get(
+    key({ ...ctx, owner: threadOwner(ctx.auth, ctx.parentThread) }, item),
+  );
+  if (!Array.isArray(portableSource(parent)) || !portableSource(parent).length) {
+    const reason = parent ? "portable_source_missing" : "not_found";
+    diagnostics?.({
+      event: "checkpoint_parent_unavailable",
+      reason,
+    });
+    return { checkpoint: current, parentReason: reason };
+  }
+  state.set(currentKey, parent, ctx);
+  diagnostics?.({ event: "checkpoint_inherited_from_parent" });
+  return { checkpoint: parent, parentReason: null };
+}
+
 export function expandCheckpoints(
   state,
   ctx,
   input,
   target,
-  { portable = false } = {},
+  { portable = false, diagnostics } = {},
 ) {
   let expanded = [],
     count = 0,
@@ -43,7 +114,8 @@ export function expandCheckpoints(
       expanded.push(item);
       continue;
     }
-    const checkpoint = state.get(key(ctx, item));
+    const resolved = checkpointFor(state, ctx, item, diagnostics);
+    const checkpoint = resolved.checkpoint;
     // Official encrypted state is validated by the authenticated official backend.
     // Local cache loss must not block native continuation. Never send our virtual
     // checkpoint handles to that backend or opaque official state to another provider.
@@ -55,12 +127,16 @@ export function expandCheckpoints(
     }
     const original = checkpoint?.original ?? checkpoint?.portable;
     const view = checkpoint?.view ?? checkpoint?.portable;
-    if (!checkpoint || (portable && !original))
+    if (!checkpoint || (portable && !original)) {
+      const sourceExists = checkpoint || resolved.parentReason === "portable_source_missing";
       throw fail(
         "compaction_history_unavailable",
         409,
-        "Compacted history expired or belongs to another session; restore full history before retrying",
+        sourceExists
+          ? "Compacted history checkpoint exists but has no portable original history; try explicit rollout recovery or continue on the official model"
+          : "Compacted history checkpoint was not found for this thread or its declared parent; try explicit rollout recovery before switching providers",
       );
+    }
     const nativeCompatible =
       checkpoint.provider === target.provider &&
       (target.provider === "chatgpt-subscription" ||
@@ -101,13 +177,17 @@ export function expandCheckpoints(
   return { input: expanded, count, source };
 }
 
-export function portableItems(input) {
-  return input.flatMap((item) => {
+export function portableItems(input, options = {}) {
+  return canonicalizeToolSearchHistory(input, options.diagnostics).flatMap((item) => {
     // Responses Lite carries current tool declarations as an input item. These
     // are regenerated by Codex for the selected model, not conversation history.
-    if (["compaction_trigger", "additional_tools"].includes(item.type))
-      return [];
-    if (isCompaction(item)) throw fail("compaction_history_unavailable", 409);
+    if (item.type === "compaction_trigger") return [];
+    if (item.type === "additional_tools")
+      return options.preserveAdditionalTools ? [item] : [];
+    if (isCompaction(item)) {
+      if (options.preserveCompaction) return [item];
+      throw fail("compaction_history_unavailable", 409);
+    }
     if (item.type === "reasoning") {
       const text = (item.summary ?? []).map((x) => x.text ?? "").join("\n");
       if (!text && item.encrypted_content)
@@ -205,6 +285,7 @@ export function portableItems(input) {
 }
 
 export function hasPendingTools(input) {
+  canonicalizeToolSearchHistory(input);
   const outputs = new Set(
     input
       .filter((x) =>

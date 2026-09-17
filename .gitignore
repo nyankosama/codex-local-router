@@ -9,3 +9,4 @@ node_modules/
 *.tgz
 *.sha256
 coverage/
+artifacts/

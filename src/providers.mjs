@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { request } from "./transport.mjs";
 import { fail } from "./errors.mjs";
+import { sanitizePromptCacheOptions } from "./prompt-cache-affinity.mjs";
 const exec = promisify(execFile);
 const limiters = new Map();
 const codexCompatibilityHeaders = [
@@ -68,6 +69,22 @@ export function providerEndpoint(provider, wireApi) {
   return url.toString().replace(/\/$/, "");
 }
 
+export function prepareThirdPartyProviderBody(target, body, affinity) {
+  const next = { ...body };
+  const promptCacheOptions =
+    target.wireApi === "responses"
+      ? sanitizePromptCacheOptions(next.prompt_cache_options)
+      : undefined;
+  delete next.client_metadata;
+  delete next.prompt_cache_key;
+  delete next.prompt_cache_options;
+  delete next.metadata;
+  delete next.session_id;
+  if (promptCacheOptions) next.prompt_cache_options = promptCacheOptions;
+  if (affinity?.applied) next.prompt_cache_key = affinity.providerKey;
+  return next;
+}
+
 function limitedBody(body, release) {
   if (!body?.[Symbol.asyncIterator]) {
     release();
@@ -113,6 +130,12 @@ export async function callProvider(
   signal,
   send = request,
 ) {
+  const responsesLite =
+    ctx.responsesLite ??
+    (body.client_metadata
+      ? body.client_metadata
+          .ws_request_header_x_openai_internal_codex_responses_lite === "true"
+      : ctx.headers["x-openai-internal-codex-responses-lite"] === "true");
   const headers = {
     "content-type": "application/json",
     accept: body.stream ? "text/event-stream" : "application/json",
@@ -159,13 +182,8 @@ export async function callProvider(
       if (ctx.headers[k]) headers[k] = ctx.headers[k];
     // WS request metadata, unlike the handshake, changes when a conversation
     // switches between Responses Lite and standard Responses models.
-    const lite =
-      ctx.responsesLite ??
-      (body.client_metadata
-        ? body.client_metadata
-            .ws_request_header_x_openai_internal_codex_responses_lite === "true"
-        : ctx.headers["x-openai-internal-codex-responses-lite"] === "true");
-    if (lite) headers["x-openai-internal-codex-responses-lite"] = "true";
+    if (responsesLite)
+      headers["x-openai-internal-codex-responses-lite"] = "true";
     if (body.client_metadata?.["x-codex-turn-metadata"])
       headers["x-codex-turn-metadata"] =
         body.client_metadata["x-codex-turn-metadata"];
@@ -186,14 +204,17 @@ export async function callProvider(
     ) {
       for (const name of codexCompatibilityHeaders)
         if (ctx.headers[name]) headers[name] = ctx.headers[name];
+      if (responsesLite)
+        headers["x-openai-internal-codex-responses-lite"] = "true";
+      else delete headers["x-openai-internal-codex-responses-lite"];
     }
     if (p.adapter === "opencode-go")
       headers["x-opencode-session"] = ctx.channelSession;
-    body = { ...body };
-    delete body.client_metadata;
-    delete body.prompt_cache_key;
-    delete body.metadata;
-    delete body.session_id;
+    body = prepareThirdPartyProviderBody(
+      target,
+      body,
+      ctx.promptCacheAffinity,
+    );
     url = providerEndpoint(p, target.wireApi);
   }
   const response = await send(url, {

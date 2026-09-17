@@ -1,5 +1,7 @@
 import { resolveStandaloneSearchPolicy } from "./standalone-search.mjs";
 import { resolveAppCapabilityProfile } from "./app-capability-profile.mjs";
+import { catalogInstructions } from "./instruction-source.mjs";
+import { catalogMultiAgent } from "./multi-agent-source.mjs";
 
 const defaultReasoningLevels = ["low", "medium", "high", "xhigh"].map((effort) => ({
   effort,
@@ -51,6 +53,7 @@ function customModel(target, source, config) {
     default_reasoning_level: target.app.defaultReasoningLevel ?? "medium",
     supported_reasoning_levels: reasoningLevels(target.app.reasoningLevels),
     shell_type: target.app.shellType ?? "unified_exec",
+    ...(target.app.toolMode != null ? { tool_mode: target.app.toolMode } : {}),
     visibility: "list",
     supported_in_api: true,
     priority: target.app.priority ?? Math.max(1, highestPriority - 1),
@@ -58,8 +61,8 @@ function customModel(target, source, config) {
     service_tiers: [],
     availability_nux: null,
     upgrade: null,
-    base_instructions: target.app.baseInstructions ?? "",
-    model_messages: target.app.modelMessages ?? null,
+    ...catalogInstructions(target),
+    ...catalogMultiAgent(target),
     supports_reasoning_summaries: target.app.supportsReasoningSummaries ?? true,
     default_reasoning_summary: target.app.defaultReasoningSummary ?? "auto",
     support_verbosity: target.app.supportVerbosity ?? false,

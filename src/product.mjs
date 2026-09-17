@@ -28,6 +28,7 @@ export function runtimePaths(env = process.env) {
     state: join(root, "state"),
     runtime: join(root, "run"),
     logs: join(root, "logs"),
+    evidence: join(root, "evidence"),
     integration: join(root, "integration"),
     spaces: join(root, "spaces"),
     spaceIndex: join(root, "spaces", "index.json"),

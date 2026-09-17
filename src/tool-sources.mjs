@@ -52,7 +52,7 @@ export async function discoverToolSources(options = {}) {
   ]);
   const pluginMcpServers = new Set();
   const pluginMcpOwners = new Map();
-  const coreNamespaces = new Set(["codex_app", "cua_repl"]);
+  const coreNamespaces = new Set(["codex_app", "cua_repl", "collaboration"]);
   try {
     const parsed = parseCodexConfig(await readFile(configPath, "utf8"));
     for (const identifier of parsed.enabledPlugins) {

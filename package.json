@@ -1,6 +1,6 @@
 {
   "name": "codex-local-router",
-  "version": "0.5.0",
+  "version": "0.5.2",
   "description": "Local multi-model routing for Codex CLI and App while preserving ChatGPT subscription access",
   "license": "MIT",
   "repository": {
@@ -20,9 +20,13 @@
     "scripts/codex-app-upgrade.mjs",
     "scripts/run-tests.mjs",
     "scripts/audit-package.mjs",
+    "scripts/public-boundary.mjs",
     "scripts/e2e/",
     "test/",
+    "!test/cache-affinity-rollout.test.mjs",
+    "!test/generic-template-rollout.test.mjs",
     "docs/e2e/thresholds.json",
+    "!docs/README.md",
     "config/gateway.example.json",
     "docs/public/",
     "README.md",
@@ -45,7 +49,11 @@
     "e2e:profiles": "node scripts/e2e/profile-qualification.mjs",
     "e2e:g3": "node scripts/e2e/g3-qualification.mjs",
     "e2e:official-search": "node scripts/e2e/official-search-acceptance.mjs",
-    "e2e:third-party-search": "node scripts/e2e/third-party-search-acceptance.mjs"
+    "e2e:third-party-search": "node scripts/e2e/third-party-search-acceptance.mjs",
+    "e2e:prompt-cache": "node scripts/e2e/prompt-cache-affinity.mjs",
+    "e2e:instructions": "node scripts/e2e/instruction-inheritance.mjs",
+    "e2e:instructions:live": "node scripts/e2e/instruction-inheritance-live.mjs",
+    "e2e:tool-search-history": "node scripts/e2e/tool-search-history-acceptance.mjs"
   },
   "bin": {
     "codex-local-router": "scripts/gateway-admin.mjs",

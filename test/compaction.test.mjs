@@ -9,10 +9,10 @@ import { tmpdir } from "node:os";
 import { WebSocket } from "ws";
 import { Engine } from "../src/engine.mjs";
 import { createGateway } from "../src/server.mjs";
-import { identity } from "../src/state.mjs";
+import { identity, threadOwner } from "../src/state.mjs";
 import { buildModelCatalog } from "../src/model-catalog.mjs";
 import { Archive } from "../src/archive.mjs";
-import { portableItems } from "../src/history.mjs";
+import { expandCheckpoints, portableItems } from "../src/history.mjs";
 
 const GPT = "gpt-5.6-sol",
   DS = "deepseek-v4.1-flash";
@@ -81,12 +81,28 @@ const upstreamError = (status, code, message) => ({
     JSON.stringify({ error: { code, message, type: code } }),
   ]),
 });
-const call = async (e, model, turn, input, kind = "turn", h = headers) => {
+const call = async (
+  e,
+  model,
+  turn,
+  input,
+  kind = "turn",
+  h = headers,
+  previousResponseId,
+  clientMetadata,
+) => {
   const events = [];
   for await (const event of e.generate(
     "subscription",
     h,
-    { model, input, client_metadata: metadata(turn, kind) },
+    {
+      model,
+      input,
+      client_metadata: clientMetadata ?? metadata(turn, kind),
+      ...(previousResponseId
+        ? { previous_response_id: previousResponseId }
+        : {}),
+    },
     new AbortController().signal,
   ))
     events.push(event);
@@ -247,6 +263,212 @@ test("native compact content stays on its provider; checkpoint expiry and authen
   e.state.items.clear();
   e.state.bytes = 0;
   await assert.rejects(call(e, DS, "two", c.output), /Compacted history/);
+});
+
+test("a trusted fork inherits the exact portable parent checkpoint and persists its own copy", async () => {
+  const seen = [], logs = [];
+  const e = new Engine(config(), {
+    log: (event) => logs.push(event),
+    send: async (_, options) => {
+      seen.push(options.body);
+      return json(result([msg("assistant", "fork continued")]));
+    },
+  });
+  const parentHeaders = { ...headers, "thread-id": "parent-thread" };
+  const parentCtx = identity("subscription", parentHeaders, {
+    client_metadata: metadata("parent", "turn", "parent-thread"),
+  });
+  const item = {
+    type: "compaction",
+    encrypted_content: "fork-parent-opaque-test-only",
+  };
+  const checkpoint = {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    original: [msg("user", "PORTABLE_FORK_731")],
+    virtual: false,
+  };
+  const digest = createHash("sha256")
+    .update(item.encrypted_content)
+    .digest("hex");
+  e.state.set(`checkpoint:${parentCtx.owner}:${digest}`, checkpoint, parentCtx);
+
+  const forkThread = "fork-thread";
+  const forkMetadata = {
+    "x-codex-turn-metadata": JSON.stringify({
+      thread_id: forkThread,
+      parent_thread_id: "parent-thread",
+      turn_id: "fork-turn",
+    }),
+  };
+  await call(
+    e,
+    DS,
+    "fork-turn",
+    [item, msg("user", "continue")],
+    "turn",
+    { ...headers, "thread-id": forkThread },
+    undefined,
+    forkMetadata,
+  );
+  assert.match(JSON.stringify(seen[0].input), /PORTABLE_FORK_731/);
+  assert.doesNotMatch(JSON.stringify(seen[0].input), /fork-parent-opaque/);
+  assert.equal(
+    logs.filter((event) => event.event === "checkpoint_inherited_from_parent")
+      .length,
+    1,
+  );
+  const forkAuth = identity("subscription", headers, {}).auth;
+  assert.deepEqual(
+    e.state.get(`checkpoint:${threadOwner(forkAuth, forkThread)}:${digest}`),
+    checkpoint,
+  );
+});
+
+test("fork inheritance rejects a wrong parent or compaction hash and stays below the local lookup budget", () => {
+  const e = new Engine(config(), { send: async () => json(result([])) });
+  const parentCtx = identity("subscription", headers, {
+    client_metadata: metadata("parent", "turn", "parent-thread"),
+  });
+  const item = { type: "compaction", encrypted_content: "exact-parent-hash" };
+  const digest = createHash("sha256").update(item.encrypted_content).digest("hex");
+  e.state.set(`checkpoint:${parentCtx.owner}:${digest}`, {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    original: [msg("user", "portable")],
+    virtual: false,
+  }, parentCtx);
+
+  const target = config().targets.go;
+  for (const [parentThread, encryptedContent] of [
+    ["wrong-parent", item.encrypted_content],
+    ["parent-thread", "different-compaction-hash"],
+  ]) {
+    const ctx = identity("subscription", headers, {
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: `fork-${parentThread}-${encryptedContent}`,
+          parent_thread_id: parentThread,
+        }),
+      },
+    });
+    assert.throws(
+      () => expandCheckpoints(e.state, ctx, [{ ...item, encrypted_content: encryptedContent }], target, { portable: true }),
+      (error) => error.type === "compaction_history_unavailable",
+    );
+  }
+
+  const samples = [];
+  for (let index = 0; index < 200; index++) {
+    const ctx = identity("subscription", headers, {
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: `benchmark-fork-${index}`,
+          parent_thread_id: "parent-thread",
+        }),
+      },
+    });
+    const started = performance.now();
+    expandCheckpoints(e.state, ctx, [item], target, { portable: true });
+    samples.push(performance.now() - started);
+  }
+  samples.sort((a, b) => a - b);
+  assert.ok(samples[Math.floor(samples.length * 0.95)] < 10);
+});
+
+test("fork inheritance fails closed without a portable parent and keeps official continuation native", async () => {
+  const seen = [], logs = [];
+  const e = new Engine(config(), {
+    log: (event) => logs.push(event),
+    send: async (_, options) => {
+      seen.push(options.body);
+      return json(result([msg("assistant", "ok")]));
+    },
+  });
+  const item = {
+    type: "compaction",
+    encrypted_content: "fork-nonportable-test-only",
+  };
+  const parentCtx = identity("subscription", headers, {
+    client_metadata: metadata("parent", "turn", "parent-thread"),
+  });
+  const digest = createHash("sha256")
+    .update(item.encrypted_content)
+    .digest("hex");
+  e.state.set(
+    `checkpoint:${threadOwner(parentCtx.auth, "parent-thread")}:${digest}`,
+    {
+      provider: "chatgpt-subscription",
+      model: GPT,
+      targetId: `official:${GPT}`,
+      virtual: false,
+    },
+    parentCtx,
+  );
+  const forkMetadata = {
+    "x-codex-turn-metadata": JSON.stringify({
+      thread_id: "fork-thread",
+      parent_thread_id: "parent-thread",
+      turn_id: "fork-turn",
+    }),
+  };
+  await assert.rejects(
+    call(
+      e,
+      DS,
+      "fork-turn",
+      [item],
+      "turn",
+      headers,
+      undefined,
+      forkMetadata,
+    ),
+    /Compacted history/,
+  );
+  assert.equal(seen.length, 0);
+  assert.ok(
+    logs.some(
+      (event) =>
+        event.event === "checkpoint_parent_unavailable" &&
+        event.reason === "portable_source_missing",
+    ),
+  );
+
+  await call(
+    e,
+    GPT,
+    "official-turn",
+    [item],
+    "turn",
+    headers,
+    undefined,
+    {
+      "x-codex-turn-metadata": JSON.stringify({
+        thread_id: "official-fork",
+        parent_thread_id: "missing-parent",
+        turn_id: "official-turn",
+      }),
+    },
+  );
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].input[0].encrypted_content, item.encrypted_content);
+
+  await assert.rejects(
+    call(
+      e,
+      DS,
+      "wrong-account",
+      [item],
+      "turn",
+      { ...headers, authorization: "Bearer other" },
+      undefined,
+      forkMetadata,
+    ),
+    /Compacted history/,
+  );
+  assert.equal(seen.length, 1);
 });
 
 test("summary-mode compaction makes exactly one source-model call with tools disabled", async () => {
@@ -627,6 +849,182 @@ test("Responses Lite per-frame protocol header is isolated and tool declarations
   );
   assert.ok(!seen.at(-1).body.input.some((x) => x.type === "additional_tools"));
   assert.ok(JSON.stringify(seen.at(-1).body.input).includes("PORTABLE_LITE"));
+});
+
+test("cross-provider Responses Lite keeps only current tools and closes a core tool call", async () => {
+  const c = config();
+  c.targets.go.modelFamily = "openai-gpt";
+  c.targets.go.app = { enabled: true, useResponsesLite: true };
+  const seen = [], logs = [];
+  const e = new Engine(c, {
+    log: (event) => logs.push(event),
+    toolRegistry: {
+      pluginApps: new Set(),
+      pluginMcpServers: new Set(["acceptance_github", "acceptance_gmail"]),
+      pluginMcpOwners: new Map([
+        ["acceptance_github", "github"],
+        ["acceptance_gmail", "gmail"],
+      ]),
+      userMcpServers: new Set(["router_acceptance"]),
+      coreNamespaces: new Set(["functions"]),
+    },
+    send: async (_, options) => {
+      seen.push(options.body);
+      if (options.body.model !== DS)
+        return json(result([msg("assistant", "official source")]));
+      if (
+        options.body.input.some(
+          (item) =>
+            item.type === "function_call_output" &&
+            item.call_id === "call_lite_core",
+        )
+      )
+        return json(result([msg("assistant", "LITE_CORE_RESULT_USED")]));
+      return json(
+        result([
+          {
+            type: "function_call",
+            name: "exec_command",
+            call_id: "call_lite_core",
+            arguments: "{}",
+            status: "completed",
+          },
+        ]),
+      );
+    },
+  });
+  const historicalCarrier = {
+    type: "additional_tools",
+    tools: [{ type: "function", name: "stale_history_tool" }],
+  };
+  const source = await call(e, GPT, "lite-source", [
+    historicalCarrier,
+    msg("user", "source turn"),
+  ]);
+  const currentCarrier = {
+    type: "additional_tools",
+    tools: [
+      {
+        type: "namespace",
+        name: "functions",
+        tools: [{ type: "function", name: "exec_command" }],
+      },
+      {
+        type: "namespace",
+        name: "mcp__acceptance_github",
+        tools: [{ type: "function", name: "read_allowed" }],
+      },
+      {
+        type: "namespace",
+        name: "mcp__acceptance_gmail",
+        tools: [{ type: "function", name: "read_forbidden" }],
+      },
+      {
+        type: "namespace",
+        name: "mcp__router_acceptance",
+        tools: [{ type: "function", name: "read_user" }],
+      },
+    ],
+  };
+  const switched = await call(
+    e,
+    DS,
+    "lite-switch",
+    [currentCarrier, msg("user", "use the core tool")],
+    "turn",
+    headers,
+    source.id,
+  );
+  const migrated = seen.filter((body) => body.model === DS).at(-1);
+  const carriers = migrated.input.filter(
+    (item) => item.type === "additional_tools",
+  );
+  const names = carriers.flatMap((item) => item.tools.map((tool) => tool.name));
+  assert.equal(carriers.length, 1);
+  assert.deepEqual(names, [
+    "functions",
+    "mcp__acceptance_github",
+    "mcp__router_acceptance",
+  ]);
+  assert.doesNotMatch(JSON.stringify(migrated), /stale_history_tool|read_forbidden/);
+  assert.equal(switched.output[0].name, "exec_command");
+  const completed = await call(
+    e,
+    DS,
+    "lite-result",
+    [
+      {
+        type: "function_call_output",
+        call_id: "call_lite_core",
+        output: "CORE_RESULT_804",
+      },
+    ],
+    "turn",
+    headers,
+    switched.id,
+  );
+  assert.match(completed.output[0].content[0].text, /LITE_CORE_RESULT_USED/);
+  assert.match(JSON.stringify(seen.at(-1).input), /CORE_RESULT_804/);
+  assert.ok(
+    logs.some(
+      (event) =>
+        event.event === "plugin_tools_filtered" && event.removed_count > 0,
+    ),
+  );
+  assert.ok(
+    logs.some(
+      (event) =>
+        event.event === "route" &&
+        event.model === DS &&
+        event.additional_tool_definitions === 3 &&
+        event.effective_tool_definitions === 3,
+    ),
+  );
+});
+
+test("migration summary restores the current Responses Lite tool carrier", async () => {
+  const c = config();
+  c.targets.go.modelFamily = "openai-gpt";
+  c.targets.go.app = { enabled: true, useResponsesLite: true };
+  const seen = [];
+  let targetAttempts = 0;
+  const e = new Engine(c, {
+    send: async (_, options) => {
+      seen.push(options.body);
+      if (options.body.model === DS && ++targetAttempts === 1)
+        return upstreamError(
+          400,
+          "context_length_exceeded",
+          "maximum context length exceeded",
+        );
+      if (options.body.instructions?.startsWith("Create one factual"))
+        return json(result([msg("assistant", "MIGRATION_SUMMARY_805")]));
+      return json(result([msg("assistant", "done")]));
+    },
+  });
+  await call(e, GPT, "summary-source", [msg("user", "source")]);
+  const carrier = {
+    type: "additional_tools",
+    tools: [{ type: "function", name: "exec_command" }],
+  };
+  await call(e, DS, "summary-target", [
+    carrier,
+    msg("user", "older portable text"),
+    msg("user", "current request"),
+  ]);
+  const targetBodies = seen.filter((body) => body.model === DS);
+  assert.equal(targetBodies.length, 2);
+  assert.equal(
+    targetBodies.at(-1).input.filter((item) => item.type === "additional_tools")
+      .length,
+    1,
+  );
+  assert.match(JSON.stringify(targetBodies.at(-1).input), /MIGRATION_SUMMARY_805/);
+  const summaryRequest = seen.find((body) =>
+    body.instructions?.startsWith("Create one factual"),
+  );
+  assert.deepEqual(summaryRequest.tools, []);
+  assert.doesNotMatch(JSON.stringify(summaryRequest.input), /additional_tools/);
 });
 
 test("custom prewarm retains Lite tool definitions for incremental first inference without calling upstream", async (t) => {

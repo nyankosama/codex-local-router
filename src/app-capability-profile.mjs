@@ -27,11 +27,15 @@ export function resolveAppCapabilityProfile(config, target, options = {}) {
   }
 
   const search = resolveStandaloneSearchPolicy(config, target);
-  if (target?.app?.enabled !== true || target?.modelFamily !== "openai-gpt") {
+  if (target?.app?.enabled !== true || (
+    target?.modelFamily !== "openai-gpt" &&
+    target?.app?.capabilityProfile == null &&
+    target?.app?.thirdPartyTemplate == null
+  )) {
     const reason = target?.app == null
       ? "app-absent"
       : target.app.enabled === true
-        ? "non-gpt-unchanged"
+        ? "legacy-non-gpt-unchanged"
         : "app-disabled";
     return {
       profile: null,

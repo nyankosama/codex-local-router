@@ -424,21 +424,30 @@ export class Archive {
     };
   }
 
+  writeState(key, value, scope) {
+    const hash = this.putBlob(value);
+    this.db
+      .prepare(
+        "INSERT INTO records(key,hash,updated,owner,thread,branch) VALUES (?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET hash=excluded.hash,updated=excluded.updated,owner=excluded.owner,thread=excluded.thread,branch=excluded.branch",
+      )
+      .run(
+        this.opaque(key),
+        hash,
+        Date.now(),
+        scope ? this.opaque(scope.owner) : null,
+        scope ? this.opaque(scope.thread) : null,
+        scope ? this.opaque(scope.branch) : null,
+      );
+  }
+
   setState(key, value, scope) {
+    this.transaction(() => this.writeState(key, value, scope));
+  }
+
+  setStates(entries) {
     this.transaction(() => {
-      const hash = this.putBlob(value);
-      this.db
-        .prepare(
-          "INSERT INTO records(key,hash,updated,owner,thread,branch) VALUES (?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET hash=excluded.hash,updated=excluded.updated,owner=excluded.owner,thread=excluded.thread,branch=excluded.branch",
-        )
-        .run(
-          this.opaque(key),
-          hash,
-          Date.now(),
-          scope ? this.opaque(scope.owner) : null,
-          scope ? this.opaque(scope.thread) : null,
-          scope ? this.opaque(scope.branch) : null,
-        );
+      for (const { key, value, scope } of entries)
+        this.writeState(key, value, scope);
     });
   }
 
@@ -632,6 +641,35 @@ export class Archive {
     }
     const sql = `SELECT version,target_id,provider,model,response_id,status,created FROM history_versions${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created DESC LIMIT ?`;
     return this.db.prepare(sql).all(...values, limit);
+  }
+
+  checkpointStats({ owner, thread, branch }) {
+    const rows = this.db.prepare(`
+      SELECT b.hash,b.body,r.updated FROM records r
+      JOIN blobs b ON b.hash=r.hash
+      WHERE r.owner=? AND r.thread=? AND r.branch=?
+      ORDER BY r.updated DESC
+    `).all(this.opaque(owner), this.opaque(thread), this.opaque(branch));
+    const checkpoints = rows
+      .map((row) => ({ value: this.decode(row), updated: row.updated }))
+      .filter(({ value }) =>
+        value &&
+        typeof value === "object" &&
+        Object.hasOwn(value, "virtual") &&
+        Object.hasOwn(value, "targetId") &&
+        Array.isArray(value.view),
+      );
+    const portable = checkpoints.filter(({ value }) =>
+      Array.isArray(value.original ?? value.portable) &&
+      (value.original ?? value.portable).length,
+    );
+    return {
+      portable: portable.length,
+      unrecoverable: checkpoints.length - portable.length,
+      recovered: checkpoints.filter(({ value }) => value.recovery?.sourceHash).length,
+      recentRecoverySourceHash:
+        checkpoints.find(({ value }) => value.recovery?.sourceHash)?.value.recovery.sourceHash ?? null,
+    };
   }
 
   operationKey({ owner, thread, branch, version, kind }) {

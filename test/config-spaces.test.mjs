@@ -68,7 +68,6 @@ async function fixture(t, status = "disabled") {
     CODEX_HOME: home,
     CODEX_LOCAL_ROUTER_HOME: data,
     CODEX_LOCAL_ROUTER_CONFIG: configPath,
-    CODEX_APP_RUNNING: "0",
   };
   const integrationState = {
     schemaVersion: 3,
@@ -181,6 +180,53 @@ test("space revisions are immutable, cloneable, comparable and detect runtime dr
   };
   await writeFile(f.configPath, JSON.stringify(materialized));
   assert.equal((await detectSpaceDrift({ env: f.env })).drift, true);
+});
+
+test("prompt cache affinity versions, diffs and drift detection stay space-scoped", async (t) => {
+  const f = await fixture(t);
+  await initializeSpaces({
+    env: f.env,
+    config: f.config,
+    configPath: f.configPath,
+    codexHome: f.home,
+    integrationState: f.integrationState,
+  });
+  const enabled = structuredClone(f.config);
+  enabled.providers.provider.promptCaching = { affinity: "gateway-opaque" };
+  const appended = await appendSpaceRevision("default", {
+    kind: "router",
+    source: "provider-cache-affinity",
+    config: enabled,
+    defaultCodexModel: "custom-model",
+  }, { env: f.env, expectedLatestRevision: 1 });
+  assert.equal(appended.changed, true);
+  assert.deepEqual(
+    diffSpaceRevisions(
+      await resolveSpace("default@1", f.env),
+      await resolveSpace("default@2", f.env),
+    ),
+    [{
+      path: "config.providers.provider.promptCaching",
+      before: undefined,
+      after: { affinity: "gateway-opaque" },
+    }],
+  );
+
+  const materialized = composeRuntimeConfig(
+    f.config,
+    await resolveSpace("default@2", f.env),
+  );
+  await writeFile(f.configPath, JSON.stringify(materialized));
+  const indexPath = join(f.data, "spaces", "index.json");
+  const index = JSON.parse(await readFile(indexPath, "utf8"));
+  index.active = { space: "default", revision: 2 };
+  await writeFile(indexPath, JSON.stringify(index));
+  assert.equal((await detectSpaceDrift({ env: f.env })).drift, false);
+  materialized.providers.provider.promptCaching.affinity = "none";
+  await writeFile(f.configPath, JSON.stringify(materialized));
+  const drift = await detectSpaceDrift({ env: f.env });
+  assert.equal(drift.drift, true);
+  assert.notEqual(drift.expectedHash, drift.actualHash);
 });
 
 test("space names and revisions fail closed on invalid or tampered state", async (t) => {

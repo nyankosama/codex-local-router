@@ -167,7 +167,17 @@ async function createSyntheticProvider() {
         response = completedResponse(body.model, [message(`${MARKERS.core} ${MARKERS.plugin} ${MARKERS.mcp} ${MARKERS.final}`)]);
     } else if (body.model === "fixture-lite") {
       const resultIds = new Set(record.resultCallIds);
-      if (!resultIds.has("call_g2_search"))
+      const coreTool = names.find((name) => name === "exec_command");
+      if (!resultIds.has("call_g2_lite_core"))
+        response = completedResponse(
+          body.model,
+          coreTool
+            ? [functionCall(coreTool, "call_g2_lite_core")]
+            : [message("MISSING_LITE_CORE_TOOL")],
+        );
+      else if (!text.includes(MARKERS.core))
+        response = completedResponse(body.model, [message("LITE_CORE_RESULT_MARKER_MISSING")]);
+      else if (!resultIds.has("call_g2_search"))
         response = completedResponse(body.model, [
           {
             ...functionCall("run", "call_g2_search", "web"),
@@ -175,7 +185,10 @@ async function createSyntheticProvider() {
           },
         ]);
       else if (text.includes(MARKERS.searchUrl))
-        response = completedResponse(body.model, [message(`${MARKERS.searchUrl} ${MARKERS.searchFinal}`)]);
+        response = completedResponse(
+          body.model,
+          [message(`${MARKERS.core} ${MARKERS.searchUrl} ${MARKERS.searchFinal}`)],
+        );
       else
         response = completedResponse(body.model, [message("SEARCH_RESULT_MARKER_MISSING")]);
     } else {
@@ -580,7 +593,7 @@ try {
   app = startAppServer({ corePath: core.path, home: liteHome, cwd: workspace });
   await app.initialize("codex_local_router_g2_lite");
   const liteThread = await app.rpc("thread/start", {
-    model: "fixture-lite",
+    model: "gpt-5.6-sol",
     modelProvider: "openai",
     cwd: workspace,
     ephemeral: true,
@@ -588,6 +601,12 @@ try {
     approvalPolicy: "never",
   });
   const liteStartedAt = Date.now();
+  const officialPrelude = await app.request(
+    liteThread.thread.id,
+    "gpt-5.6-sol",
+    "Return the synthetic official fixture marker without using tools.",
+    { timeoutMs: 120000 },
+  );
   const liteTurn = await app.request(
     liteThread.thread.id,
     "fixture-lite",
@@ -599,15 +618,28 @@ try {
   const litePayloads = gateway.payloads.filter((item) => item.model === "fixture-lite");
   const searchOutbound = gateway.outbound.filter((event) => event.path.endsWith("/alpha/search"));
   recordCase("lite_search_closure", {
+    officialPreludeCompleted:
+      officialPrelude.status === "completed" &&
+      officialPrelude.text.includes(MARKERS.official),
     appServerCompleted: liteTurn.status === "completed",
+    coreCarrierForwarded: litePayloads.some((item) =>
+      item.additionalToolSurface.names.includes("exec_command"),
+    ),
+    coreResultReachedThirdParty: litePayloads.some((item) =>
+      item.toolResultMarkers.includes("core"),
+    ),
     reducedCarrierAdvertised: litePayloads.some((item) => item.additionalToolSurface.hasWebRun),
     officialSearchRequested: searchOutbound.some((event) => event.official && event.status === 200),
     searchResultReachedThirdParty: litePayloads.some((item) => item.markerMatches.includes("searchUrl")),
     searchItemCompleted: liteTurn.items.some((item) => item.type === "webSearch" && item.status !== "failed"),
-    finalAnswerUsesSearchResult: liteTurn.text.includes(MARKERS.searchFinal) && liteTurn.text.includes(MARKERS.searchUrl),
+    finalAnswerUsesCoreAndSearchResults:
+      liteTurn.text.includes(MARKERS.core) &&
+      liteTurn.text.includes(MARKERS.searchFinal) &&
+      liteTurn.text.includes(MARKERS.searchUrl),
     credentialsSeparated: gateway.outbound.every((event) => (!event.subscriptionBearer && !event.accountHeader) || event.official) && gateway.outbound.every((event) => !event.providerCredential || !event.official),
   }, {
     profile: "lite-search",
+    sourceProfile: "official-transparent",
     clientItems: liteTurn.items,
     searchEvidence: gateway.searchEvidence.map((item) => ({ status: item.status, complete: item.complete, bytes: item.bytes, resultCount: item.resultFingerprints.length })),
     durationMs: Date.now() - liteStartedAt,

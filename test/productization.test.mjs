@@ -181,6 +181,8 @@ test("config transactions preview, back up, apply, and reject stale writes", asy
 test("history migration packages authenticate content and resume tools as completed facts", async () => {
   const versions = [{ version: 1, status: "complete_original", original: [], view: [
     { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] },
+    { type: "tool_search_call", id: "private-search-id", call_id: "search1", arguments: "PRIVATE_SEARCH_QUERY" },
+    { type: "tool_search_output", id: "private-output-id", call_id: "search1", tools: [{ name: "private_tool", schema: "PRIVATE_TOOL_SCHEMA" }] },
     { type: "function_call", call_id: "c1", name: "read", arguments: "{}" },
     { type: "function_call_output", call_id: "c1", output: "done" },
   ] }];
@@ -190,6 +192,8 @@ test("history migration packages authenticate content and resume tools as comple
   await assert.rejects(decryptHistoryPayload(encrypted, "wrong"), /passphrase|authentication/);
   const prompt = historyResumePrompt(versions[0]);
   assert.match(prompt, /COMPLETED TOOL CALL c1/);
+  assert.match(prompt, /Dynamic tool discovery occurred/);
+  assert.doesNotMatch(prompt, /PRIVATE_SEARCH_QUERY|PRIVATE_TOOL_SCHEMA|private_tool|private-search-id/);
   assert.match(prompt, /Do not replay/);
 });
 
@@ -455,10 +459,9 @@ test("service drain fails closed when a loaded service has no trustworthy initia
       ...process.env,
       CODEX_LOCAL_ROUTER_HOME: join(root, "data"),
       CODEX_LOCAL_ROUTER_LAUNCH_AGENT: join(root, "router.plist"),
-      CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL: "1",
-      CODEX_LOCAL_ROUTER_TEST_SERVICE_LOADED: "1",
     },
     signal: (pid, name) => { signals.push([pid, name]); },
+    launchctl: async () => ({ stdout: "", stderr: "" }),
   });
   assert.equal(result.drained, false);
   assert.equal(result.reason, "health_unavailable");
@@ -489,7 +492,9 @@ test("service status ignores saved state from a different config or test instanc
     instance: "test-123",
     url: "http://127.0.0.1:8",
   }));
-  const status = await serviceStatus(configPath, env);
+  const status = await serviceStatus(configPath, env, {
+    launchctl: async () => { throw Error("not loaded"); },
+  });
   assert.equal(status.saved, null);
   assert.equal(status.health, null);
 });

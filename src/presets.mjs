@@ -1,5 +1,6 @@
 const PRESETS = Object.freeze({
   "opencode-go/deepseek-v4.1-flash": Object.freeze({
+    thirdPartyTemplates: ["legacy"],
     provider: {
       adapter: "opencode-go",
       responsesMessagePhasePolicy: "defer_until_done",
@@ -130,4 +131,9 @@ export function applyPreset(target, provider) {
 
 export function listPresets() {
   return Object.keys(PRESETS);
+}
+
+export function presetSupportsThirdPartyTemplate(id, template) {
+  const allowed = PRESETS[id]?.thirdPartyTemplates;
+  return allowed == null || allowed.includes(template);
 }

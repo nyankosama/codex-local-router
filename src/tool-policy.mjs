@@ -137,6 +137,9 @@ function appSource(name, registry) {
 export function classifyTool(tool, registry = {}) {
   const name = toolName(tool);
   const labels = sourceLabels(tool);
+  if ((name === "collaboration" || labels.includes("collaboration")) &&
+      (registry?.userMcpServers?.has("collaboration") || registry?.pluginMcpServers?.has("collaboration")))
+    return { kind: "collision", name, source: "collaboration" };
   if (
     internalToolNames.has(name) ||
     coreToolNames.has(name) ||
@@ -232,11 +235,25 @@ function allowed(classification, allowlist) {
   return classification.kind !== "plugin" || allowlist.has(classification.plugin);
 }
 
-function filterTools(tools, registry, allowlist, diagnostics) {
+const sourceCountKey = (classification, allowlist) => {
+  if (classification.kind === "plugin")
+    return allowlist.has(classification.plugin) ? "allowed_plugin" : "removed_plugin";
+  if (classification.kind === "user-mcp") return "user_mcp";
+  return classification.kind;
+};
+
+function filterTools(tools, registry, allowlist, diagnostics, inheritedSource) {
   if (!Array.isArray(tools)) return tools;
   const filtered = [];
   for (const tool of tools) {
-    const classification = classifyTool(tool, registry);
+    const direct = classifyTool(tool, registry);
+    const inherited =
+      direct.kind === "unknown" && inheritedSource && inheritedSource.kind !== "unknown";
+    const classification = inherited
+      ? { ...inheritedSource, name: direct.name, inherited: true }
+      : direct;
+    diagnostics.sourceCounts[sourceCountKey(classification, allowlist)]++;
+    if (inherited) diagnostics.inheritedSourceCount++;
     if (!allowed(classification, allowlist)) {
       diagnostics.removed.push(classification);
       continue;
@@ -244,7 +261,13 @@ function filterTools(tools, registry, allowlist, diagnostics) {
     if (["unknown", "collision"].includes(classification.kind))
       diagnostics.passedUncertain.push(classification);
     if (tool?.type === "namespace" && Array.isArray(tool.tools)) {
-      const nested = filterTools(tool.tools, registry, allowlist, diagnostics);
+      const nested = filterTools(
+        tool.tools,
+        registry,
+        allowlist,
+        diagnostics,
+        classification,
+      );
       if (!nested.length) {
         diagnostics.removed.push({ ...classification, reason: "empty-namespace" });
         continue;
@@ -276,7 +299,19 @@ export function applyPluginToolPolicy(body, policy, registry = {}) {
       diagnostics: { removed: [], passedUncertain: [] },
     };
   const allowlist = new Set(policy.allowedPlugins);
-  const diagnostics = { removed: [], passedUncertain: [] };
+  const diagnostics = {
+    removed: [],
+    passedUncertain: [],
+    sourceCounts: {
+      core: 0,
+      user_mcp: 0,
+      allowed_plugin: 0,
+      removed_plugin: 0,
+      unknown: 0,
+      collision: 0,
+    },
+    inheritedSourceCount: 0,
+  };
   const tools = filterTools(body.tools, registry, allowlist, diagnostics);
   const input = Array.isArray(body.input)
     ? body.input.flatMap((item) => {

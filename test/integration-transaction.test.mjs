@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { validate } from "../src/config.mjs";
 import {
+  appIsRunning,
   disableIntegration,
   editCodexConfig,
   inspectCodexBaseline,
@@ -20,6 +21,41 @@ const gatewayConfig = (catalog) => validate({
   providers: { go: { baseUrl: "https://example.com", adapter: "opencode-go" } },
   targets: { deepseek: { provider: "go", preset: "opencode-go/deepseek-v4.1-flash" } },
   subscription: { enabled: true, models: ["gpt-5.5"], catalogPath: catalog },
+});
+
+test("production App detection ignores legacy test switches and fails closed when process inspection is unavailable", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "router-app-state-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const codexHome = join(root, "codex"), data = join(root, "data");
+  await mkdir(codexHome, { recursive: true });
+  const source = join(codexHome, "models_cache.json");
+  await writeFile(join(codexHome, "config.toml"), 'model = "gpt-5.5"\n');
+  await writeFile(source, JSON.stringify({ models: [{ slug: "gpt-5.5" }] }));
+  const env = {
+    ...process.env,
+    CODEX_HOME: codexHome,
+    CODEX_LOCAL_ROUTER_HOME: data,
+    CODEX_MODEL_CATALOG_SOURCE: source,
+    CODEX_APP_RUNNING: "0",
+    CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL: "1",
+  };
+  const unavailable = async () => { throw Error("ps unavailable"); };
+  assert.equal(await appIsRunning(env, { exec: unavailable }), null);
+  const status = await integrationStatus(gatewayConfig(source), {
+    env,
+    codexHome,
+    appRunning: async () => null,
+  });
+  assert.equal(status.appRunning, null);
+  assert.equal(status.appRunningError, "app_state_unknown");
+  await assert.rejects(
+    syncIntegration(gatewayConfig(source), {
+      env,
+      codexHome,
+      appRunning: async () => null,
+    }),
+    (error) => error.code === "app_state_unknown",
+  );
 });
 
 test("managed multiline TOML assignments are removed and restored as complete values", () => {
@@ -119,18 +155,18 @@ test("integration sync is idempotent and disable preserves unrelated user edits"
     ...process.env,
     CODEX_HOME: codexHome,
     CODEX_LOCAL_ROUTER_HOME: data,
-    CODEX_APP_RUNNING: "0",
     CODEX_MODEL_CATALOG_SOURCE: source,
   };
   const config = gatewayConfig(source);
-  const first = await syncIntegration(config, { env, codexHome, gatewayConfigPath: join(data, "config.json") });
+  const stopped = async () => false;
+  const first = await syncIntegration(config, { env, codexHome, appRunning: stopped, gatewayConfigPath: join(data, "config.json") });
   assert.equal(first.changed, true);
   assert.match(await readFile(configPath, "utf8"), /BEGIN codex-local-router managed settings/);
   assert.match(await readFile(configPath, "utf8"), new RegExp(multiline.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  const second = await syncIntegration(config, { env, codexHome });
+  const second = await syncIntegration(config, { env, codexHome, appRunning: stopped });
   assert.equal(second.changed, false);
   await writeFile(configPath, (await readFile(configPath, "utf8")) + '\n[projects."/after"]\ntrust_level = "trusted"\n');
-  const third = await syncIntegration(config, { env, codexHome });
+  const third = await syncIntegration(config, { env, codexHome, appRunning: stopped });
   assert.equal(third.changed, false);
   await writeFile(
     configPath,
@@ -140,24 +176,24 @@ test("integration sync is idempotent and disable preserves unrelated user edits"
     ),
   );
   assert.equal(
-    (await integrationStatus(config, { env, codexHome })).configCurrent,
+    (await integrationStatus(config, { env, codexHome, appRunning: stopped })).configCurrent,
     true,
   );
-  const selected = await syncIntegration(config, { env, codexHome });
+  const selected = await syncIntegration(config, { env, codexHome, appRunning: stopped });
   assert.equal(selected.changed, true);
   assert.equal(selected.pending, false);
   assert.equal(selected.state.managed.model, "deepseek-v4.1-flash");
-  const status = await integrationStatus(config, { env, codexHome });
+  const status = await integrationStatus(config, { env, codexHome, appRunning: stopped });
   assert.equal(status.configCurrent, true);
   assert.equal(status.targets[0].contextWindow, 400000);
-  await disableIntegration({ env, codexHome });
+  await disableIntegration({ env, codexHome, appRunning: stopped });
   const restored = await readFile(configPath, "utf8");
   assert.match(restored, /model = "gpt-5.5"/);
   assert.match(restored, /projects\."\/before"/);
   assert.match(restored, /projects\."\/after"/);
   assert.match(restored, new RegExp(multiline.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(restored, /codex-local-router managed settings/);
-  assert.deepEqual(await disableIntegration({ env, codexHome }), { changed: false, conflicts: [] });
+  assert.deepEqual(await disableIntegration({ env, codexHome, appRunning: stopped }), { changed: false, conflicts: [] });
 });
 
 test("running App produces a pending transaction without editing Codex config", async (t) => {
@@ -168,9 +204,10 @@ test("running App produces a pending transaction without editing Codex config", 
   const original = 'model = "gpt-5.5"\n';
   await writeFile(join(codexHome, "config.toml"), original);
   await writeFile(source, JSON.stringify({ models: [{ slug: "gpt-5.5", priority: 10 }] }));
-  const env = { ...process.env, CODEX_HOME: codexHome, CODEX_LOCAL_ROUTER_HOME: join(root, "data"), CODEX_APP_RUNNING: "1", CODEX_MODEL_CATALOG_SOURCE: source };
-  const result = await syncIntegration(gatewayConfig(source), { env, codexHome });
+  const env = { ...process.env, CODEX_HOME: codexHome, CODEX_LOCAL_ROUTER_HOME: join(root, "data"), CODEX_MODEL_CATALOG_SOURCE: source };
+  const running = async () => true;
+  const result = await syncIntegration(gatewayConfig(source), { env, codexHome, appRunning: running });
   assert.equal(result.pending, true);
   assert.equal(await readFile(join(codexHome, "config.toml"), "utf8"), original);
-  assert.equal((await integrationStatus(gatewayConfig(source), { env, codexHome })).pending, true);
+  assert.equal((await integrationStatus(gatewayConfig(source), { env, codexHome, appRunning: running })).pending, true);
 });
