@@ -196,7 +196,7 @@ test("an app-absent legacy GPT target is distinct from an explicitly disabled Ap
   });
 });
 
-test("third-party GPT profiles cannot be attached to unrelated target shapes", () => {
+test("third-party profiles are capability based and still reject unrelated protocol shapes", () => {
   const invalidName = fixture();
   invalidName.targets.gpt.app.capabilityProfile = "everything";
   assert.throws(() => validate(invalidName), /invalid App capability profile/);
@@ -204,7 +204,7 @@ test("third-party GPT profiles cannot be attached to unrelated target shapes", (
   const nonGpt = fixture();
   nonGpt.targets.gpt.modelFamily = "other";
   nonGpt.targets.gpt.app.capabilityProfile = "standard-tools";
-  assert.throws(() => validate(nonGpt), /App-enabled openai-gpt target/);
+  assert.equal(validate(nonGpt).targets.gpt.app.capabilityProfile, "standard-tools");
 
   const chat = fixture();
   chat.targets.gpt.wireApi = "chat_completions";

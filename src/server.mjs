@@ -260,7 +260,17 @@ export function createGateway(config, options = {}) {
       phase = "inference";
       res.setHeader("x-gateway-request-id", requestId);
       let response;
-      for await (const event of engine.generate(entry, req.headers, body, c.signal)) {
+      for await (const event of engine.generate(
+        entry,
+        req.headers,
+        body,
+        c.signal,
+        {
+          transport: "http",
+          responsesLite:
+            req.headers["x-openai-internal-codex-responses-lite"] === "true",
+        },
+      )) {
         if (["response.completed", "response.incomplete"].includes(event.type))
           response = event.response;
         if (body.stream) {
@@ -542,6 +552,13 @@ export function createGateway(config, options = {}) {
                 headers,
                 body,
                 active.signal,
+                {
+                  transport: "websocket",
+                  responsesLite:
+                    message.client_metadata
+                      ?.ws_request_header_x_openai_internal_codex_responses_lite ===
+                    "true",
+                },
               ))
                 await send({ ...event, sequence_number: seq++ });
           } catch (e) {

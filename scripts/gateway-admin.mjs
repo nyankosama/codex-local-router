@@ -3,10 +3,15 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
 import { readFile, rm } from "node:fs/promises";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { loadConfig, upgradeConfig, validate } from "../src/config.mjs";
 import { buildModelCatalog } from "../src/model-catalog.mjs";
-import { readRollout, importRollout } from "../src/rollout.mjs";
+import {
+  applyRolloutRecovery,
+  importRollout,
+  planRolloutRecovery,
+  readRollout,
+} from "../src/rollout.mjs";
 import { loadCodexAuth } from "../src/local-identity.mjs";
 import { configDiff, createConfig, rawConfig, writeConfigTransaction } from "../src/config-store.mjs";
 import {
@@ -14,6 +19,7 @@ import {
   discoverCodex,
   disableIntegration,
   integrationStatus,
+  codexInstructionOverrideStatus,
   syncIntegration,
 } from "../src/integration.mjs";
 import {
@@ -31,7 +37,7 @@ import {
   historyResumePrompt,
 } from "../src/history-package.mjs";
 import { atomicJSON, atomicWrite, withFileLock } from "../src/files.mjs";
-import { PACKAGE_VERSION, PRODUCT_NAME, runtimePaths } from "../src/product.mjs";
+import { codexHome, PACKAGE_VERSION, PRODUCT_NAME, runtimePaths } from "../src/product.mjs";
 import { credential } from "../src/providers.mjs";
 import {
   resolvePluginToolPolicy,
@@ -45,7 +51,25 @@ import {
   resolveAppCapabilityProfile,
   validateAppCapabilityProfile,
 } from "../src/app-capability-profile.mjs";
-import { preset as loadPreset } from "../src/presets.mjs";
+import {
+  PROMPT_CACHE_AFFINITIES,
+  resolvePromptCacheAffinity,
+} from "../src/prompt-cache-affinity.mjs";
+import {
+  preset as loadPreset,
+  presetSupportsThirdPartyTemplate,
+} from "../src/presets.mjs";
+import { applyManagedInstructions, captureInstructions, instructionStatus, redactInstructions } from "../src/instruction-source.mjs";
+import { captureMultiAgent, configureMultiAgent, multiAgentStatus } from "../src/multi-agent-source.mjs";
+import { INSTRUCTION_DELIVERIES } from "../src/instruction-delivery.mjs";
+import {
+  GENERIC_INSTRUCTIONS,
+  GENERIC_INSTRUCTION_TEMPLATE,
+  THIRD_PARTY_TEMPLATES,
+  applyThirdPartyTemplate,
+  effectiveThirdPartyTemplate,
+  thirdPartyTemplateStatus,
+} from "../src/third-party-template.mjs";
 import { discoverToolSources } from "../src/tool-sources.mjs";
 import {
   DEFAULT_SPACE,
@@ -154,20 +178,119 @@ function requestedResponsesLite() {
   return undefined;
 }
 
+function requestedInstructionDelivery() {
+  const mode = value("instruction-delivery");
+  if (mode == null) return undefined;
+  if (!INSTRUCTION_DELIVERIES.includes(mode))
+    throw Object.assign(Error("--instruction-delivery must be client or gateway-lite"), {
+      code: "usage_error",
+    });
+  return mode;
+}
+
+function requestedToolMode() {
+  const mode = value("tool-mode");
+  if (mode != null && !["default", "code_mode_only"].includes(mode))
+    throw Object.assign(Error("--tool-mode must be default or code_mode_only"), { code: "usage_error" });
+  return mode;
+}
+
+function requestedTemplate() {
+  const template = value("template");
+  if (template == null) return undefined;
+  if (!THIRD_PARTY_TEMPLATES.includes(template))
+    throw Object.assign(Error("--template must be codex-general-v1 or legacy"), { code: "usage_error" });
+  return template;
+}
+
+function requestedMultiAgentVersion() {
+  const version = value("multi-agent-version");
+  if (version == null) return undefined;
+  if (!["v1", "v2", "client-default"].includes(version))
+    throw Object.assign(Error("--multi-agent-version must be v1, v2 or client-default"), { code: "usage_error" });
+  return version;
+}
+
+function setMultiAgentVersion(target, version) {
+  if (version == null) return target;
+  if (version === "client-default") {
+    const next = structuredClone(target);
+    if (next.app) delete next.app.multiAgent;
+    return next;
+  }
+  return configureMultiAgent(target, version);
+}
+
+async function requestedManagedInstructions() {
+  const template = value("instructions-template");
+  const file = value("instructions-file");
+  if (template != null && file != null)
+    throw Object.assign(Error("instruction source flags conflict"), { code: "usage_error" });
+  if (template != null) {
+    if (template !== GENERIC_INSTRUCTION_TEMPLATE)
+      throw Object.assign(Error("--instructions-template must be codex-generic-v1"), { code: "usage_error" });
+    return { mode: "builtin-template", template, text: GENERIC_INSTRUCTIONS };
+  }
+  if (file != null) {
+    const text = await readFile(resolve(file), "utf8");
+    if (!text.trim()) throw Object.assign(Error("instruction file is empty"), { code: "instruction_source_empty" });
+    return { mode: "custom", text };
+  }
+  return null;
+}
+
+function setToolMode(target, mode) {
+  if (mode == null) return;
+  if (mode === "default") {
+    if (target.app) delete target.app.toolMode;
+  } else {
+    target.app ??= {};
+    target.app.toolMode = mode;
+  }
+}
+
+async function assertNoCodexInstructionOverride() {
+  const discovery = await discoverCodex(env);
+  const text = await readFile(discovery.configPath, "utf8");
+  const status = codexInstructionOverrideStatus(text);
+  if (status.configured)
+    throw Object.assign(
+      Error("gateway-lite instruction delivery conflicts with the active Codex model_instructions_file override"),
+      { code: "instruction_custom_conflict" },
+    );
+}
+
 function capabilityProfileSummaries(config) {
   return Object.values(config.targets).map((target) => ({
     target: target.id,
     ...resolveAppCapabilityProfile(config, target),
+    toolMode: target.app?.toolMode ?? "default",
+    toolFilteringBoundary: target.app?.toolMode === "code_mode_only"
+      ? "structured-only; embedded-exec-opaque"
+      : "structured-tools",
   }));
 }
 
 function humanCapabilityProfile(profile) {
-  return `${profile?.profile ?? "unchanged"} (${profile?.reason ?? "unknown"}; ${profile?.toolSurface ?? "unchanged"})`;
+  return `${profile?.profile ?? "unchanged"} (${profile?.reason ?? "unknown"}; ${profile?.toolSurface ?? "unchanged"}); ` +
+    `tool-mode=${profile?.toolMode ?? "default"}; filtering=${profile?.toolFilteringBoundary ?? "structured-tools"}`;
 }
 
 function humanCapabilityProfileLines(profiles) {
   return (profiles ?? [])
     .map((profile) => `${profile.target}=${humanCapabilityProfile(profile)}`)
+    .join(", ");
+}
+
+function humanPromptCacheAffinity(summary) {
+  return `${summary?.mode ?? "none"} (${summary?.reason ?? "unknown"}; ` +
+    `carrier=${summary?.carrier ?? "none"}; ` +
+    `restart=${summary?.restartStability ?? "not-applicable"})`;
+}
+
+function humanPromptCacheLines(summaries) {
+  return (summaries ?? [])
+    .map((summary) => `${summary.target}=${humanPromptCacheAffinity(summary)}`)
     .join(", ");
 }
 
@@ -193,8 +316,57 @@ function searchSummaries(config, credentials) {
   });
 }
 
+function promptCacheSummaries(config) {
+  return Object.values(config.targets).map((target) => ({
+    target: target.id,
+    ...resolvePromptCacheAffinity(config, target),
+  }));
+}
+
 function emit(value, human) {
-  console.log(jsonMode || !human ? JSON.stringify(value, null, 2) : human(value));
+  const safe = redactInstructions(value);
+  console.log(jsonMode || !human ? JSON.stringify(safe, null, 2) : human(safe));
+}
+
+async function instructionCatalog(config) {
+  const path = config.subscription?.catalogPath ?? (await discoverCodex(env)).catalogSource;
+  return readFile(path, "utf8").then(JSON.parse).catch(() => null);
+}
+
+async function instructionSummaries(config) {
+  const catalog = await instructionCatalog(config);
+  return Object.values(config.targets).map((target) => instructionStatus(target, catalog));
+}
+
+async function multiAgentSummaries(config) {
+  const catalog = await instructionCatalog(config);
+  return Object.values(config.targets).map((target) => multiAgentStatus(target, catalog));
+}
+
+async function captureTargetMultiAgent(config, ids, sourceModel) {
+  const catalog = sourceModel === "none" ? null : await instructionCatalog(config);
+  const result = sourceModel === "none" ? null : spawnSync(env.CODEX_CLI_PATH ?? "/Applications/ChatGPT.app/Contents/Resources/codex", ["--version"],
+    { encoding: "utf8", timeout: 10000 });
+  const clientVersion = result?.status === 0 ? result.stdout.trim() : null;
+  const captured = {};
+  for (const id of ids) {
+    if (!config.targets[id]) throw Object.assign(Error(`model does not exist: ${id}`), { code: "model_not_found" });
+    captured[id] = captureMultiAgent(config.targets[id], catalog, { sourceModel, clientVersion });
+  }
+  Object.assign(config.targets, captured);
+}
+
+async function captureTargetInstructions(config, ids, options = {}) {
+  const catalog = await instructionCatalog(config);
+  const result = spawnSync(env.CODEX_CLI_PATH ?? "/Applications/ChatGPT.app/Contents/Resources/codex", ["--version"],
+    { encoding: "utf8", timeout: 10000 });
+  const clientVersion = result.status === 0 ? result.stdout.trim() : null;
+  const captured = {};
+  for (const id of ids) {
+    if (!config.targets[id]) throw Object.assign(Error(`model does not exist: ${id}`), { code: "model_not_found" });
+    captured[id] = captureInstructions(config.targets[id], catalog, { ...options, clientVersion });
+  }
+  Object.assign(config.targets, captured);
 }
 
 async function confirm(summary) {
@@ -297,8 +469,26 @@ async function inspectCredentials(config) {
 }
 
 function baseConfig(discovery) {
-  const providerId = value("provider-id") ?? "opencode-go";
-  const targetId = value("target-id") ?? "deepseek";
+  const presetId = value("preset");
+  if (!presetId)
+    throw Object.assign(Error(
+      "fresh setup requires --preset PRESET; use --config PATH for an existing complete configuration",
+    ), { code: "setup_preset_required" });
+  const selected = loadPreset(presetId);
+  const providerId = value("provider-id") ?? "provider";
+  const targetId = value("target-id") ?? "model";
+  const baseUrl = value("base-url") ?? selected.provider?.baseUrl;
+  if (!baseUrl)
+    throw Object.assign(Error(`preset ${presetId} requires --base-url URL for setup`), {
+      code: "setup_base_url_required",
+    });
+  const provider = {
+    ...selected.provider,
+    ...(value("adapter") ? { adapter: value("adapter") } : {}),
+    baseUrl,
+    ...(value("api-key-env") ? { apiKeyEnv: value("api-key-env") } : {}),
+    concurrency: Number(value("concurrency") ?? 4),
+  };
   return {
     schemaVersion: 3,
     listen: { host: "127.0.0.1", port: Number(value("port") ?? 8788) },
@@ -306,17 +496,13 @@ function baseConfig(discovery) {
     mode: "rules",
     defaultTarget: targetId,
     providers: {
-      [providerId]: {
-        adapter: value("adapter") ?? "opencode-go",
-        baseUrl: value("base-url") ?? "https://opencode.ai/zen/go",
-        apiKeyEnv: value("api-key-env") ?? "OPENCODE_GO_API_KEY",
-        concurrency: Number(value("concurrency") ?? 4),
-      },
+      [providerId]: provider,
     },
     targets: {
-      [targetId]: { provider: providerId, preset: value("preset") ?? "opencode-go/deepseek-v4.1-flash" },
+      [targetId]: { provider: providerId, preset: presetId },
     },
     rules: [],
+    thirdPartyDefaults: { template: requestedTemplate() ?? "codex-general-v1" },
     history: {
       maxBytes: 128 * 1024 * 1024,
       ttlMs: 30 * 60 * 1000,
@@ -329,7 +515,7 @@ function baseConfig(discovery) {
   };
 }
 
-const describeDiff = (diff) => diff
+const describeDiff = (diff) => redactInstructions(diff)
   .map((item) => `${item.path}: ${JSON.stringify(item.before)} -> ${JSON.stringify(item.after)}`)
   .join("\n");
 
@@ -410,7 +596,11 @@ async function mutateSpaceConfig(mutator, label, options = {}) {
   if (appended.changed && context.index.active?.space === context.name)
     switching = await beginSpaceSwitch(
       `${context.name}@${appended.revision.revision}`,
-      { env, configPath },
+      {
+        env,
+        configPath,
+        preserveCodexSelection: options.preserveCodexSelection === true,
+      },
     );
   const result = {
     changed: appended.changed,
@@ -488,8 +678,19 @@ async function setup() {
     throw Object.assign(Error("configuration spaces are already initialized; use space and config commands"), {
       code: "spaces_already_initialized",
     });
-  const after = before ? upgradeConfig(before).config : baseConfig(discovery);
-  if (!before) validate(after);
+  let after = before ? upgradeConfig(before).config : structuredClone(validate(baseConfig(discovery)));
+  if (!before) {
+    const explicitTemplate = requestedTemplate();
+    const template = effectiveThirdPartyTemplate(after);
+    for (const id of Object.keys(after.targets)) {
+      const targetTemplate = explicitTemplate == null &&
+          !presetSupportsThirdPartyTemplate(after.targets[id].preset, template)
+        ? "legacy"
+        : template;
+      after.targets[id] = applyThirdPartyTemplate(after.targets[id], targetTemplate);
+    }
+    after = structuredClone(validate(after));
+  }
   const preview = before
     ? await writeConfigTransaction(configPath, before, after)
     : await createConfig(configPath, after);
@@ -510,7 +711,7 @@ async function setup() {
   if (suppliedCredential != null) {
     if (!suppliedCredential)
       throw Object.assign(Error("provider credential cannot be empty"), { code: "provider_credential_missing" });
-    const providerId = value("provider-id") ?? "opencode-go";
+    const providerId = value("provider-id") ?? "provider";
     const service = value("keychain-service") ?? "codex-local-router-provider";
     const account = value("keychain-account") ?? providerId;
     await storeKeychain(service, account, suppliedCredential);
@@ -556,6 +757,15 @@ async function providerCommand() {
   const suppliedCredential = await requestedCredential();
   if (flag("no-standalone-search-endpoint") && value("standalone-search-endpoint") != null)
     throw Object.assign(Error("standalone search endpoint flags conflict"), { code: "usage_error" });
+  const promptCacheAffinity = value("prompt-cache-affinity");
+  if (
+    promptCacheAffinity != null &&
+    !PROMPT_CACHE_AFFINITIES.has(promptCacheAffinity)
+  )
+    throw Object.assign(
+      Error("--prompt-cache-affinity must be none or gateway-opaque"),
+      { code: "usage_error" },
+    );
   const keychain = suppliedCredential == null ? null : {
     service: value("keychain-service") ?? "codex-local-router-provider",
     account: value("keychain-account") ?? id,
@@ -589,6 +799,8 @@ async function providerCommand() {
       };
     if (flag("no-standalone-search-endpoint"))
       delete config.providers[id].standaloneSearch;
+    if (promptCacheAffinity != null)
+      config.providers[id].promptCaching = { affinity: promptCacheAffinity };
     if (keychain) {
       config.providers[id].keychain = keychain;
       delete config.providers[id].apiKeyEnv;
@@ -604,6 +816,8 @@ async function modelCommand() {
   const id = value("id") ?? positional[2];
   if (command === "list") {
     const config = await loadCommandConfig();
+    const instructions = new Map((await instructionSummaries(config)).map((entry) => [entry.target, entry]));
+    const multiAgents = new Map((await multiAgentSummaries(config)).map((entry) => [entry.target, entry]));
     const registry = await discoverToolSources();
     const credentials = await inspectCredentials(config);
     const searches = new Map(
@@ -611,6 +825,9 @@ async function modelCommand() {
     );
     const profiles = new Map(
       capabilityProfileSummaries(config).map((profile) => [profile.target, profile]),
+    );
+    const promptCaching = new Map(
+      promptCacheSummaries(config).map((summary) => [summary.target, summary]),
     );
     return emit(Object.values(config.targets).map((target) => ({
       id: target.id, provider: target.provider, model: target.model,
@@ -622,9 +839,15 @@ async function modelCommand() {
       toolSourceRecognition: toolSourceStatus(registry),
       standaloneSearch: searches.get(target.id),
       appCapabilityProfile: profiles.get(target.id),
+      promptCaching: promptCaching.get(target.id),
+      template: thirdPartyTemplateStatus(target),
+      instructions: instructions.get(target.id),
+      multiAgent: multiAgents.get(target.id),
     })), (rows) => rows.map((row) =>
       `${row.id}\t${row.provider}\t${row.model}\t${row.contextWindow}` +
-      `\tprofile=${humanCapabilityProfile(row.appCapabilityProfile)}`,
+      `\tprofile=${humanCapabilityProfile(row.appCapabilityProfile)}` +
+      `\tprompt-cache=${humanPromptCacheAffinity(row.promptCaching)}` +
+      `\tinstructions=${JSON.stringify(row.instructions)}\tmulti-agent=${JSON.stringify(row.multiAgent)}`,
     ).join("\n"));
   }
   if (command === "probe") {
@@ -645,13 +868,21 @@ async function modelCommand() {
         .find((search) => search.target === id),
       appCapabilityProfile: capabilityProfileSummaries(config)
         .find((profile) => profile.target === id),
+      promptCaching: promptCacheSummaries(config)
+        .find((summary) => summary.target === id),
+      template: thirdPartyTemplateStatus(target),
       live: false,
+      instructions: (await instructionSummaries(config)).find((entry) => entry.target === id),
+      multiAgent: (await multiAgentSummaries(config)).find((entry) => entry.target === id),
     };
     if (!flag("live")) return emit(configured, (row) =>
       `Model ${id} configuration is valid. ` +
       `Profile: ${humanCapabilityProfile(row.appCapabilityProfile)}. ` +
       `Standalone search: ${row.standaloneSearch.source ?? "unchanged"} ` +
       `(${row.standaloneSearch.reason}; ${row.standaloneSearch.advertised ? "advertised" : "not advertised"}). ` +
+      `Prompt cache: ${humanPromptCacheAffinity(row.promptCaching)}. ` +
+      `Instructions: ${JSON.stringify(row.instructions)}. ` +
+      `Multi-agent: ${JSON.stringify(row.multiAgent)}. ` +
       `Use --live to spend model quota on an end-to-end probe.`,
     );
     const { auth } = await loadCodexAuth();
@@ -668,18 +899,83 @@ async function modelCommand() {
     if (!response.ok || body.status !== "completed") throw Object.assign(Error("live model probe failed"), { code: "model_probe_failed", status: response.status });
     return emit({ ...configured, live: true, status: body.status, responseId: body.id }, () => `Model ${id} live probe completed.`);
   }
+  if (command === "set-tool-mode") {
+    const ids = value("ids")?.split(",").map((id) => id.trim());
+    const mode = requestedToolMode();
+    if (!ids?.length || ids.some((id) => !id) || new Set(ids).size !== ids.length || mode == null)
+      throw Object.assign(Error("set-tool-mode requires unique --ids TARGET,... and --tool-mode"), { code: "usage_error" });
+    return mutateConfig((config) => {
+      for (const id of ids) {
+        if (!config.targets[id])
+          throw Object.assign(Error(`model does not exist: ${id}`), { code: "model_not_found" });
+        setToolMode(config.targets[id], mode);
+      }
+    }, "model set-tool-mode", { preserveCodexSelection: true });
+  }
+  if (command === "sync-multi-agent") {
+    const ids = value("ids")?.split(",").map((id) => id.trim());
+    if (!ids?.length || ids.some((id) => !id) || new Set(ids).size !== ids.length)
+      throw Object.assign(Error("sync-multi-agent requires unique --ids TARGET,..."), { code: "usage_error" });
+    return mutateConfig((config) => captureTargetMultiAgent(config, ids, value("multi-agent-from")),
+      "model sync-multi-agent", { preserveCodexSelection: true });
+  }
+  if (command === "sync-instructions") {
+    const ids = value("ids")?.split(",").map((id) => id.trim());
+    if (!ids?.length || ids.some((id) => !id) || new Set(ids).size !== ids.length)
+      throw Object.assign(Error("sync-instructions requires unique --ids TARGET,..."), { code: "usage_error" });
+    const instructionDelivery = requestedInstructionDelivery();
+    return mutateConfig(async (config) => {
+      await captureTargetInstructions(config, ids);
+      if (instructionDelivery != null)
+        for (const id of ids) config.targets[id].app.instructionDelivery = instructionDelivery;
+    }, "model sync-instructions", {
+      preserveCodexSelection: true,
+      beforeApply: instructionDelivery === "gateway-lite"
+        ? assertNoCodexInstructionOverride
+        : undefined,
+    });
+  }
+  if (command === "apply-template") {
+    const ids = value("ids")?.split(",").map((entry) => entry.trim());
+    const template = requestedTemplate();
+    if (!ids?.length || ids.some((entry) => !entry) || new Set(ids).size !== ids.length || template == null)
+      throw Object.assign(Error("apply-template requires unique --ids TARGET,... and --template"), { code: "usage_error" });
+    return mutateConfig((config) => {
+      const applied = {};
+      for (const targetId of ids) {
+        if (!config.targets[targetId])
+          throw Object.assign(Error(`model does not exist: ${targetId}`), { code: "model_not_found" });
+        applied[targetId] = applyThirdPartyTemplate(config.targets[targetId], template);
+      }
+      Object.assign(config.targets, applied);
+    }, "model apply-template", { preserveCodexSelection: true });
+  }
   if (!["add", "edit", "remove"].includes(command) || !id)
     throw Object.assign(Error("model add|edit|remove requires --id"), { code: "usage_error" });
   const requestedProfile = requestedAppProfile();
   const requestedLite = requestedResponsesLite();
+  const instructionDelivery = requestedInstructionDelivery();
+  const toolMode = requestedToolMode();
+  const template = requestedTemplate();
+  const multiAgentVersion = requestedMultiAgentVersion();
+  const managedInstructions = await requestedManagedInstructions();
+  if ([value("instructions-from"), managedInstructions].filter((entry) => entry != null).length > 1)
+    throw Object.assign(Error("instruction source flags conflict"), { code: "usage_error" });
+  if (value("multi-agent-from") != null && multiAgentVersion != null)
+    throw Object.assign(Error("multi-agent source flags conflict"), { code: "usage_error" });
+  if (instructionDelivery === "gateway-lite" && value("instructions-from") === "none")
+    throw Object.assign(Error("gateway-lite instruction delivery requires an instruction snapshot"), {
+      code: "usage_error",
+    });
   if (
     flag("no-app") &&
-    (requestedProfile != null || requestedLite != null || requestedSearchSource() != null)
+    (requestedProfile != null || requestedLite != null || requestedSearchSource() != null || instructionDelivery != null || toolMode != null ||
+      value("multi-agent-from") != null || multiAgentVersion != null || template != null || managedInstructions != null)
   )
     throw Object.assign(Error("App profile or search flags cannot be combined with --no-app"), {
       code: "usage_error",
     });
-  await mutateConfig((config) => {
+  await mutateConfig(async (config) => {
     config.targets ??= {};
     if (command === "add" && config.targets[id]) throw Object.assign(Error(`model already exists: ${id}`), { code: "model_exists" });
     if (command !== "add" && !config.targets[id]) throw Object.assign(Error(`model does not exist: ${id}`), { code: "model_not_found" });
@@ -697,6 +993,15 @@ async function modelCommand() {
     const wireApi = value("protocol") ?? current.wireApi ?? presetTarget?.wireApi ?? "responses";
     const appEnabled = !flag("no-app") &&
       (current.app?.enabled === true || presetTarget?.app?.enabled === true || command === "add");
+    let effectiveTemplate = appEnabled && (command === "add" || template != null)
+      ? effectiveThirdPartyTemplate(config, template)
+      : null;
+    if (
+      command === "add" &&
+      template == null &&
+      presetId != null &&
+      !presetSupportsThirdPartyTemplate(presetId, effectiveTemplate)
+    ) effectiveTemplate = "legacy";
     let profile = requestedProfile;
     if (
       modelFamily === "openai-gpt" &&
@@ -742,6 +1047,8 @@ async function modelCommand() {
         };
         delete config.targets[id].app.capabilityProfile;
         delete config.targets[id].app.supportsSearchTool;
+        delete config.targets[id].app.toolMode;
+        delete config.targets[id].app.multiAgent;
       } else if (profile != null) {
         config.targets[id].app = {
           ...(current.app ?? {}),
@@ -763,6 +1070,36 @@ async function modelCommand() {
         if (config.targets[id].app)
           delete config.targets[id].app.supportsSearchTool;
       }
+      setToolMode(config.targets[id], toolMode);
+      const priorMultiAgent = config.targets[id].app?.multiAgent;
+      if (value("multi-agent-from") != null) delete config.targets[id].app?.multiAgent;
+      config.targets[id] = structuredClone(validate(config).targets[id]);
+      if (effectiveTemplate != null)
+        config.targets[id] = applyThirdPartyTemplate(config.targets[id], effectiveTemplate, {
+          instructions: managedInstructions == null && value("instructions-from") == null,
+        });
+      if (profile != null) {
+        config.targets[id].app.capabilityProfile = profile;
+        config.targets[id].app.useResponsesLite = profile === "lite-search";
+      } else if (requestedLite != null) config.targets[id].app.useResponsesLite = requestedLite;
+      if (profileSearchSource != null) config.targets[id].standaloneSearch = { source: profileSearchSource };
+      setToolMode(config.targets[id], toolMode);
+      if (value("multi-agent-from") != null) {
+        if (priorMultiAgent) config.targets[id].app.multiAgent = priorMultiAgent;
+        await captureTargetMultiAgent(config, [id], value("multi-agent-from"));
+      }
+      if (multiAgentVersion != null)
+        config.targets[id] = setMultiAgentVersion(config.targets[id], multiAgentVersion);
+      if (value("instructions-from") != null ||
+          (effectiveTemplate !== "codex-general-v1" && command === "add" && config.targets[id].modelFamily === "openai-gpt"))
+        await captureTargetInstructions(config, [id], { automatic: value("instructions-from") == null, sourceModel: value("instructions-from") });
+      if (managedInstructions != null)
+        config.targets[id] = applyManagedInstructions(config.targets[id], managedInstructions);
+      if (instructionDelivery != null)
+        config.targets[id].app.instructionDelivery = instructionDelivery;
+      if (value("instructions-from") === "none")
+        delete config.targets[id].app.instructionDelivery;
+      config.targets[id] = structuredClone(validate(config).targets[id]);
       return;
     }
     const next = {
@@ -805,6 +1142,8 @@ async function modelCommand() {
     if (flag("no-app")) {
       delete next.app.capabilityProfile;
       delete next.app.supportsSearchTool;
+      delete next.app.toolMode;
+      delete next.app.multiAgent;
     }
     if (profileSearchSource != null) {
       next.standaloneSearch = { source: profileSearchSource };
@@ -814,7 +1153,35 @@ async function modelCommand() {
       if (next.app) delete next.app.supportsSearchTool;
     }
     config.targets[id] = next;
-  }, `model ${command} ${id}`);
+    if (effectiveTemplate != null)
+      config.targets[id] = applyThirdPartyTemplate(config.targets[id], effectiveTemplate, {
+        instructions: managedInstructions == null && value("instructions-from") == null,
+      });
+    if (profile != null) {
+      config.targets[id].app.capabilityProfile = profile;
+      config.targets[id].app.useResponsesLite = profile === "lite-search";
+    } else if (requestedLite != null) config.targets[id].app.useResponsesLite = requestedLite;
+    if (profileSearchSource != null) config.targets[id].standaloneSearch = { source: profileSearchSource };
+    setToolMode(config.targets[id], toolMode);
+    if (value("multi-agent-from") != null)
+      await captureTargetMultiAgent(config, [id], value("multi-agent-from"));
+    if (multiAgentVersion != null)
+      config.targets[id] = setMultiAgentVersion(config.targets[id], multiAgentVersion);
+    if (value("instructions-from") != null ||
+        (effectiveTemplate !== "codex-general-v1" && command === "add" && config.targets[id].modelFamily === "openai-gpt"))
+      await captureTargetInstructions(config, [id], { automatic: value("instructions-from") == null, sourceModel: value("instructions-from") });
+    if (managedInstructions != null)
+      config.targets[id] = applyManagedInstructions(config.targets[id], managedInstructions);
+    if (instructionDelivery != null)
+      config.targets[id].app.instructionDelivery = instructionDelivery;
+    if (value("instructions-from") === "none")
+      delete config.targets[id].app.instructionDelivery;
+  }, `model ${command} ${id}`, {
+    preserveCodexSelection: true,
+    beforeApply: instructionDelivery === "gateway-lite"
+      ? assertNoCodexInstructionOverride
+      : undefined,
+  });
 }
 
 async function modelsLegacy() {
@@ -975,13 +1342,29 @@ async function spaceCommand() {
       source: "standalone-search-default-edit",
     });
   }
+  if (command === "set-third-party-template") {
+    const template = positional[2] ?? value("template");
+    if (!THIRD_PARTY_TEMPLATES.includes(template))
+      throw Object.assign(Error("space set-third-party-template requires codex-general-v1 or legacy"), {
+        code: "usage_error",
+      });
+    return mutateSpaceConfig((config) => {
+      config.thirdPartyDefaults = { template };
+    }, `set third-party template ${template}`, {
+      source: "third-party-template-default-edit",
+    });
+  }
   if (command === "use") {
     const target = positional[2];
     if (!target) throw Object.assign(Error("space use requires NAME[@REV]"), { code: "usage_error" });
     const revision = await resolveSpace(target, env);
     const apply = await confirm(`Switch from ${index.active.space}@${index.active.revision} to ${revision.space}@${revision.revision}.`);
     if (!apply) return emit({ applied: false }, () => "No switch started.");
-    const result = await beginSpaceSwitch(`${revision.space}@${revision.revision}`, { env, configPath });
+    const result = await beginSpaceSwitch(`${revision.space}@${revision.revision}`, {
+      env,
+      configPath,
+      preserveCodexSelection: flag("preserve-current-model"),
+    });
     return emit({ applied: true, ...result }, (x) => x.pending
       ? `Switch to ${revision.space}@${revision.revision} is pending Codex App quit.`
       : `Active configuration space is ${revision.space}@${revision.revision}.`);
@@ -1016,7 +1399,7 @@ async function spaceCommand() {
     if (!apply) return emit({ applied: false }, () => "Pending switch retained.");
     return emit(await cancelSpaceSwitch({ env }), () => "Pending switch cancelled.");
   }
-  throw Object.assign(Error("use space init|list|current|show|history|diff|create|capture|set-default-model|set-search-source|use|rollback|resume|cancel"), {
+  throw Object.assign(Error("use space init|list|current|show|history|diff|create|capture|set-default-model|set-search-source|set-third-party-template|use|rollback|resume|cancel"), {
     code: "usage_error",
   });
 }
@@ -1083,8 +1466,41 @@ async function historyCommand() {
     const branch = value("branch") ?? thread;
     if (command === "inspect") {
       const latest = archive.history({ owner, thread, branch });
-      return emit({ found: !!latest, latest: latest ? { ...latest, original: undefined, view: undefined, originalItems: latest.original.length, viewItems: latest.view.length } : null, versions: archive.listHistory({ owner, thread, branch }), archive: archive.stats() },
+      return emit({ found: !!latest, latest: latest ? { ...latest, original: undefined, view: undefined, originalItems: latest.original.length, viewItems: latest.view.length } : null, versions: archive.listHistory({ owner, thread, branch }), checkpoints: archive.checkpointStats({ owner, thread, branch }), archive: archive.stats() },
         (x) => x.found ? `History ${thread}: ${x.versions.length} version(s), latest ${x.latest.originalItems} original / ${x.latest.viewItems} view items.` : `History not found: ${thread}`);
+    }
+    if (command === "recover") {
+      try {
+        const apply = flag("yes");
+        if (apply) {
+          if (await appIsRunning(env))
+            throw Object.assign(Error("quit Codex App before recovering rollout checkpoints"), {
+              code: "app_running",
+            });
+          const service = await serviceStatus(configPath, env);
+          if (
+            (service.running && !service.health) ||
+            (service.health?.activeTurns ?? 0) !== 0 ||
+            (service.health?.websocketConnections ?? 0) !== 0
+          )
+            throw Object.assign(Error("Gateway must be idle before recovering rollout checkpoints"), {
+              code: "history_recovery_busy",
+            });
+        }
+        const plan = await planRolloutRecovery({
+          thread,
+          source: value("source"),
+          sessionsRoot: join(codexHome(env), "sessions"),
+        });
+        const result = applyRolloutRecovery(archive, plan, { account: owner, apply });
+        return emit(result, (x) => x.applied
+          ? `Recovered ${x.written} checkpoint(s) for ${thread}.`
+          : `Recovery preview: ${x.wouldWrite} checkpoint(s) can be added for ${thread}; re-run with --yes to apply.`);
+      } catch (error) {
+        if (error.type?.startsWith("rollout_") || error.code?.startsWith("rollout_"))
+          error.event = "rollout_recovery_incomplete";
+        throw error;
+      }
     }
     if (command === "export") {
       const output = value("output");
@@ -1142,7 +1558,7 @@ async function historyCommand() {
       const apply = flag("apply") && await confirm(`Prune history for exact scope ${owner}/${thread}/${branch}.`);
       return emit(archive.prune({ owner, thread, branch, beforeVersion: before == null ? undefined : Number(before), dryRun: !apply }), (x) => `${x.dryRun ? "Would prune" : "Pruned"} ${x.count} version(s).`);
     }
-    throw Object.assign(Error("use history inspect|export|import|resume|prune"), { code: "usage_error" });
+    throw Object.assign(Error("use history inspect|recover|export|import|resume|prune"), { code: "usage_error" });
   } finally { archive.close(); }
 }
 
@@ -1168,6 +1584,11 @@ async function doctor() {
     credentials,
     standaloneSearch: config ? searchSummaries(config, credentials) : [],
     appCapabilityProfiles: config ? capabilityProfileSummaries(config) : [],
+    promptCaching: config ? promptCacheSummaries(config) : [],
+    thirdPartyDefaults: config?.thirdPartyDefaults ?? { template: "codex-general-v1" },
+    thirdPartyTemplates: config ? Object.values(config.targets).map((target) => ({ target: target.id, ...thirdPartyTemplateStatus(target) })) : [],
+    instructions: config ? await instructionSummaries(config) : [],
+    multiAgent: config ? await multiAgentSummaries(config) : [],
     warnings,
     issues,
     liveModelCalls: 0,
@@ -1175,7 +1596,9 @@ async function doctor() {
   const ok = discovery.configExists && !!config && issues.length === 0;
   emit({ ok, ...checks }, (x) =>
     `Doctor: ${x.ok ? "OK" : `${x.issues.length} issue(s) found`}${x.warnings.length ? `, ${x.warnings.length} warning(s)` : ""}. No model calls were made.` +
-    `\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}`,
+    `\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}` +
+    `\nPrompt cache: ${humanPromptCacheLines(x.promptCaching)}` +
+    `\nInstructions: ${JSON.stringify(x.instructions)}`,
   );
   if (!ok) process.exitCode = 1;
 }
@@ -1204,8 +1627,13 @@ async function status() {
     targets: Object.keys(config.targets),
     standaloneSearch: searchSummaries(config, credentials),
     appCapabilityProfiles: capabilityProfileSummaries(config),
+    promptCaching: promptCacheSummaries(config),
+    thirdPartyDefaults: config.thirdPartyDefaults ?? { template: "codex-general-v1" },
+    thirdPartyTemplates: Object.values(config.targets).map((target) => ({ target: target.id, ...thirdPartyTemplateStatus(target) })),
+    instructions: await instructionSummaries(config),
+    multiAgent: await multiAgentSummaries(config),
   },
-  (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nSpace: ${x.configurationSpace.active ? `${x.configurationSpace.active.space}@${x.configurationSpace.active.revision}` : "uninitialized"}\nModels: ${x.targets.join(", ")}\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}`);
+  (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nSpace: ${x.configurationSpace.active ? `${x.configurationSpace.active.space}@${x.configurationSpace.active.revision}` : "uninitialized"}\nModels: ${x.targets.join(", ")}\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}\nPrompt cache: ${humanPromptCacheLines(x.promptCaching)}\nInstructions: ${JSON.stringify(x.instructions)}`);
 }
 
 async function requireRouterServiceSpace() {
@@ -1215,6 +1643,15 @@ async function requireRouterServiceSpace() {
       code: "official_space_service_dormant",
     });
   return index;
+}
+
+async function checkedAppRunning() {
+  const running = await appIsRunning(env);
+  if (running == null)
+    throw Object.assign(Error("Codex App state could not be determined"), {
+      code: "app_state_unknown",
+    });
+  return running;
 }
 
 async function serviceCommand() {
@@ -1259,7 +1696,7 @@ async function main() {
     const apply = await confirm("Restore Codex official subscription direct settings without contacting the Gateway.");
     if (!apply) return emit({ applied: false }, () => "Rescue preview only; re-run with --yes to apply.");
     const result = await withFileLock(paths.spaceTransactionLock, async () => {
-      if (await appIsRunning(env))
+      if (await checkedAppRunning())
         throw Object.assign(Error("quit Codex App before using the subscription rescue path"), {
           code: "app_running",
         });
@@ -1316,7 +1753,7 @@ async function main() {
     const apply = await confirm("Remove Codex integration and LaunchAgent. History and credentials will be retained.");
     if (!apply) return emit({ applied: false }, () => "Uninstall preview only; re-run with --yes to apply.");
     const index = await readSpaceIndex(env);
-    if (index && index.active?.space !== OFFICIAL_SPACE && await appIsRunning(env))
+    if (index && index.active?.space !== OFFICIAL_SPACE && await checkedAppRunning())
       throw Object.assign(Error("quit Codex App before uninstalling an active Router space"), {
         code: "app_running",
       });
@@ -1345,6 +1782,7 @@ catch (error) {
   const code = /^[a-z][a-z0-9_]+$/.test(error.code ?? "") ? error.code : error.type ?? "command_failed";
   const result = {
     ok: false, code, correlationId, message: error.message,
+    ...(error.event ? { event: error.event } : {}),
     impact: error.impact ?? "requested operation was not completed",
     next: error.next ?? (code === "integration_conflict" ? "codex-local-router integration status --json" : "codex-local-router doctor --json"),
   };

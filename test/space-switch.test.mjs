@@ -79,7 +79,6 @@ async function fixture(t) {
     CODEX_MODEL_CATALOG_SOURCE: catalog,
     CODEX_LOCAL_ROUTER_LAUNCH_AGENT: join(root, "LaunchAgents", "router.plist"),
     CODEX_LOCAL_ROUTER_SPACE_SWITCHER_LAUNCH_AGENT: join(root, "LaunchAgents", "switcher.plist"),
-    CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL: "1",
   };
   const integrationState = {
     schemaVersion: 4,
@@ -162,6 +161,48 @@ test("Router spaces switch across revisions and rollback target is prior activat
   await beginSpaceSwitch("default@1", f.operations);
   index = await readSpaceIndex(f.env);
   assert.deepEqual(index.previous, { space: "alternate", revision: 2 });
+});
+
+test("same-space edits preserve the current Codex selection through apply and rollback", async (t) => {
+  const f = await fixture(t);
+  await beginSpaceSwitch("default", f.operations);
+  const selected = (await readFile(join(f.home, "config.toml"), "utf8"))
+    .replace('model = "custom-model"', 'model = "gpt-5.5"');
+  await writeFile(join(f.home, "config.toml"), selected);
+  const changed = runtimeConfig(f.catalog, 3);
+  await appendSpaceRevision("default", {
+    kind: "router",
+    source: "same-space-edit",
+    config: changed,
+    defaultCodexModel: "custom-model",
+  }, { env: f.env, expectedLatestRevision: 1 });
+  await beginSpaceSwitch("default@2", {
+    ...f.operations,
+    preserveCodexSelection: true,
+  });
+  assert.deepEqual((await readSpaceIndex(f.env)).active, { space: "default", revision: 2 });
+  assert.equal((await resolveSpace("default@2", f.env)).defaultCodexModel, "custom-model");
+  assert.match(await readFile(join(f.home, "config.toml"), "utf8"), /model = "gpt-5\.5"/);
+
+  await appendSpaceRevision("default", {
+    kind: "router",
+    source: "failing-same-space-edit",
+    config: runtimeConfig(f.catalog, 2),
+    defaultCodexModel: "custom-model",
+  }, { env: f.env, expectedLatestRevision: 2 });
+  let installs = 0;
+  await assert.rejects(beginSpaceSwitch("default@3", {
+    ...f.operations,
+    preserveCodexSelection: true,
+    installService: async () => {
+      if (installs++ === 0) throw Error("synthetic service failure");
+      return f.operations.installService();
+    },
+  }), /synthetic service failure/);
+  assert.deepEqual((await readSpaceIndex(f.env)).active, { space: "default", revision: 2 });
+  assert.match(await readFile(join(f.home, "config.toml"), "utf8"), /model = "gpt-5\.5"/);
+  const failed = await readSpaceTransaction(f.env);
+  assert.equal(failed.recovered, true, JSON.stringify(failed));
 });
 
 test("official captures a changed default before leaving and restores exact protected versions", async (t) => {

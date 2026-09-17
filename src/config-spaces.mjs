@@ -28,6 +28,7 @@ export const SPACE_CONFIG_KEYS = Object.freeze([
   "targets",
   "rules",
   "pluginTools",
+  "thirdPartyDefaults",
   "standaloneSearch",
   "webSearch",
 ]);

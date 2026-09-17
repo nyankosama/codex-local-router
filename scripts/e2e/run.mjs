@@ -1,4 +1,4 @@
-// E2E 运行入口：G0 门禁 + 6 条用例，统一输出 artifacts/e2e/<runId>/。
+// E2E 运行入口：G0 门禁 + 6 条用例，证据默认写入本地 Router 数据目录。
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -14,6 +14,7 @@ import {
   writeImmutableJson,
 } from "./lib/harness.mjs";
 import { parseNodeTestSummary } from "./lib/process-output.mjs";
+import { evidencePath } from "./lib/evidence-path.mjs";
 import { CASES } from "./cases.mjs";
 
 const argv = process.argv.slice(2);
@@ -24,9 +25,7 @@ const value = (name) => {
 };
 
 const projectRoot = resolve(import.meta.dirname, "..", "..");
-const artifactsRoot = value("out")
-  ? resolve(value("out"))
-  : join(projectRoot, "artifacts", "e2e");
+const artifactsRoot = evidencePath(value("out"), "e2e", { projectRoot });
 const GROUP = value("group") ?? "all";
 const ONLY = value("case");
 const INCLUDE_PRE_RELEASE = flag("include-pre-release");

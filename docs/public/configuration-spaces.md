@@ -1,6 +1,6 @@
 # Configuration spaces
 
-A configuration space is a versioned Router profile. It groups providers, models, the default model, routing, Plugin policy, search, compression, and subscription-routing settings so a complete working combination can be inspected, cloned, switched, and rolled back as one unit.
+A configuration space is a versioned Router profile. It groups providers, models, the third-party creation template, the default model, routing, Plugin policy, search, compression, and subscription-routing settings so a complete working combination can be inspected, cloned, switched, and rolled back as one unit.
 
 It is not a separate Codex account or sandbox. Listener and access settings, encrypted history, request limits, user MCP servers, Skills, Hooks, prompts, and conversations remain machine- or Codex-level data and are not copied into a space.
 

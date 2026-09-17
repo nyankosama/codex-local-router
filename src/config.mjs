@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { applyPreset } from "./presets.mjs";
+import { applyPreset, presetSupportsThirdPartyTemplate } from "./presets.mjs";
 import { CONFIG_SCHEMA_VERSION, runtimePaths } from "./product.mjs";
 import {
   effectiveThirdPartyGptAllowlist,
@@ -15,6 +15,14 @@ import {
   validateAppCapabilityProfile,
   validateResolvedAppCapabilityProfile,
 } from "./app-capability-profile.mjs";
+import { PROMPT_CACHE_AFFINITIES } from "./prompt-cache-affinity.mjs";
+import { validateInstructionSource } from "./instruction-source.mjs";
+import { validateMultiAgentSource } from "./multi-agent-source.mjs";
+import { validateInstructionDelivery } from "./instruction-delivery.mjs";
+import {
+  assertThirdPartyTemplateCompatible,
+  validateThirdPartyTemplate,
+} from "./third-party-template.mjs";
 const loopback = (h) => ["127.0.0.1", "localhost", "[::1]"].includes(h);
 const conditions = new Set([
   "modelID",
@@ -115,6 +123,12 @@ export function validate(input) {
   }
   // Also validates alias-normalized add/remove conflicts.
   effectiveThirdPartyGptAllowlist(c);
+  if (c.thirdPartyDefaults != null) {
+    if (!c.thirdPartyDefaults || typeof c.thirdPartyDefaults !== "object" || Array.isArray(c.thirdPartyDefaults) ||
+        Object.keys(c.thirdPartyDefaults).some((key) => key !== "template"))
+      throw Error("invalid thirdPartyDefaults configuration");
+    validateThirdPartyTemplate(c.thirdPartyDefaults.template);
+  }
   if (c.standaloneSearch != null) {
     if (
       !c.standaloneSearch ||
@@ -173,6 +187,15 @@ export function validate(input) {
       throw Error("inline credentials forbidden");
     if (p.keychain && (!p.keychain.service || !p.keychain.account))
       throw Error("invalid keychain reference");
+    if (p.promptCaching != null) {
+      if (
+        !p.promptCaching ||
+        typeof p.promptCaching !== "object" ||
+        Array.isArray(p.promptCaching) ||
+        Object.keys(p.promptCaching).some((key) => key !== "affinity") ||
+        !PROMPT_CACHE_AFFINITIES.has(p.promptCaching.affinity)
+      ) throw Error(`invalid prompt cache affinity for provider ${name}`);
+    }
     if (p.standaloneSearch != null) {
       if (
         !p.standaloneSearch ||
@@ -259,6 +282,14 @@ export function validate(input) {
       throw Error("native search requires responses");
     for (const v of Object.values(t.capabilities ?? {}))
       if (typeof v !== "boolean") throw Error("capabilities must be boolean");
+    validateInstructionSource(t);
+    validateMultiAgentSource(t);
+    const genericTemplateQualified = presetSupportsThirdPartyTemplate(
+      t.preset,
+      "codex-general-v1",
+    );
+    if (t.app?.multiAgent != null && !genericTemplateQualified)
+      throw Error(`App multi-agent is not qualified for preset ${t.preset}`);
     let appReasoningLevels;
     if (t.app?.reasoningLevels != null) {
       if (!Array.isArray(t.app.reasoningLevels) || !t.app.reasoningLevels.length)
@@ -310,14 +341,34 @@ export function validate(input) {
       typeof t.app.useResponsesLite !== "boolean"
     )
       throw Error(`invalid App Responses Lite flag for target ${name}`);
+    if (t.app?.thirdPartyTemplate != null && (
+      t.provider === "chatgpt-subscription" ||
+      t.app.thirdPartyTemplate?.id !== "codex-general-v1" ||
+      t.app.thirdPartyTemplate?.version !== 1 ||
+      Object.keys(t.app.thirdPartyTemplate).some((key) => !["id", "version"].includes(key))
+    )) throw Error(`invalid third-party template marker for target ${name}`);
+    if (t.app?.thirdPartyTemplate?.id)
+      assertThirdPartyTemplateCompatible(t, t.app.thirdPartyTemplate.id);
+    if (t.app?.toolMode != null) {
+      if (t.app.toolMode !== "code_mode_only")
+        throw Error(`invalid App tool mode for target ${name}`);
+      if (!genericTemplateQualified)
+        throw Error(`App code mode is not qualified for preset ${t.preset}`);
+      if (t.provider === "chatgpt-subscription" ||
+          t.app.enabled !== true || t.wireApi !== "responses" ||
+          t.capabilities?.freeformTools !== true || t.capabilities?.toolCalling !== true)
+        throw Error(`App code mode requires a third-party App-enabled Responses target with freeform tool support: ${name}`);
+    }
     if (t.app?.capabilityProfile != null) {
+      if (!genericTemplateQualified)
+        throw Error(`App capability profile is not qualified for preset ${t.preset}`);
       validateAppCapabilityProfile(
         t.app.capabilityProfile,
         `App capability profile for target ${name}`,
       );
-      if (t.modelFamily !== "openai-gpt" || t.app.enabled !== true)
+      if (t.app.enabled !== true)
         throw Error(
-          `App capability profile requires an App-enabled openai-gpt target ${name}`,
+          `App capability profile requires an App-enabled target ${name}`,
         );
       if (t.wireApi !== "responses")
         throw Error(`App capability profile requires Responses target ${name}`);
@@ -374,6 +425,7 @@ export function validate(input) {
       resolveAppCapabilityProfile(c, t),
       name,
     );
+    validateInstructionDelivery(t);
     if (search.source === "provider") {
       if (t.wireApi !== "responses" || t.app?.enabled !== true)
         throw Error(`provider standalone search requires an App-enabled Responses target ${name}`);

@@ -196,7 +196,7 @@ test("third-party GPT forwards only non-identity Codex compatibility headers", a
   assert.equal(seen.headers["x-codex-beta-features"], "feature-a");
   assert.equal(
     seen.headers["x-openai-internal-codex-responses-lite"],
-    "false",
+    undefined,
   );
   for (const name of [
     "chatgpt-account-id",

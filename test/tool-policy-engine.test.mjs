@@ -100,6 +100,37 @@ test("A3/A4 Engine applies the selected target policy and preserves allowed defi
   assert.equal(payload.tools[0].untouched, 1);
 });
 
+test("A2 Engine logs source counts without tool names or schemas", async () => {
+  const logs = [];
+  const engine = new Engine(config(), {
+    toolRegistry: registry,
+    log: (event) => logs.push(event),
+    send: async () => response(),
+  });
+  await collect(engine, {
+    model: "client-model",
+    input: [{
+      type: "additional_tools",
+      tools: [{
+        type: "namespace",
+        name: "mcp__codex_apps__github",
+        tools: [{ type: "function", name: "private_fixture", schema: { secret: true } }],
+      }],
+    }],
+  });
+  const route = logs.find((event) => event.event === "route");
+  assert.deepEqual(route.tool_source_counts, {
+    core: 0,
+    user_mcp: 0,
+    allowed_plugin: 2,
+    removed_plugin: 0,
+    unknown: 0,
+    collision: 0,
+  });
+  assert.equal(route.inherited_tool_source_count, 1);
+  assert.doesNotMatch(JSON.stringify(route), /private_fixture|secret/);
+});
+
 test("A3 fallback derives a fresh target view from the unfiltered request", async () => {
   const payloads = [];
   const engine = new Engine(config(), {

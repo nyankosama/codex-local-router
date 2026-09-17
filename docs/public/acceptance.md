@@ -37,7 +37,11 @@ The official-relay and Plugin-policy change uses ten bounded equivalence groups 
 
 Pure logic and local simulated upstream coverage for A1-A10 is part of `npm test`; real providers are not called by the PR gate.
 
+Tool-search history migration adds a focused deterministic matrix: valid single, multiple, interleaved and empty-result pairs; missing, duplicated, reversed and malformed pairs; third-party Responses → official → third-party → Chat Completions switching; function/custom-tool result preservation; encrypted original/view separation; schema/query/ID redaction; and a 10,000-item linear-scan sanity case. The engine uses only local simulated upstreams, and malformed history must fail before the outbound hook is called. This gate does not retry a real retained conversation.
+
 Configuration spaces add deterministic cases for fresh and legacy migration, applied/disabled/pending/ambiguous state, immutable revisions, official auto-capture, clone/diff/default-model/drift capture, official↔Router and Router↔Router switching, historical activation and rollback, one-shot coordinator recovery, active-turn timeout, missing credentials, candidate/service/hash failures, staged rollback, and preservation of non-managed Codex data. Every case uses temporary Codex/Router homes, config/state/LaunchAgent paths, random ports, simulated launchctl, and local upstreams.
+
+Compacted-history recovery adds deterministic cases for current-thread lookup, exact direct-parent inheritance and restart persistence; account, parent and compaction-hash isolation; summary-only failure; complete single-file and parent/child rollout reconstruction; repeated recovery; missing bases, bad boundaries, incomplete tool pairs, corrupt JSON, ambiguous files and existing-record conflicts. Validation failures must write zero checkpoints. A recovered checkpoint is expanded before the one simulated third-party request, so the opaque official compaction never reaches that upstream and no retry occurs. Parent lookup p95 is enforced below 10 ms locally and adds no network request.
 
 The configuration-space candidate gate intentionally performs zero real model calls and does not run `e2e:focused -- --run`. Before and after the gate, operators verify that the installed Router and switcher remain unloaded, port 8788 remains closed, integration remains disabled, and the real Codex config still selects its built-in OpenAI provider. App-server coverage cannot replace a later App UI sign-off.
 
@@ -48,13 +52,31 @@ npm run e2e:l0     # gate: npm test, package audit, source scan
 npm run e2e:l1     # credential-free local fixtures: E2E-1/2/3/5
 npm run e2e:l2     # credential-free local capacity fixture: E2E-4
 npm run e2e:profiles  # credential-free standard-tools and lite-search closure
+npm run e2e:tool-search-history  # current app-server plus retained-history migration, all local
 npm run e2e        # L0-L2 only; the live case is excluded
 npm run e2e:live -- --run  # explicit installed-service concurrency (E2E-6)
 npm run e2e -- --include-live --run  # explicit L0-L2 plus live E2E-6
 npm run e2e:official-search -- --run  # two-turn official cached-default + explicit-live search
 npm run e2e:third-party-search -- --run  # two-turn ai.feei + subscription-search acceptance
+npm run e2e:prompt-cache  # zero-network derivation/adapter performance gate
+npm run e2e:prompt-cache -- --live-feasibility --run  # max 8 direct Provider calls
+npm run e2e:prompt-cache -- --live-comparison --run  # 24-call Sol/Astra direct-vs-candidate comparison
+npm run e2e:prompt-cache -- --live-app-candidate --run  # current App binary, max 6 Provider generations
 npm run e2e:focused -- --run  # explicit five-turn official + ai.feei candidate acceptance
 ```
+
+Prompt-cache affinity has a staged, fail-closed gate. The default `e2e:prompt-cache` command makes zero network calls and checks HMAC derivation p95 below 5 ms, body-adaptation p95 below 25 ms, and wire growth below 128 bytes. The current effect gate uses `--live-comparison --run`: 24 interleaved, no-retry Sol/Astra generations compare the direct client shape with the candidate anonymous key under an otherwise fixed request. `--live-app-candidate --run` then uses the current App-bundled Codex binary, a temporary Codex/Router home and an isolated Gateway for at most six Provider generations. It must close one read-only MCP call/result plus a following turn per model, observe a stable anonymous-key fingerprint and the per-frame Lite header, and keep subscription/provider identity separated. Missing usage remains unknown rather than zero. Older `--live-feasibility`, `--live-gateway` and `--live-app-protocol` modes remain available for earlier candidate reproduction but are not the current 30-generation gate.
+
+The historical ai.feei feasibility attempt that stopped on its first HTTP 403 remains recorded. A later 35-request causal diagnostic did not overwrite it: all 35 synthetic calls completed, and a strict single-variable toggle moved Sol from 30.11% weighted cache reuse without a key to 98.55% with the Gateway-derived anonymous key. That result establishes a Gateway-controlled field effect for that workload, not ai.feei's internal account-pool algorithm and not a universal natural-session hit-rate guarantee. The current candidate must still pass its own Sol/Astra and App-protocol gates before local activation.
+
+`e2e:tool-search-history` drives the current App-bundled app-server through a
+new-session model switch, then reproduces the affected retained-response path
+through the real Gateway HTTP identity and encrypted-archive boundary. It uses
+synthetic auth and credentials, a loopback Provider, an injected official
+response, a random port, and temporary homes. It asserts that the destination
+receives one fixed marker, no dynamic schema/query/provider identifiers, while
+the original encrypted pair remains byte-equivalent. It never retries a real
+conversation or contacts an external upstream.
 
 `e2e:official-search` is the narrow official-only canary. It first makes a zero-generation handshake probe through the Router's production official-WebSocket client and requires HTTP 101. Its first isolated CLI turn then leaves `web_search` unset and verifies the normal cached default without requiring a new user flag. Its second turn passes the one-run `--search` override to verify live search. Both turns require a successful official Responses exchange over the transport selected by the current Codex build, a successful fixed-origin `/alpha/search` request, a completed `web_search` client item, a source hostname in the answer, and no non-OpenAI outbound destination. The runner allows exactly two turns and at most six generation requests because one search turn can require multiple model/tool continuations; it stores no prompt or response body.
 
@@ -76,7 +98,7 @@ The runner permits exactly five short turns and at most ten observed generation 
 
 It has no retry loop. The outbound hook rejects a generation beyond the budget and rejects any standalone-search request whose destination is not OpenAI. Before the live turns, a `standard-tools` preflight confirms only that allowed Plugin and user-MCP definitions are forwarded and a forbidden Plugin definition is removed; its result is labelled `DEFINITION_PREFLIGHT_ONLY` and never counts as call/result closure. The two App cases require the Responses Lite search carrier and a successful official search, disclose `reduced-responses-lite`, and make no full Plugin/MCP compatibility claim. The summary explicitly says that combined Standard-tools-plus-search capability is not established. Missing expected cases or evidence is `FAIL`, never an inferred pass.
 
-Full profile qualification is a separate deterministic gate. It must prove an actual `standard-tools` core/allowed-Plugin/user-MCP call-and-result chain and a separate `lite-search` completed search chain with the current App-bundled Codex binary against isolated local fixtures. Results from different profiles are reported separately and cannot be combined into a single capability claim. This gate, like L1 and L2, strips ambient proxy and Provider variables from Codex child processes; all outbound observations terminate at injected in-process fixtures.
+Full profile qualification is a separate deterministic gate. It must prove an actual `standard-tools` core/allowed-Plugin/user-MCP call-and-result chain and, after an official-to-third-party switch in the same task, a `lite-search` core-tool result plus completed-search chain with the current App-bundled Codex binary against isolated local fixtures. The Lite case still does not claim the full Plugin/MCP surface of `standard-tools`. Results from different profiles are reported separately and cannot be combined into a single capability claim. This gate, like L1 and L2, strips ambient proxy and Provider variables from Codex child processes; all outbound observations terminate at injected in-process fixtures.
 
 ## Isolation and privacy
 
@@ -98,13 +120,7 @@ The bounded G3 gate is stricter about evidence completeness than it is about lat
 
 ## Evidence
 
-```
-artifacts/e2e/<runId>/summary.json   # per-case verdict, criteria results, harness kind/version/sha256
-artifacts/e2e/<runId>/<case>.json    # observation and assertions for that case
-artifacts/e2e/<runId>/raw/<case>.jsonl
-```
-
-Evidence is written under `artifacts/e2e/`; pass `--out DIR` to write it elsewhere.
+By default, evidence is written below the local Router data directory as `evidence/e2e/<runId>/`. Legacy acceptance scripts use `evidence/legacy/`. Pass `--out DIR` to choose another private location. Raw evidence cannot be written inside the source checkout and is never part of a public export or npm package.
 
 Each case records the harness kind, the driver binary source label, its version, and its SHA-256, so a verdict is bound to an exact build without publishing a local absolute path. Promotion runs additionally set `ACCEPTANCE_COMMIT`; the harness rejects a dirty or different checkout and records both the exact commit and Git tree. Run directories and JSON receipts are create-once: an existing path fails rather than being overwritten.
 

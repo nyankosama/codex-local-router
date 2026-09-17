@@ -11,6 +11,10 @@ Runtime configuration remains schema 3. Configuration-space storage is schema 1 
 
 For initialization, cloning, switching, rollback, drift, pending transactions, and rescue workflows, see the [configuration-space guide](configuration-spaces.md).
 
+## Third-party default template
+
+New App-enabled third-party models default to `codex-general-v1` when they declare Responses, tool calling and freeform tools and their preset is Provider-qualified. The template materializes generic instructions, Standard Responses, code mode, multi-agent v2, disabled standalone search and the standard Plugin policy. `thirdPartyDefaults.template` may be `codex-general-v1` or `legacy`; it affects later creation only. Existing targets change only through `model apply-template`. The current OpenCode Go DeepSeek preset is legacy-only despite its static capability shape. See [third-party templates](third-party-templates.md).
+
 Space metadata lives below the Router data directory:
 
 ```text
@@ -27,7 +31,7 @@ Within a Router space, schema 3 keeps three model-routing layers:
 - `targets`: unique target ID, provider, upstream model, protocol, context window, input modalities, tools, reasoning levels, search, compression, and Codex catalog metadata.
 - global policy: routing, local access, history, request limits, subscription routing, and standalone-search defaults.
 
-A target can name a versioned `preset`. Presets fill missing values; explicit target and provider values win. `opencode-go/deepseek-v4.1-flash` currently declares a 400,000-token configured window, image input, Responses, tools, streaming, summary compression, and reasoning levels through `max`. `feei/gpt-5.6-sol` and `feei/gpt-6-astra` declare text and image input, freeform tools, summary compression, and a conservative 272,000-token configured window. New CLI-created targets overlay the `standard-tools` profile; old preset-only or explicitly Lite configurations retain their transport, resolving as `lite-search` only when search is active. These declarations are specific to each provider-model pair and do not prove a provider's larger capacity.
+A target can name a versioned `preset`. Presets fill model/provider capabilities first, the selected template supplies behavior defaults, and explicit target flags win. Loading a preset at runtime never reapplies a template. Provider-model declarations do not prove an unrelated provider offers the same behavior.
 
 ## Third-party GPT Plugin policy
 
@@ -64,18 +68,68 @@ An alias-normalized name cannot be present in both arrays. Codex built-ins, `cod
 
 The filter covers ordinary functions, namespace tools, and `input[].additional_tools.tools`. An explicit `tool_choice` that selects a removed Plugin fails with `tool_policy_conflict`. If an upstream nevertheless emits a confirmed forbidden Plugin call, the router ends the turn with `disallowed_plugin_tool_call` before the call reaches the client; this policy failure never triggers model fallback.
 
-## Third-party GPT App profiles
+## Third-party App profiles
 
-App-enabled third-party `openai-gpt` targets have one explicit capability profile:
+### Opt-in code mode
+
+`targets.<id>.app.toolMode: "code_mode_only"` projects the same-named `tool_mode` catalog field. It asks a compatible Codex client to expose its `exec`/`wait` code-mode tools, enabling batched calls. It requires an App-enabled third-party Responses target with `toolCalling` and `freeformTools`, plus Provider qualification for a preset that narrows those claims; model family is not an admission rule. Omit the field to preserve the client's default. Presets and existing installations are not migrated. This option works independently of Standard/Lite transport and instruction delivery; it does not copy other official model capabilities or change defaults, search, cache affinity or prompts. Diagnostics include `appCapabilityProfile.toolMode` (`default` when absent).
+
+The Plugin allowlist still filters structured tool definitions. It does **not** parse or trim schemas embedded in `exec.description`, inspect JavaScript, or block indirect calls. Here the goal is context-size control, not a security sandbox. Do not treat a code-mode wrapper as proof that tool context became smaller.
+
+Before activating code mode, compare the same client binary, target, prompt, instructions, transport and installed tool inventory with and without the option. Record the UTF-8 bytes of serialized `{instructions, tools, input}` and tool-definition hashes at Provider egress; this is a wire-size proxy, not measured tokens. A practical qualification bound is a first-request increase of at most `max(8 KiB, 10% of the original context payload)`, with stable tool hashes across tool continuation and the next turn. If the bound fails or tool call/result evidence is missing, do not activate. Requalify after a material client/tool-inventory change; this is an activation gate, not an automatic runtime limiter or fallback.
+
+Batch preview (add `--yes` only after qualification and in an App-closed rollout window):
+
+```bash
+codex-local-router model set-tool-mode --ids feei-sol,feei-astra \
+  --tool-mode code_mode_only --space default --json
+```
+
+The batch commits one immutable space revision and preserves the space default and current Codex selection separately. `--tool-mode default` removes the override; an exact historical space reference restores all prior settings. Client adoption requires a fresh task after the usual safe activation/reopen flow. App-server protocol checks are not App UI acceptance, and fewer round trips are possible, not guaranteed.
+
+Instruction snapshots are separately versioned and do not inherit the source model's capability profile. Standard Responses uses client delivery; eligible Lite targets can explicitly opt into `gateway-lite`. See [instruction snapshots](instruction-snapshots.md) for constraints, evidence and rollout gates.
+
+Eligible App-enabled third-party Responses targets have one explicit capability profile. Existing non-GPT targets remain outside this logic until a profile or generic template is explicitly materialized:
 
 | Profile | Transport and tool surface | Standalone search |
 |---|---|---|
 | `standard-tools` | Standard Responses; Codex core tools, allowed Plugins, and user MCP follow the configured policy | Not advertised |
 | `lite-search` | Responses Lite; the reduced Plugin/MCP surface is reported in diagnostics | Required; uses the selected subscription or Provider source |
 
-New Responses targets created with `model add` persist `standard-tools`, so diagnostics report reason `target-explicit`; newly validated unprofiled App-enabled GPT Responses targets without a Lite compatibility signal resolve to the same profile with reason `standard-default`. Select `--app-profile lite-search` explicitly when independent search is required. Existing Responses targets with `useResponsesLite: true` retain their transport without an automatic persisted migration. When search is active they resolve to `lite-search`; when search is explicitly disabled they remain unprofiled with reason `legacy-responses-lite-transport-only` and tool surface `legacy-responses-lite`. An explicitly selected `lite-search` without search, or `standard-tools` with search, still fails closed. Legacy non-Responses GPT targets keep their old transport behavior and report `profile: null`, reason `non-responses-unchanged`, and tool surface `unchanged`; they are not presented as either qualified profile. JSON and human-readable `model list`, non-live `model probe`, `status`, and `doctor` output expose the effective profile, selection reason, and tool-surface classification. Each generated custom catalog entry exposes the same profile, reason, and tool surface. Official subscription models are outside this split and remain transparent.
+New Responses targets created with `model add` persist `standard-tools`, so diagnostics report reason `target-explicit`; newly validated unprofiled App-enabled GPT Responses targets without a Lite compatibility signal resolve to the same profile with reason `standard-default`. A non-GPT target enters only through an explicit profile or generic-template marker. Select `--app-profile lite-search` explicitly when independent search is required. Existing Responses targets with `useResponsesLite: true` retain their transport without an automatic persisted migration. When search is active they resolve to `lite-search`; when search is explicitly disabled they remain unprofiled with reason `legacy-responses-lite-transport-only` and tool surface `legacy-responses-lite`. An explicitly selected `lite-search` without search, or `standard-tools` with search, still fails closed. Legacy non-Responses and unconfigured non-GPT targets keep their old transport behavior and report an unchanged, unprofiled state. JSON and human-readable `model list`, non-live `model probe`, `status`, and `doctor` output expose the effective profile, selection reason, and tool-surface classification. Each generated custom catalog entry exposes the same profile, reason, and tool surface. Official subscription models are outside this split and remain transparent.
 
 The profile is frozen in the target configuration; upstream failures, retries, reconnects, and tool requests never switch it. `standard-tools` plus active standalone search, and an explicitly selected `lite-search` plus disabled search or Standard transport, are rejected rather than silently coerced. The unprofiled legacy transport-only case is a compatibility state, not a third qualified profile.
+
+## Third-party prompt-cache affinity
+
+Provider cache affinity is opt-in and applies to compatible third-party Responses targets: `openai-gpt`, or a non-GPT target that explicitly materialized `codex-general-v1`. Old non-GPT targets remain unchanged:
+
+```json
+{
+  "providers": {
+    "example": {
+      "adapter": "openai-compatible",
+      "baseUrl": "https://provider.example/v1",
+      "promptCaching": { "affinity": "gateway-opaque" }
+    }
+  }
+}
+```
+
+`affinity` accepts `none` or `gateway-opaque`. An absent field is the same effective policy as `none`; presets, including ai.feei, do not enable it automatically. Configure it through an immutable space revision:
+
+```bash
+codex-local-router provider edit --id example \
+  --prompt-cache-affinity gateway-opaque --yes
+```
+
+Official subscription traffic keeps the client cache fields unchanged. For an eligible explicitly enabled third-party Responses target, the router removes the original `prompt_cache_key`, Codex metadata, account/thread/turn/session/install identifiers, and `comparison_response_id`, then sends only a `clr-pc-v1-*` HMAC key. Safe `prompt_cache_options.mode` (`implicit` or `explicit`) and `ttl` (`30m`) may remain. Chat Completions, OpenCode Go, and unconfigured legacy non-GPT targets never receive a Gateway affinity key.
+
+For third-party GPT Responses, `prompt_cache_usage` diagnostics are emitted for both `none` and `gateway-opaque` after one successful terminal response. Missing upstream usage remains `null`/unknown rather than becoming a zero hit; errors and cancellations emit no terminal usage event. Responses Lite is negotiated per HTTP request or WebSocket frame. Only normalized `true` is sent to an applicable Provider; a missing or false frame never inherits an earlier connection value, and internal summary/image helper calls remain non-Lite.
+
+The secret is generated lazily only when the feature is first used and stored as a 32-byte value in macOS Keychain under service `com.nyankosama.codex-local-router.prompt-cache-v1`, account `affinity`. Lineage state contains derived IDs only, is bounded, expires after 30 minutes, and uses the encrypted state archive when available. Same-turn tool continuations freeze the first policy/key. A fork inherits only when the client cache key matches or an existing same-account parent mapping verifies the relationship; otherwise it starts an independent lineage.
+
+`model list`, non-live `model probe`, `status`, and `doctor` report the effective mode, selection reason, carrier, supported lineage sources, and restart-stability capability. They never print the derived key or client identifiers. Provider behavior still determines end-to-end effectiveness; the [account-pool interoperability guidance](provider-cache-affinity.md) is conditional, and Gateway configuration alone proves no cache-hit rate.
 
 ## Standalone search routing
 
@@ -174,7 +228,7 @@ codex-local-router integration sync --yes
 codex-local-router model probe --id my-model --live
 ```
 
-A target can name the built-in preset `opencode-go/deepseek-v4.1-flash` with `--preset`. Explicit flags override preset values.
+A target can name the built-in preset `opencode-go/deepseek-v4.1-flash` with `--preset`. That preset currently selects the accepted `legacy` path and rejects generic-template, Code-mode and multi-agent overrides until its Provider is requalified. Other explicit flags still override ordinary preset values.
 
 For ai.feei, store the credential independently and create two targets with the built-in presets:
 

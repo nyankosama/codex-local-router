@@ -29,6 +29,7 @@ import {
   integrationPaths,
   integrationStatus,
   readIntegrationState,
+  removeTopLevelKeys,
   restoreCodexConfig,
   syncIntegration,
 } from "./integration.mjs";
@@ -155,6 +156,15 @@ function defaultOperations(options, configPath) {
   };
 }
 
+async function checkedAppState(appRunning) {
+  const state = await appRunning();
+  if (state == null)
+    throw Object.assign(Error("Codex App state could not be determined"), {
+      code: "app_state_unknown",
+    });
+  return state;
+}
+
 async function writeTransaction(paths, transaction) {
   transaction.updatedAt = Date.now();
   await atomicJSON(paths.spaceTransaction, transaction);
@@ -230,7 +240,7 @@ async function candidateConfigFor(target, sourceConfig) {
     : sourceConfig;
 }
 
-async function expectedIntegrationFiles(target, targetConfig, env, codexHome) {
+async function expectedIntegrationFiles(target, targetConfig, env, codexHome, selectedModel) {
   const paths = integrationPaths(env, codexHome);
   const configText = await readFile(paths.config, "utf8");
   if (target.kind === "official") {
@@ -249,7 +259,7 @@ async function expectedIntegrationFiles(target, targetConfig, env, codexHome) {
   const stored = await readIntegrationState(env);
   const managed = {
     model_provider: "openai",
-    model: target.defaultCodexModel,
+    model: selectedModel ?? target.defaultCodexModel,
     openai_base_url: `http://${targetConfig.listen?.host ?? "127.0.0.1"}:${targetConfig.listen?.port ?? 8788}/subscription/v1`,
     model_catalog_json: paths.catalog,
   };
@@ -326,13 +336,18 @@ export async function beginSpaceSwitch(targetInput, options = {}) {
         });
     }
 
-    const target = await resolveSpace(ref(parsed), env);
-    const [sourceConfigBytes, sourceCodexConfigHash, sourceCatalogHash] = await Promise.all([
+    const source = index.active;
+    const [target, sourceRevision] = await Promise.all([
+      resolveSpace(ref(parsed), env),
+      resolveSpace(ref(source), env),
+    ]);
+    const [sourceConfigBytes, sourceCodexConfigBytes, sourceCatalogHash] = await Promise.all([
       readFile(configPath),
-      fileHash(codexPaths.config),
+      readFile(codexPaths.config),
       fileHash(codexPaths.catalog),
     ]);
     const sourceGatewayConfigHash = hash(sourceConfigBytes);
+    const sourceCodexConfigHash = hash(sourceCodexConfigBytes);
     const sourceConfig = JSON.parse(sourceConfigBytes);
     const candidate = await prepareCandidate(
       target,
@@ -348,8 +363,29 @@ export async function beginSpaceSwitch(targetInput, options = {}) {
     ) throw Object.assign(Error("source files changed during candidate preflight"), {
       code: "space_source_changed",
     });
-    const source = index.active;
-    const sourceRevision = await resolveSpace(ref(source), env);
+    let preservedCodexModel;
+    if (options.preserveCodexSelection) {
+      if (
+        source.space !== parsed.space ||
+        sourceRevision.kind !== "router" ||
+        target.kind !== "router" ||
+        sourceRevision.defaultCodexModel !== target.defaultCodexModel
+      ) throw Object.assign(Error("Codex selection can only be preserved for a same-space edit with an unchanged space default"), {
+        code: "space_selection_preservation_invalid",
+      });
+      preservedCodexModel = blockValues(Object.values(removeTopLevelKeys(
+        sourceCodexConfigBytes.toString("utf8").split(/\r?\n/),
+      ).baseline)).model;
+      const sourceCatalog = JSON.parse(await readFile(codexPaths.sourceCatalog, "utf8"));
+      const projectedConfig = await materializeRuntimeConfig(sourceConfig, target);
+      const available = new Set(
+        buildModelCatalog(sourceCatalog, projectedConfig).models.map((model) => model.slug),
+      );
+      if (!preservedCodexModel || !available.has(preservedCodexModel))
+        throw Object.assign(Error("the current Codex model is unavailable in the target revision"), {
+          code: "space_selected_model_unavailable",
+        });
+    }
     const transaction = {
       schemaVersion: 1,
       id: randomUUID(),
@@ -358,6 +394,7 @@ export async function beginSpaceSwitch(targetInput, options = {}) {
       sourceRevisionHash: sourceRevision.contentHash,
       targetRevisionHash: target.contentHash,
       targetRuntimeHash: candidate.hash,
+      ...(preservedCodexModel ? { preservedCodexModel } : {}),
       sourceFiles: {
         gatewayConfigPath: configPath,
         gatewayConfigHash: sourceGatewayConfigHash,
@@ -379,7 +416,7 @@ export async function beginSpaceSwitch(targetInput, options = {}) {
       updatedAt: Date.now(),
     };
     await writeTransaction(paths, transaction);
-    if (await operations.appRunning()) {
+    if (await checkedAppState(operations.appRunning)) {
       transaction.stage = "pending_app_quit";
       await writeTransaction(paths, transaction);
       return {
@@ -408,6 +445,7 @@ async function applyIntegration(
   configPath,
   recovery = false,
   expectedCurrentFiles = null,
+  selectedModel = null,
 ) {
   const expected = expectedCurrentFiles ? {
     expectedCodexConfigHash: expectedCurrentFiles.codexConfigHash,
@@ -424,7 +462,7 @@ async function applyIntegration(
     });
   }
   return operations.syncIntegration(targetConfig, {
-    selectedModel: target.defaultCodexModel,
+    selectedModel: selectedModel ?? target.defaultCodexModel,
     officialBaseline: official.codexBaseline,
     officialSpaceRef: ref(official),
     spaceRef: ref(target),
@@ -537,6 +575,7 @@ async function rollback(transaction, options, operations, paths, error) {
       configPath,
       true,
       recoveryCurrentFiles,
+      transaction.preservedCodexModel,
     );
     if (source.kind === "official" || transaction.sourceServiceWasRunning === false)
       await operations.stopService();
@@ -568,11 +607,7 @@ async function rollback(transaction, options, operations, paths, error) {
 async function verifyApplied(target, targetConfig, operations, env) {
   const integration = await operations.integrationStatus(targetConfig);
   let service = await operations.serviceStatus();
-  if (
-    target.kind === "router" &&
-    env.CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL !== "1" &&
-    !service.running
-  ) {
+  if (target.kind === "router" && !service.running) {
     for (let attempt = 0; attempt < 20 && !service.running; attempt++) {
       await new Promise((done) => setTimeout(done, 100));
       service = await operations.serviceStatus();
@@ -587,7 +622,7 @@ async function verifyApplied(target, targetConfig, operations, env) {
   } else if (
     !integration.active || integration.pending ||
     integration.configCurrent === false || integration.catalogCurrent === false ||
-    (env.CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL !== "1" && !service.running)
+    !service.running
   ) throw Object.assign(Error("Router space verification failed"), {
     code: "space_verification_failed",
   });
@@ -640,7 +675,7 @@ export async function resumeSpaceSwitch(options = {}) {
       throw Object.assign(Error("the previous switch could not be recovered safely"), {
         code: "space_switch_recovery_required",
       });
-    if (await operations.appRunning())
+    if (await checkedAppState(operations.appRunning))
       return {
         changed: false,
         pending: true,
@@ -714,7 +749,7 @@ export async function resumeSpaceSwitch(options = {}) {
         throw Object.assign(Error("active Gateway turns did not finish before the timeout"), {
           code: "active_turn_timeout",
         });
-      if (await operations.appRunning())
+      if (await checkedAppState(operations.appRunning))
         throw Object.assign(Error("Codex App reopened before the switch could be applied"), {
           code: "app_running",
         });
@@ -741,7 +776,13 @@ export async function resumeSpaceSwitch(options = {}) {
         : targetConfig;
       transaction.expectedFiles = {
         ...transaction.expectedFiles,
-        ...await expectedIntegrationFiles(target, integrationConfig, env, options.codexHome),
+        ...await expectedIntegrationFiles(
+          target,
+          integrationConfig,
+          env,
+          options.codexHome,
+          transaction.preservedCodexModel,
+        ),
       };
       await writeTransaction(paths, transaction);
       await applyIntegration(
@@ -755,6 +796,7 @@ export async function resumeSpaceSwitch(options = {}) {
           codexConfigHash: transaction.sourceFiles.codexConfigHash,
           catalogHash: transaction.sourceFiles.catalogHash,
         },
+        transaction.preservedCodexModel,
       );
       const [appliedCodexConfigHash, appliedCatalogHash] = await Promise.all([
         fileHash(transaction.sourceFiles.codexConfigPath),
@@ -806,7 +848,7 @@ export async function resumeSpaceSwitch(options = {}) {
   }
   const appRunning = options.appRunning ?? (() => appIsRunning(env));
   const deadline = Date.now() + (options.coordinatorWaitMs ?? 24 * 60 * 60 * 1000);
-  while (await appRunning()) {
+  while (await checkedAppState(appRunning)) {
     if (Date.now() >= deadline) {
       const { waitForApp, ...pending } = outcome;
       return pending;

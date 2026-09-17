@@ -186,6 +186,55 @@ export function blockValues(block) {
   return values;
 }
 
+function tomlString(value) {
+  const raw = withoutTomlComment(value).trim();
+  if (raw.startsWith('"') && raw.endsWith('"'))
+    return decodeTomlBasic(raw.slice(1, -1));
+  if (raw.startsWith("'") && raw.endsWith("'")) return raw.slice(1, -1);
+  return null;
+}
+
+function profileTable(line) {
+  const match = line.match(
+    /^\s*\[\s*profiles\s*\.\s*(?:"((?:\\.|[^"\\])*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*\]\s*(?:#.*)?$/,
+  );
+  if (!match) return null;
+  return match[1] != null
+    ? decodeTomlBasic(match[1])
+    : (match[2] ?? match[3]);
+}
+
+export function codexInstructionOverrideStatus(text) {
+  const lines = splitLines(text), structural = structuralTomlLines(lines);
+  let atTop = true, section = null, selectedProfile = null, topLevel = false;
+  const profileOverrides = new Set();
+  for (let index = 0; index < lines.length; index++) {
+    if (!structural[index]) continue;
+    const line = lines[index];
+    if (/^\s*\[/.test(line)) {
+      atTop = false;
+      section = profileTable(line);
+      continue;
+    }
+    const assignment = tomlAssignment(line);
+    if (!assignment) continue;
+    if (atTop && assignment.key === "profile")
+      selectedProfile = tomlString(assignment.value);
+    if (assignment.key === "model_instructions_file") {
+      if (atTop) topLevel = true;
+      else if (section != null) profileOverrides.add(section);
+    }
+  }
+  const selectedProfileOverride =
+    selectedProfile != null && profileOverrides.has(selectedProfile);
+  return {
+    configured: topLevel || selectedProfileOverride,
+    topLevel,
+    selectedProfile,
+    selectedProfileOverride,
+  };
+}
+
 export function removeTopLevelKeys(lines) {
   const structural = structuralTomlLines(lines);
   let inTable = false;
@@ -294,22 +343,29 @@ export function integrationPaths(env, home = defaultCodexHome(env)) {
   };
 }
 
-export async function appIsRunning(env = process.env) {
-  if (env.CODEX_APP_RUNNING === "0") return false;
-  if (env.CODEX_APP_RUNNING === "1") return true;
+export async function appIsRunning(env = process.env, options = {}) {
   const candidates = [
     env.CODEX_APP_EXECUTABLE,
     "/Applications/Codex.app/Contents/MacOS/Codex",
     "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
   ].filter(Boolean);
   try {
-    const { stdout } = await exec("ps", ["-axo", "args="], { timeout: 5000 });
+    const { stdout } = await (options.exec ?? exec)("ps", ["-axo", "args="], { timeout: 5000 });
     return stdout
       .split(/\r?\n/)
       .some((line) => candidates.some((candidate) => line.trim().startsWith(candidate)));
   } catch {
-    return false;
+    return null;
   }
+}
+
+async function checkedAppState(options, env) {
+  const state = await (options.appRunning ?? (() => appIsRunning(env)))();
+  if (state == null)
+    throw Object.assign(Error("Codex App state could not be determined"), {
+      code: "app_state_unknown",
+    });
+  return state;
 }
 
 async function migrateLegacyState(paths, env) {
@@ -360,7 +416,7 @@ export async function readIntegrationState(env = process.env) {
   return (await readJSON(paths.state, null)) ?? migrateLegacyState(paths, env);
 }
 
-export async function discoverCodex(env = process.env) {
+export async function discoverCodex(env = process.env, options = {}) {
   const home = defaultCodexHome(env);
   const paths = integrationPaths(env, home);
   const exists = async (path) => access(path).then(() => true, () => false);
@@ -374,7 +430,7 @@ export async function discoverCodex(env = process.env) {
     catalogSource: paths.sourceCatalog,
     catalogSourceExists: await exists(paths.sourceCatalog),
     cliPath: env.CODEX_CLI_PATH ?? null,
-    appRunning: await appIsRunning(env),
+    appRunning: await (options.appRunning ?? (() => appIsRunning(env)))(),
     credentialsStore,
   };
 }
@@ -504,7 +560,10 @@ export async function syncIntegration(config, options = {}) {
         state: stateUnchanged ? previous : state,
       };
     }
-    if (clients.includes("app") && (await appIsRunning(env)) && !options.applyWhileRunning) {
+    const appRunning = clients.includes("app") && !options.applyWhileRunning
+      ? await checkedAppState(options, env)
+      : false;
+    if (appRunning) {
       await atomicWrite(paths.pendingConfig, edited.text);
       await atomicWrite(paths.pendingCatalog, catalog);
       state.status = "pending_app_quit";
@@ -527,7 +586,15 @@ export async function integrationStatus(config, options = {}) {
   const env = options.env ?? process.env;
   const paths = integrationPaths(env, options.codexHome ?? defaultCodexHome(env));
   const state = (await readJSON(paths.state, null)) ?? (await migrateLegacyState(paths, env));
-  if (!state) return { active: false, statePath: paths.state };
+  if (!state) {
+    const appRunning = await (options.appRunning ?? (() => appIsRunning(env)))();
+    return {
+      active: false,
+      statePath: paths.state,
+      appRunning,
+      ...(appRunning == null ? { appRunningError: "app_state_unknown" } : {}),
+    };
+  }
   let configText = "", catalog = null;
   try { configText = await readFile(state.configPath, "utf8"); } catch {}
   try { catalog = JSON.parse(await readFile(state.catalogPath, "utf8")); } catch {}
@@ -550,6 +617,7 @@ export async function integrationStatus(config, options = {}) {
         compHash: entry?.comp_hash ?? null,
       };
     });
+  const appRunning = await (options.appRunning ?? (() => appIsRunning(env)))();
   return {
     active: state.status === "applied",
     pending: state.status === "pending_app_quit",
@@ -560,10 +628,12 @@ export async function integrationStatus(config, options = {}) {
         : currentBlock[key] === state.managed[key],
     ),
     catalogCurrent: !!catalog && digest(Buffer.from(JSON.stringify(catalog, null, 2) + "\n")) === state.catalogHash,
-    appRunning: await appIsRunning(env),
+    appRunning,
+    ...(appRunning == null ? { appRunningError: "app_state_unknown" } : {}),
     clients: state.clients,
     officialSpaceRef: state.officialSpaceRef ?? null,
     materializedSpaceRef: state.materializedSpaceRef ?? null,
+    selectedModel: currentBlock.model ?? state.managed?.model ?? null,
     targets,
   };
 }
@@ -600,7 +670,10 @@ export async function disableIntegration(options = {}) {
       state.status === "disabled" &&
       !options.officialBaseline
     ) return { changed: false, conflicts: [] };
-    if ((await appIsRunning(env)) && state.clients?.includes("app") && !options.applyWhileRunning)
+    const appRunning = state.clients?.includes("app") && !options.applyWhileRunning
+      ? await checkedAppState(options, env)
+      : false;
+    if (appRunning)
       throw Object.assign(Error("Codex App is running; quit it before disabling integration"), { code: "app_running" });
     const current = await readFile(state.configPath, "utf8");
     if (

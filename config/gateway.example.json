@@ -3,42 +3,37 @@
   "listen": { "host": "127.0.0.1", "port": 8788 },
   "access": { "required": true, "tokenEnv": "CODEX_LOCAL_ROUTER_TOKEN" },
   "mode": "rules",
-  "defaultTarget": "deepseek",
+  "defaultTarget": "model",
   "providers": {
-    "opencode-go": {
-      "adapter": "opencode-go",
-      "baseUrl": "https://opencode.ai/zen/go",
-      "apiKeyEnv": "OPENCODE_GO_API_KEY",
-      "concurrency": 4
-    },
-    "feei": {
+    "provider": {
       "adapter": "openai-compatible",
-      "baseUrl": "https://ai.feei.cn/v1",
-      "keychain": {
-        "service": "codex-local-router-provider",
-        "account": "feei"
-      },
+      "baseUrl": "https://provider.example/v1",
+      "apiKeyEnv": "EXAMPLE_PROVIDER_API_KEY",
       "concurrency": 4
     }
   },
   "targets": {
-    "deepseek": {
-      "provider": "opencode-go",
-      "preset": "opencode-go/deepseek-v4.1-flash"
-    },
-    "feei-sol": {
-      "provider": "feei",
-      "preset": "feei/gpt-5.6-sol",
-      "app": {
-        "capabilityProfile": "standard-tools",
-        "useResponsesLite": false
+    "model": {
+      "provider": "provider",
+      "model": "provider-model-id",
+      "modelFamily": "other",
+      "wireApi": "responses",
+      "contextWindow": 128000,
+      "maxContextWindow": 128000,
+      "inputModalities": ["text"],
+      "compression": { "mode": "summary" },
+      "capabilities": {
+        "responses": true,
+        "toolCalling": true,
+        "freeformTools": true,
+        "streaming": true,
+        "nativeWebSearch": false
       },
-      "standaloneSearch": { "source": "disabled" }
-    },
-    "feei-astra": {
-      "provider": "feei",
-      "preset": "feei/gpt-6-astra",
       "app": {
+        "enabled": true,
+        "modelId": "provider-model-id",
+        "displayName": "Provider model",
+        "reasoningLevels": ["low", "medium", "high"],
         "capabilityProfile": "standard-tools",
         "useResponsesLite": false
       },
@@ -56,12 +51,6 @@
     "thirdPartyGpt": {
       "defaultSource": "subscription"
     }
-  },
-  "webSearch": {
-    "backend": "tavily",
-    "apiKeyEnv": "TAVILY_API_KEY",
-    "maxRounds": 3,
-    "maxExtractCharacters": 20000
   },
   "history": {
     "maxBytes": 134217728,

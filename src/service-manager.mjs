@@ -122,14 +122,13 @@ async function rotateLog(path) {
   await rename(path, `${path}.1`).catch(() => {});
 }
 
-async function launchctl(args, env = process.env) {
-  if (env.CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL === "1") return { stdout: "", stderr: "" };
+async function launchctl(args) {
   return exec("/bin/launchctl", args, { timeout: 15000 });
 }
 
 const domain = () => `gui/${process.getuid()}`;
 
-export async function serviceStatus(configPath, env = process.env) {
+export async function serviceStatus(configPath, env = process.env, options = {}) {
   const paths = runtimePaths(env);
   const recorded = await readJSON(paths.serviceState, null);
   const installation = await readJSON(paths.serviceInstall, null);
@@ -154,10 +153,9 @@ export async function serviceStatus(configPath, env = process.env) {
     }
   } catch {}
   const installed = await access(launchAgentPath(env)).then(() => true, () => false);
-  const loaded = env.CODEX_LOCAL_ROUTER_TEST_LAUNCHCTL === "1"
-    ? env.CODEX_LOCAL_ROUTER_TEST_SERVICE_LOADED === "1"
-    : await launchctl(["print", `${domain()}/${SERVICE_LABEL}`], env)
-      .then(() => true, () => false);
+  const control = options.launchctl ?? launchctl;
+  const loaded = await control(["print", `${domain()}/${SERVICE_LABEL}`])
+    .then(() => true, () => false);
   return {
     installed,
     loaded,
@@ -179,6 +177,7 @@ export async function installService(configPath, options = {}) {
   await mkdir(paths.logs, { recursive: true, mode: 0o700 });
   await rotateLog(paths.serviceLog);
   const plist = launchAgentPath(env);
+  const control = options.launchctl ?? launchctl;
   const prior = await readFile(plist, "utf8").catch(() => null);
   await atomicWrite(
     plist,
@@ -193,15 +192,15 @@ export async function installService(configPath, options = {}) {
     0o600,
   );
   try {
-    await launchctl(["bootout", domain(), plist], env).catch(() => {});
-    await launchctl(["bootstrap", domain(), plist], env);
-    await launchctl(["kickstart", "-k", `${domain()}/${SERVICE_LABEL}`], env);
+    await control(["bootout", domain(), plist]).catch(() => {});
+    await control(["bootstrap", domain(), plist]);
+    await control(["kickstart", "-k", `${domain()}/${SERVICE_LABEL}`]);
   } catch (error) {
     if (prior) {
-      await launchctl(["bootout", domain(), plist], env).catch(() => {});
+      await control(["bootout", domain(), plist]).catch(() => {});
       await atomicWrite(plist, prior, 0o600);
-      await launchctl(["bootstrap", domain(), plist], env).catch(() => {});
-      await launchctl(["kickstart", "-k", `${domain()}/${SERVICE_LABEL}`], env).catch(() => {});
+      await control(["bootstrap", domain(), plist]).catch(() => {});
+      await control(["kickstart", "-k", `${domain()}/${SERVICE_LABEL}`]).catch(() => {});
     } else await rm(plist, { force: true });
     throw Object.assign(Error("LaunchAgent update failed; the previous definition was restored"), {
       code: "service_upgrade_failed",
@@ -215,13 +214,14 @@ export async function installService(configPath, options = {}) {
     launchAgent: launchAgentPath(env),
     installedAt: Date.now(),
   });
-  return serviceStatus(configPath, env);
+  return serviceStatus(configPath, env, { launchctl: control });
 }
 
 export async function stopService(options = {}) {
   const env = options.env ?? process.env;
   const plist = launchAgentPath(env);
-  await launchctl(["bootout", domain(), plist], env).catch((error) => {
+  const control = options.launchctl ?? launchctl;
+  await control(["bootout", domain(), plist]).catch((error) => {
     if (!options.ignoreMissing) throw error;
   });
   return { stopped: true };
@@ -229,7 +229,7 @@ export async function stopService(options = {}) {
 
 export async function uninstallService(options = {}) {
   const env = options.env ?? process.env;
-  await stopService({ env, ignoreMissing: true });
+  await stopService({ ...options, env, ignoreMissing: true });
   await rm(launchAgentPath(env), { force: true });
   return { removed: true };
 }
@@ -238,7 +238,7 @@ export async function installSpaceSwitcher(options = {}) {
   const env = options.env ?? process.env;
   const paths = runtimePaths(env);
   return withSpaceSwitcherLock(paths, async () => {
-    const control = options.launchctl ?? ((args) => launchctl(args, env));
+    const control = options.launchctl ?? launchctl;
     const admin = options.adminPath ?? fileURLToPath(
       new URL("../scripts/gateway-admin.mjs", import.meta.url),
     );
@@ -295,18 +295,18 @@ export async function uninstallSpaceSwitcher(options = {}) {
   return withSpaceSwitcherLock(paths, async () => {
     const plist = spaceSwitcherLaunchAgentPath(env);
     if (!options.skipBootout)
-      await launchctl(["bootout", domain(), plist], env).catch(() => {});
+      await (options.launchctl ?? launchctl)(["bootout", domain(), plist]).catch(() => {});
     await rm(plist, { force: true });
     await rm(paths.spaceSwitcherInstall, { force: true });
     return { removed: true };
   }, options.switcherLockWaitMs);
 }
 
-export async function spaceSwitcherStatus(env = process.env) {
+export async function spaceSwitcherStatus(env = process.env, options = {}) {
   const paths = runtimePaths(env);
   return {
     installed: await access(spaceSwitcherLaunchAgentPath(env)).then(() => true, () => false),
-    loaded: await launchctl(["print", `${domain()}/${SPACE_SWITCHER_LABEL}`], env)
+    loaded: await (options.launchctl ?? launchctl)(["print", `${domain()}/${SPACE_SWITCHER_LABEL}`])
       .then(() => true, () => false),
     installation: await readJSON(paths.spaceSwitcherInstall, null),
   };
@@ -316,7 +316,7 @@ export async function drainService(configPath, options = {}) {
   const env = options.env ?? process.env;
   const waitMs = options.waitMs ?? 300000;
   const signal = options.signal ?? process.kill;
-  const before = await serviceStatus(configPath, env);
+  const before = await serviceStatus(configPath, env, options);
   if (!before.health) {
     if (before.loaded)
       return {
@@ -337,7 +337,7 @@ export async function drainService(configPath, options = {}) {
   signal(before.health.pid, "SIGUSR2");
   const deadline = Date.now() + waitMs;
   for (;;) {
-    const state = await serviceStatus(configPath, env);
+    const state = await serviceStatus(configPath, env, options);
     if (state.health?.activeTurns === 0)
       return { drained: true, wasRunning: true, before, state };
     if (Date.now() >= deadline) {
@@ -401,7 +401,7 @@ export async function preflightCandidate(serverPath, configPath, options = {}) {
 export async function gracefulRestart(configPath, options = {}) {
   const env = options.env ?? process.env;
   const waitMs = options.waitMs ?? 300000;
-  const before = await serviceStatus(configPath, env);
+  const before = await serviceStatus(configPath, env, options);
   const candidate = await preflightCandidate(
     options.serverPath ?? fileURLToPath(new URL("./server.mjs", import.meta.url)),
     configPath,
@@ -411,7 +411,7 @@ export async function gracefulRestart(configPath, options = {}) {
     process.kill(before.health.pid, "SIGUSR2");
     const deadline = Date.now() + waitMs;
     for (;;) {
-      const state = await serviceStatus(configPath, env);
+      const state = await serviceStatus(configPath, env, options);
       if (!state.health?.activeTurns) break;
       if (Date.now() >= deadline) {
         process.kill(before.health.pid, "SIGUSR1");

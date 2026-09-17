@@ -1,44 +1,49 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
-import { readFile } from "node:fs/promises";
+import { assertAllowedFiles, filesUnder, scanTextFiles } from "./public-boundary.mjs";
 
 const exec = promisify(execFile);
-const { stdout } = await exec("npm", ["pack", "--dry-run", "--json"], {
-  maxBuffer: 10 * 1024 * 1024,
-});
-const report = JSON.parse(stdout)[0];
-const names = report.files.map((file) => file.path);
-const packageJson = JSON.parse(await readFile("package.json", "utf8"));
-for (const command of ["codex-local-router", "llm-auto-gateway"])
-  if (packageJson.bin?.[command] !== "scripts/gateway-admin.mjs")
-    throw Error(`package is missing the ${command} executable`);
-for (const [name, command] of Object.entries(packageJson.scripts ?? {})) {
-  const match = /^node\s+([^\s]+)/.exec(command);
-  if (match && !names.includes(match[1]))
-    throw Error(`package script ${name} references missing file ${match[1]}`);
+const root = await mkdtemp(join(tmpdir(), "codex-local-router-package-audit-"));
+try {
+  const { stdout } = await exec(
+    "npm",
+    ["pack", "--ignore-scripts", "--json", "--pack-destination", root],
+    { maxBuffer: 16 * 1024 * 1024 },
+  );
+  const report = JSON.parse(stdout)[0];
+  const archive = resolve(root, report.filename);
+  await exec("tar", ["-xzf", archive, "-C", root]);
+  const packageRoot = join(root, "package");
+  const names = (await Promise.all(
+    (await readdir(packageRoot)).map((entry) => filesUnder(packageRoot, entry)),
+  )).flat().sort();
+  assertAllowedFiles(names);
+  const packageJson = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+  for (const command of ["codex-local-router", "llm-auto-gateway"])
+    if (packageJson.bin?.[command] !== "scripts/gateway-admin.mjs")
+      throw Error(`package is missing the ${command} executable`);
+  for (const [name, command] of Object.entries(packageJson.scripts ?? {})) {
+    const match = /^node\s+([^\s]+)/.exec(command);
+    if (match && !names.includes(match[1]))
+      throw Error(`package script ${name} references missing file ${match[1]}`);
+  }
+  if (!names.some((name) => name.startsWith("test/") && name.endsWith(".test.mjs")))
+    throw Error("package test script has no packaged test files");
+  const scanned = await scanTextFiles(packageRoot, names, {
+    skip: ["scripts/public-boundary.mjs"],
+  });
+  console.log(JSON.stringify({
+    ok: true,
+    package: report.filename,
+    files: names.length,
+    textFiles: scanned.textFiles,
+    bytes: report.size,
+    commands: Object.keys(packageJson.bin),
+  }, null, 2));
+} finally {
+  await rm(root, { recursive: true, force: true });
 }
-if (!names.some((name) => name.startsWith("test/") && name.endsWith(".test.mjs")))
-  throw Error("package test script has no packaged test files");
-const denied = names.filter((name) =>
-  /(^|\/)(artifacts|\.runtime|node_modules)(\/|$)/.test(name) ||
-  /(^|\/)(auth\.json|history\.sqlite|gateway\.subscription\.local\.json)$/.test(name) ||
-  /\.before-|\.bak$|(?:^|\/)rollout-[^/]*\.jsonl$/i.test(name),
-);
-if (denied.length) throw Error(`package contains denied paths:\n${denied.join("\n")}`);
-
-const textFiles = names.filter((name) => /\.(?:mjs|js|json|md|toml|txt)$/.test(name));
-const findings = [];
-const patterns = [
-  [/\/Users\/[A-Za-z0-9._-]+\//g, "absolute user path"],
-  [/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g, "private key"],
-  [/\bBearer\s+[A-Za-z0-9._~+\/-]{24,}/g, "bearer token"],
-  [/(?:sk|sess|ghp)_[A-Za-z0-9_-]{24,}/g, "credential-shaped token"],
-];
-for (const name of textFiles) {
-  const body = await readFile(name, "utf8");
-  for (const [pattern, label] of patterns)
-    if (pattern.test(body)) findings.push(`${name}: ${label}`);
-}
-if (findings.length) throw Error(`package content audit failed:\n${findings.join("\n")}`);
-console.log(JSON.stringify({ ok: true, package: report.filename, files: names.length, bytes: report.size, commands: Object.keys(packageJson.bin) }, null, 2));

@@ -6,6 +6,7 @@ import {
   scrypt as scryptCallback,
 } from "node:crypto";
 import { promisify } from "node:util";
+import { canonicalizeToolSearchHistory } from "./history.mjs";
 
 const scrypt = promisify(scryptCallback);
 const stable = (value) => JSON.stringify(value);
@@ -99,7 +100,9 @@ export function historyResumePrompt(history) {
     "Preserve prior decisions, constraints, unresolved work, and the current context view.",
     "",
   ];
-  for (const item of history.view ?? history.original ?? []) {
+  for (const item of canonicalizeToolSearchHistory(
+    history.view ?? history.original ?? [],
+  )) {
     if (item.type === "message" || item.role)
       lines.push(`${String(item.role ?? "message").toUpperCase()}: ${textContent(item)}`);
     else if (["function_call", "custom_tool_call"].includes(item.type))

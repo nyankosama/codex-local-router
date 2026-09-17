@@ -56,10 +56,12 @@ test("legacy probe state migrates to idempotent product integration without bloc
     ...process.env,
     CODEX_HOME: home,
     CODEX_LOCAL_ROUTER_HOME: data,
-    CODEX_APP_RUNNING: "0",
+    CODEX_LOCAL_ROUTER_TEST_DRIVER_APP_STATE: "stopped",
     CODEX_MODEL_CATALOG_SOURCE: join(home, "models_cache.json"),
   };
-  await exec(process.execPath, [script, gatewayPath], { env: environment });
+  await exec(process.execPath, [
+    "--import", resolve("test/support/process-stubs.mjs"), script, gatewayPath,
+  ], { env: environment });
   const catalogPath = join(home, "model-catalogs", "codex-local-router.json");
   const catalog = JSON.parse(await readFile(catalogPath, "utf8"));
   const deepseek = catalog.models.find((model) => model.slug === "deepseek-v4.1-flash");

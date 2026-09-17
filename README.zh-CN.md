@@ -21,9 +21,11 @@ Codex Local Router（仅监听本机回环地址）
 
 Router 不替用户开启或关闭搜索：Codex 继续使用正常搜索模式（默认 cached，或由用户选择 live）。官方 HTTP 与 WebSocket 会共同继承 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`WS_PROXY`、`WSS_PROXY` 并遵守 `NO_PROXY`。
 
-新建第三方 `openai-gpt` App target 默认使用 `standard-tools`：通过标准 Responses 保留 Codex 核心工具、Plugin 策略允许的工具和用户 MCP，但不向 App 广告独立搜索。用户可以显式选择 `lite-search`，通过 Responses Lite 使用当前官方登录的订阅搜索或已配置的 Provider 搜索 endpoint；其缩减后的 Plugin/MCP 工具面会被明确披露，不会伪装成完整工具兼容。Router 不猜测，也不会在搜索来源间静默回退。Responses 内嵌 hosted search 仍是另一项独立能力。详见[第三方 GPT App 能力画像](docs/public/configuration.zh-CN.md#第三方-gpt-app-能力画像)。
+新建 App-enabled 第三方模型在具备 Responses、工具调用和 freeform 工具能力且 preset 已通过 Provider 准出时，默认采用版本化 `codex-general-v1` 模板：简短中性指令、标准 Responses、Code mode、多代理 v2 元数据和标准 Plugin 白名单。不兼容目标使用 `legacy`；当前 OpenCode Go DeepSeek preset 明确只允许 legacy，已有模型也不会在加载时迁移。官方 GPT 指令快照、Lite、搜索和缓存亲和仍为可选能力。详见[第三方模型模板](docs/public/third-party-templates.zh-CN.md)。
 
-第三方 GPT target 默认采用保守的 Plugin 白名单，以减少 Codex 客户端携带的大体积 Plugin 工具定义；Codex 核心工具和用户自行配置的 MCP 不受裁剪。非 GPT 与未声明模型家族的旧 target 默认仍原样转发。
+Plugin 白名单只裁剪结构化 Plugin 定义；Codex 核心工具和用户 MCP 保留，嵌入 `exec` 说明的 schema 仍不透明。这是上下文控制策略，不是安全沙箱，也不保证 Code mode 必然减少字节。
+
+兼容的第三方 Responses Provider 还可以显式启用匿名缓存亲和：适用于 `openai-gpt`，或已显式物化通用模板的非 GPT target；既有 Provider 不会因升级被自动开启。Router 会把 Codex 的缓存/会话身份替换为按 Provider、模型与谱系隔离的 HMAC 键。账号池中转站可以把该匿名键用于稳定选择账号或 Cache Shard；只有 Gateway 侧亲和并不能保证缓存命中。详见[缓存亲和契约](docs/public/provider-cache-affinity.zh-CN.md)。
 
 ## 支持范围
 
@@ -33,15 +35,15 @@ Router 不替用户开启或关闭搜索：Codex 继续使用正常搜索模式�
 - Responses 与 Chat Completions
 - ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设和通用 OpenAI 兼容渠道
 
-v0.5.0 不声明 Linux、Windows 或未知供应商私有协议已受支持。
+v0.5.2 不声明 Linux、Windows 或未知供应商私有协议已受支持。
 
 ## 从 GitHub Release 安装
 
-下载 `v0.5.0` Release 中的 `.tgz` 与 SHA-256 文件：
+下载 `v0.5.2` Release 中的 `.tgz` 与 SHA-256 文件：
 
 ```bash
-shasum -a 256 -c codex-local-router-0.5.0.tgz.sha256
-npm install -g ./codex-local-router-0.5.0.tgz
+shasum -a 256 -c codex-local-router-0.5.2.tgz.sha256
+npm install -g ./codex-local-router-0.5.2.tgz
 codex-local-router --version
 ```
 
@@ -49,16 +51,17 @@ codex-local-router --version
 
 ## 首次接入
 
-默认预设通过 OpenCode Go 接入 DeepSeek V4.1 Flash。使用终端隐藏输入将渠道凭证保存到 macOS Keychain：
+全新 setup 不再默认任何个人 Provider，必须显式选择 preset。例如，通过终端隐藏输入将 OpenCode Go 凭证保存到 macOS Keychain：
 
 ```bash
-codex-local-router setup --credential-prompt
+codex-local-router setup --preset opencode-go/deepseek-v4.1-flash --credential-prompt
 ```
 
 非交互安装可以通过 stdin 传入凭证；凭证不会进入配置正文或命令参数：
 
 ```bash
-printf '%s' "$OPENCODE_GO_API_KEY" | codex-local-router setup --credential-stdin --yes
+printf '%s' "$OPENCODE_GO_API_KEY" | codex-local-router setup \
+  --preset opencode-go/deepseek-v4.1-flash --credential-stdin --yes
 ```
 
 前台运行仍可使用环境变量凭证。受管 LaunchAgent 不会继承 Provider 凭证变量，只保留复现安装进程网络信任边界所需的代理变量和 `NODE_EXTRA_CA_CERTS`；`doctor` 会报告凭证引用并建议改用 Keychain。
@@ -97,6 +100,8 @@ codex-local-router model probe --id deepseek --live
 
 内置的 `feei/gpt-5.6-sol`、`feei/gpt-6-astra` 预设分别使用 `feei-gpt-5.6-sol`、`feei-gpt-6-astra` 作为 App 模型 ID，并声明保守的 272,000 token 配置窗口与第三方 GPT Plugin 策略。CLI 新建 target 默认写入 `standard-tools`；只有更重视独立搜索时才显式增加 `--app-profile lite-search`。既有显式 Responses Lite 配置保持传输行为；若旧配置明确关闭搜索，则保持未画像状态，不会被误标成 `lite-search`。API Key 必须由用户通过 Keychain 或 `FEEI_API_KEY` 单独提供，项目不包含任何凭证。具体配置见[配置说明](docs/public/configuration.zh-CN.md)。
 
+符合条件的第三方 GPT target 可固定官方 catalog 基础指令。标准 Responses 保持客户端交付；Responses Lite 需要显式开启 `gateway-lite`，且快照不能含运行时变量。已有 target 不会自动迁移。详见[基础指令快照](docs/public/instruction-snapshots.zh-CN.md)。
+
 ## 恢复与历史
 
 Codex 配置使用受管区块和三方比较事务。禁用时只撤销仍等于 Router 上次写入值的字段，保留用户后续增加的无关设置。
@@ -114,9 +119,14 @@ codex-local-router rescue --subscription --yes
 ```bash
 codex-local-router history export --thread THREAD_ID --output history.clr.json --passphrase-env HISTORY_PASSPHRASE
 codex-local-router history inspect --thread THREAD_ID
+codex-local-router history recover --thread THREAD_ID --json
 ```
 
-更多信息见[配置空间指南](docs/public/configuration-spaces.zh-CN.md)、[CLI 说明](docs/public/cli.zh-CN.md)、[配置说明](docs/public/configuration.zh-CN.md)、[架构](docs/public/architecture.zh-CN.md)、[数据流向](docs/public/data-flow.zh-CN.md)、[兼容性](docs/public/compatibility.zh-CN.md)与[验收工具链](docs/public/acceptance.zh-CN.md)。
+同一已验证账号下，直接 fork 可以继承父线程中密文完全匹配且含原文的可移植 checkpoint。存量 rollout 只有在完整来源链能够无损重建时才可预览并显式恢复；应用要求 App 已退出且 Gateway 空闲。详见 [Fork 与压缩历史恢复](docs/public/compaction-recovery.zh-CN.md)。
+
+跨 Provider 续聊时，Provider 私有的动态工具搜索控制项会转换成不含 schema 的固定历史标记；已完成的函数/custom-tool 调用与结果保持顺序，原始加密归档不改写。详见[工具搜索历史迁移](docs/public/tool-search-history-migration.zh-CN.md)。
+
+更多信息见[配置空间指南](docs/public/configuration-spaces.zh-CN.md)、[CLI 说明](docs/public/cli.zh-CN.md)、[配置说明](docs/public/configuration.zh-CN.md)、[架构](docs/public/architecture.zh-CN.md)、[数据流向](docs/public/data-flow.zh-CN.md)、[兼容性](docs/public/compatibility.zh-CN.md)、[开源维护边界](docs/public/open-source-maintenance-boundaries.zh-CN.md)与[验收工具链](docs/public/acceptance.zh-CN.md)。
 
 ## 压缩边界
 

@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+## 0.5.2 - 2026-09-17
+
+- Allow a trusted direct fork to inherit an exact same-account portable parent checkpoint, persist its own encrypted copy, and remain fail-closed when the parent is missing, mismatched, or summary-only.
+- Add preview-first `history recover` for losslessly reconstructable Codex rollouts, including bounded parent-chain traversal, strict ordinal/tool-pair validation, atomic encrypted writes, idempotency, metadata-only diagnostics, and checkpoint counts in `history inspect`.
+- Separate public product code from local evidence and private operations: public export and package audits now inspect the actual npm file list file-by-file, reject selected symlinks and sensitive paths, and keep raw acceptance output outside the checkout.
+- Require an explicit preset or complete existing config for fresh setup, use neutral fallback IDs, and report preset restrictions as restrictions or unverified state instead of qualification evidence. Existing spaces and preset expansion remain unchanged.
+- Move feature-specific rollout/rollback helpers to source-only `scripts/maintainer/`, add a hash-verified legacy recovery-bundle preparer, and remove production support for test-only App/launchctl environment switches in favor of injected test substitutes.
+
+## 0.5.1 - 2026-09-17
+
+- Add the versioned `codex-general-v1` default for new eligible third-party App models: provider-neutral base instructions, Standard Responses, code mode, configured multi-agent v2 metadata and the existing standard Plugin allowlist. Existing targets remain unchanged until explicitly updated, while incompatible targets require `legacy` instead of silently downgrading.
+- Make code mode, capability profiles, direct multi-agent metadata, managed instruction sources and explicitly configured cache affinity depend on protocol capabilities rather than GPT family alone. Official instruction snapshots, Lite delivery, standalone search and cache affinity remain explicit options.
+- Add space/model template CLI operations, built-in/custom instruction sources, metadata-only diagnostics, current-client context/protocol gates, a 12-generation live harness and hash-bound activation/rollback scripts that preserve GPT targets and both default-model states.
+- Keep the OpenCode Go DeepSeek preset on its accepted legacy path after the real generic-template payload returned HTTP 400. Default setup remains usable, while generic templates, direct Code mode and direct multi-agent metadata fail closed until that Provider path is requalified.
+
+- Add explicit, versioned official multi-agent capability snapshots for eligible third-party GPT targets, atomic `model sync-multi-agent`, shared catalog projection and metadata-only diagnostics. Preserve user agent settings, model routing and both default-model states; no automatic migration or prompt injection.
+
+- Add explicit `app.toolMode: "code_mode_only"` catalog projection and atomic `model set-tool-mode` updates for eligible third-party GPT Responses targets. Preserve defaults and existing configurations, retain structured Plugin filtering, and document a context-size qualification gate rather than parsing exec-embedded schemas or promising runtime context limits.
+- Add explicit, versioned official instruction snapshots for eligible third-party GPT targets, batch `model sync-instructions`, source diagnostics, tamper checks and body-redacted CLI previews. Existing configurations do not migrate on load.
+- Add opt-in `gateway-lite` delivery for pinned, variable-free third-party GPT snapshots. It inserts one developer input only on actual Lite user turns, includes the bytes in context budgeting, stays out of archives/history, rejects conflicting top-level instructions, and leaves Standard Responses and official relay traffic unchanged.
+- Preserve Codex's current selected model separately from the configuration-space default during same-space instruction updates, including pending/resume and rollback. Add hash-bound activation and rollback scripts that require an idle, drift-free App-closed window.
+- The current Codex CLI/app-server loopback gate now proves matching synthetic instruction hashes exactly once for Standard custom-provider and Gateway Lite paths while retaining official Lite omission as a control observation. Real-channel generation and App UI sign-off remain separate gates.
+
+- Preserve the current Responses Lite negotiation bit per HTTP request or WebSocket frame when routing third-party OpenAI GPT Responses, remove stale/false values instead of inheriting a connection handshake, and keep internal summary/image requests explicitly non-Lite.
+- Emit one redacted terminal `prompt_cache_usage` event for third-party GPT Responses in both `none` and `gateway-opaque` modes, retaining missing usage as unknown and emitting no terminal usage for errors or cancellations.
+- Add a 24-generation Sol/Astra direct-versus-anonymous cache comparison, a current-App-binary six-generation MCP continuation gate, and hash-bound local activation/rollback scripts that preserve the previous package and exact configuration-space revision.
+- Replace the unverified requirement for one particular relay consistency-hashing algorithm with a conditional interoperability recommendation; observed ai.feei field effects do not disclose its internal account-pool implementation or promise a fixed natural-session hit rate.
+- Attribute nested namespace tools to their confirmed parent source and report metadata-only source counts in route diagnostics without changing filtering behavior or logging tool names and schemas.
+- Preserve the current Responses Lite `input[].additional_tools` carrier when a conversation switches from another Provider to a Lite third-party target. Historical carriers remain non-portable, Plugin filtering still runs before dispatch, migration summaries omit tool schemas, and route diagnostics now count Lite definitions separately from top-level tools.
+- Added an opt-in `gateway-opaque` prompt-cache affinity policy for third-party OpenAI GPT Responses targets. The router derives a provider/model/lineage-scoped `prompt_cache_key` with a dedicated local Keychain secret while keeping Codex account, thread, turn, session, installation, and original cache identifiers off the provider wire.
+- Added bounded encrypted lineage state with same-turn freezing, verified parent/fork inheritance, 30-minute expiry, restart stability, safe `prompt_cache_options` filtering, metadata-only cache-usage diagnostics, and no retry or fallback caused by cache-field rejection.
+- Added Provider CLI configuration and effective diagnostics, deterministic HTTP/WebSocket/config-space/security/performance gates, a fail-closed live harness, and conditional account-pool interoperability guidance for stable upstream selection.
+- The bounded ai.feei feasibility probe stopped after its first no-affinity request returned HTTP 403, with no retry. Generic Gateway behavior is validated locally, while ai.feei end-to-end cache effectiveness remains `EXTERNAL_UNRESOLVED` until the Provider implements or proves the account-pool contract.
+- Canonicalize completed `tool_search_call` / `tool_search_output` pairs into a fixed, schema-free history marker before replaying them across providers or protocols. Function and custom-tool calls/results remain ordered and portable, while provider IDs, search arguments, execution metadata, and dynamically loaded tool schemas never enter the destination view or history-resume prompt.
+- Reject missing, duplicated, malformed, or reversed dynamic-tool-search pairs with `tool_search_history_incomplete` before any destination request. Original encrypted history remains immutable so repeated switches do not accumulate lossy rewrites.
+
 ## 0.5.0 - 2026-09-16
 
 - Keep Engine-managed, local-prewarm, compaction, and legacy unlabelled official response IDs on Gateway history replay, while allowing only successfully observed opaque official-relay responses to retain native `previous_response_id` continuation. This prevents an Engine response from being handed to a fresh official WebSocket session that cannot resolve it.

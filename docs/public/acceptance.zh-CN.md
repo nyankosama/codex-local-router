@@ -5,9 +5,13 @@ v0.4.0 第三方独立搜索记录见[第三方 OpenAI 搜索验收报告](third
 
 PR 门禁使用 A1-A10 十组等价类：策略解析、来源/名单、工具载体、调用闭环、HTTP 透明性、WS 生命周期、身份边界、历史兼容、产品/隔离、证据/预算。它们由纯函数和本地模拟上游完成，不调用真实模型。
 
+工具搜索历史迁移增加一组聚焦的确定性矩阵：合法单 pair、多 pair、交错与空结果；缺失、重复、反序和畸形 pair；第三方 Responses → 官方 → 第三方 → Chat Completions 切换；函数/custom-tool 结果保留；加密 original/view 分离；schema、查询与 ID 脱敏；以及 10,000 item 的线性扫描 sanity。Engine 只使用本地模拟上游，畸形历史必须在 outbound hook 调用前失败。该门禁不会重试真实存量会话。
+
 发布包同时携带验收 Harness 与运行时测试集；从 `.tgz` 安装后，`npm test`、`npm run audit:package` 和文档列出的 `e2e:*` 脚本都必须可执行。包审计会逐一检查 `package.json` 中声明的 Node 脚本入口及测试文件，缺少任何入口都会失败。三项只适用于完整仓库的公开导出器测试继续在源码/公开导出树强制运行，在安装后的 `.tgz` 中因不存在仓库导出输入而显式跳过。
 
 配置空间补充 fresh/legacy/applied/disabled/pending/歧义迁移、不可变 revision、official 自动追加、克隆/diff/默认模型/drift capture、official↔Router/Router↔Router/历史版本/rollback、一次性协调器、活跃轮次、凭证/候选/服务/哈希失败与分阶段恢复，以及非受管 Codex 数据保留。测试统一使用临时 Codex/Router Home、配置/状态/LaunchAgent、随机端口、模拟 launchctl 和本地上游。
+
+压缩历史恢复补充当前线程查找、精确直接父线程继承与重启持续性；账号、父线程和 compaction 哈希隔离；仅摘要 checkpoint 关闭失败；完整单文件、父子 rollout 链和重复恢复；缺祖先、错边界、工具 pair 断层、损坏 JSON、多文件歧义和已有记录冲突。验证失败必须零写入；恢复后的唯一次本地模拟第三方请求只能收到展开原文，不能收到官方不透明 compaction，也不允许重试。父 checkpoint 本地查找 p95 强制小于 10 ms，且不增加网络请求。
 
 L0-L2 和能力画像门禁均为零凭证、零外网的确定性测试：它们仍会驱动当前 App 内置 Codex core，但官方、Provider 与搜索上游全部由本地注入夹具响应。只有带显式 `--run` 的 live canary 才会读取对应凭证并访问真实上游；默认 `npm test`、`npm run e2e` 和各层门禁不会触发真实渠道。
 
@@ -20,10 +24,21 @@ npm run e2e:l0
 npm run e2e:l1
 npm run e2e:l2
 npm run e2e:profiles
+npm run e2e:tool-search-history      # 当前 app-server + 存量历史迁移，全部本地
 npm run e2e                       # 只运行 L0-L2，不包含 live
 npm run e2e:live -- --run         # 显式运行已安装服务并发用例
 npm run e2e -- --include-live --run
+npm run e2e:prompt-cache             # 零外网派生/适配性能门
+npm run e2e:prompt-cache -- --live-feasibility --run  # 最多 8 次 Provider 直连
+npm run e2e:prompt-cache -- --live-comparison --run  # Sol/Astra 24 次直连形态与候选对照
+npm run e2e:prompt-cache -- --live-app-candidate --run  # 当前 App 二进制，最多 6 次 Provider 生成
 ```
+
+缓存亲和采用分阶段 fail-closed 门禁。缺省 `e2e:prompt-cache` 零外网，要求 HMAC 派生 p95 小于 5ms、请求体适配 p95 小于 25ms、Wire 增量小于 128 bytes。当前效果门使用 `--live-comparison --run`：Sol/Astra 共 24 次交错、零重试生成，在请求其余部分固定的条件下比较原始直连形态和候选匿名 key。随后 `--live-app-candidate --run` 使用当前 App 内置 Codex 二进制、临时 Codex/Router Home 和隔离 Gateway，Provider 生成不超过 6 次；每款模型必须完成一个只读 MCP call/result 和下一 turn，同时观察到匿名键指纹稳定、逐 frame Lite Header 正确且订阅/Provider 身份不串线。缺失 usage 记为未知，不记作 0。旧的 `--live-feasibility`、`--live-gateway` 和 `--live-app-protocol` 仍用于复查历史候选，不再构成本轮 30 次准出门。
+
+历史 ai.feei 可行性尝试在第 1 次 control 请求收到 HTTP 403 后停止，该记录继续保留。后续 35 次因果诊断没有覆盖它：35 次合成请求全部完成，严格单变量对照中 Sol 从无 key 的 30.11% 加权缓存复用上升到 Gateway 匿名 key 的 98.55%。这证明特定工作负载下 Gateway 可控字段的效果，不证明 ai.feei 内部账号池算法，也不承诺自然会话固定命中率。当前候选仍必须重新通过 Sol/Astra 与 App 协议门，才能进入本机启用。
+
+`e2e:tool-search-history` 先用当前 App 内置 app-server 验证新会话模型切换，再通过真实 Gateway HTTP 身份与加密归档边界复现受影响的存量 response 链。它只使用合成 auth/凭证、本地 Provider、注入的官方响应、随机端口和临时 Home；断言目标只收到一个固定标记，不收到动态 schema、查询或 Provider 标识，同时加密归档中的原 pair 保持字节等价。它不会重试真实会话，也不会连接任何外部上游。
 
 官方搜索另有一个窄范围真实 canary：
 
@@ -53,13 +68,13 @@ FEEI_API_KEY=... npm run e2e:focused -- --run
 
 真实 turn 前的 `standard-tools` 预检只确认允许 Plugin 和用户 MCP 定义被转发、禁止 Plugin 定义被删除；结果明确标记为 `DEFINITION_PREFLIGHT_ONLY`，不能充当调用/结果闭环。两个 App 用例只要求看到 Responses Lite 搜索载体、官方独立搜索成功且只到 OpenAI，并明确披露 `reduced-responses-lite`，不宣称完整 Plugin/MCP 兼容。summary 明确写明“Standard 完整工具面与搜索组合能力未建立”；缺少任一预期用例或证据就是 FAIL。
 
-完整画像准出由独立的确定性门禁承担：使用当前 App 内置 Codex 二进制和隔离本地夹具，分别证明 `standard-tools` 的核心/允许 Plugin/用户 MCP 实际调用与结果闭环，以及 `lite-search` 的完整搜索闭环。不同画像的证据分开报告，不能拼接成一项能力结论。
+完整画像准出由独立的确定性门禁承担：使用当前 App 内置 Codex 二进制和隔离本地夹具，分别证明 `standard-tools` 的核心/允许 Plugin/用户 MCP 实际调用与结果闭环，以及同一任务从官方切到第三方后 `lite-search` 的核心工具结果与完整搜索闭环。Lite 用例仍不声明具备 `standard-tools` 的完整 Plugin/MCP 工具面。不同画像的证据分开报告，不能拼接成一项能力结论。
 
 所有过程使用临时 `HOME`、`CODEX_HOME`、XDG、Router Home/状态/历史、实例、工作区和随机端口。确定性门禁使用无害的合成 auth，不读取 Provider Key；显式 live canary 只把所需 Codex auth 以 0600 权限复制到隔离根目录，不软链接真实文件。Codex 子进程不会继承环境中的 Provider、代理、shell agent、App tools pipe 或自定义 CA 变量，除非用例显式提供无害夹具值。L0 另行验证整个测试进程树不能写真实 Codex、Router、LaunchAgent、MCP、Skill、Hook、提示或会话目录。
 
 在 macOS 上，G3 live runner 会先在禁止写入真实 Codex、Router、已安装 Skill、LaunchAgent 和 Keychain 根目录的外层 sandbox 中重新启动自身；Codex 保持自身的只读 sandbox，并使用临时 Home。回执记录 sandbox profile 哈希，并把受管 catalog、空间索引和 pending 事务纳入前后权威边界。`models_cache.json` 发生变化时，只有已观察到 App 刷新、测试进程树无法写真实目录、权威状态未变且新缓存没有 Router 状态，Gateway Core 才能继续通过。
 
-证据只保存模型/工具类型、来源标识、哈希、状态、数量、字节和耗时，不保存提示、回答、搜索查询/结果/URL、工具 schema、凭证、图片或本地绝对路径。用于准出的运行还会设置 `ACCEPTANCE_COMMIT`；Harness 会拒绝脏工作树或不一致的提交，并同时记录精确 commit 与 Git tree。run 目录和 JSON 回执只能创建一次，目标已存在时直接失败，不会覆盖旧证据。
+证据只保存模型/工具类型、来源标识、哈希、状态、数量、字节和耗时，不保存提示、回答、搜索查询/结果/URL、工具 schema、凭证、图片或本地绝对路径。默认输出位于 Router 数据目录下的 `evidence/`；`--out` 可指定其他私有目录，但不能指向源码树。原始证据不进入公开导出或 npm 包。用于准出的运行还会设置 `ACCEPTANCE_COMMIT`；Harness 会拒绝脏工作树或不一致的提交，并同时记录精确 commit 与 Git tree。run 目录和 JSON 回执只能创建一次，目标已存在时直接失败，不会覆盖旧证据。
 
 G3 性能门禁对阈值保持宽松，但对证据完整性 fail closed。成功用例必须记录适用的本地路由/策略或透明 Relay setup、身份/历史、归档/观察、上游首字节、首个实质事件、首个文本、搜索、总耗时，请求/响应/工具字节，重试/重连、健康采样、event-loop 和最终生命周期。取消用例只有在已证明生成请求发出、随后在首字节/文本前关闭、响应字节与总时长仍完成结算且资源归零时，才能把未观察到的首字节/文本标成预期缺失；其他必填指标缺失直接阻断 Gateway Core。
 

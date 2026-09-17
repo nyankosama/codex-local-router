@@ -20,7 +20,7 @@ Release candidate: `v0.3.0`
 | Installed-machine activation | NOT RUN | No candidate install, space initialization, service start, integration change, or Keychain write |
 | Codex App UI | NOT RUN | App-server or CLI automation is not treated as menu/UI sign-off |
 
-All automated processes used temporary Codex and Router homes, config/state/LaunchAgent paths, a test instance id, simulated launchctl, local upstreams, and random ports. The test runner fixes `CODEX_APP_RUNNING=0`, and tests that exercise pending behavior override it only inside their temporary fixture.
+All automated processes used temporary Codex and Router homes, config/state/LaunchAgent paths, a test instance id, injected process and service substitutes, local upstreams, and random ports. Production code does not read test-only App or launchctl environment switches.
 
 ## Covered boundaries
 

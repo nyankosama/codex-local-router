@@ -42,6 +42,8 @@ import {
   StandaloneSearchRoutes,
   requireStandaloneSearchRoute,
 } from "./search-routes.mjs";
+import { PromptCacheAffinity } from "./prompt-cache-affinity.mjs";
+import { applyInstructionDelivery } from "./instruction-delivery.mjs";
 const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value) ?? "");
 const searchFunction = {
   type: "function",
@@ -94,7 +96,18 @@ const identityHash = (value) =>
 export class Engine {
   constructor(
     config,
-    { send, log = () => {}, archive, resolveIdentity, toolRegistry } = {},
+    {
+      send,
+      log = () => {},
+      archive,
+      resolveIdentity,
+      toolRegistry,
+      promptCacheSecret,
+      loadPromptCacheSecret,
+      promptCacheNow,
+      promptCacheTtlMs,
+      promptCacheMaxLineages,
+    } = {},
   ) {
     this.config = config;
     this.send = send;
@@ -104,6 +117,13 @@ export class Engine {
     this.toolRegistry = toolRegistry ?? {};
     this.state = new StateStore(config.history, archive);
     this.standaloneSearchRoutes = new StandaloneSearchRoutes(this.state);
+    this.promptCacheAffinity = new PromptCacheAffinity(this.state, {
+      secret: promptCacheSecret,
+      loadSecret: loadPromptCacheSecret,
+      now: promptCacheNow,
+      ttlMs: promptCacheTtlMs,
+      maxLineages: promptCacheMaxLineages,
+    });
     this.summaryInflight = new Map();
     this.officialObservations = new Map();
   }
@@ -453,6 +473,8 @@ export class Engine {
         "function_call_output",
         "custom_tool_call",
         "custom_tool_call_output",
+        "tool_search_call",
+        "tool_search_output",
       ].includes(item?.type),
     );
     const crossProviderHistory =
@@ -592,7 +614,7 @@ export class Engine {
     this.state.remove(`observation-incomplete:${prepared.ctx.owner}`);
     return { complete: true, responseId: response.id };
   }
-  async *generate(entry, headers, original, signal) {
+  async *generate(entry, headers, original, signal, request = {}) {
     const acceptedAt = Date.now();
     if (
       entry === "api" &&
@@ -627,10 +649,19 @@ export class Engine {
           ? [{ role: "user", content: original.input }]
           : (original.input ?? []),
     };
+    const requestAdditionalTools = body.input.filter(
+      (item) => item?.type === "additional_tools" && Array.isArray(item.tools),
+    );
     const identityStartedAt = Date.now();
     const identityContext = await this.identify(entry, headers, body),
       identityMs = Date.now() - identityStartedAt,
-      ctx = { ...identityContext, entry, headers };
+      ctx = {
+        ...identityContext,
+        entry,
+        headers,
+        transport: request.transport,
+        responsesLite: request.responsesLite,
+      };
     ctx.channelSession =
       entry === "api" && headers["x-opencode-session"]
         ? headers["x-opencode-session"]
@@ -678,6 +709,7 @@ export class Engine {
     const correlation = {
       request_id: requestId,
       entry,
+      transport: ctx.transport,
       session: ctx.channelSession,
       // Hash correlation fields; never log arbitrary client-controlled metadata.
       thread: ctx.thread ? identityHash(ctx.thread) : undefined,
@@ -685,6 +717,8 @@ export class Engine {
       request_kind: ctx.requestKind,
       compaction_phase: ctx.compactionPhase,
     };
+    const checkpointDiagnostics = (event) =>
+      this.log({ ...event, ...correlation });
     if (
       ctx.requestKind === "compaction" &&
       body.input.some((x) => x.type === "compaction_trigger")
@@ -720,10 +754,13 @@ export class Engine {
         items: replay.previous.original.length,
       });
     }
-    const expanded = expandCheckpoints(this.state, ctx, body.input, target);
+    const expanded = expandCheckpoints(this.state, ctx, body.input, target, {
+      diagnostics: checkpointDiagnostics,
+    });
     let archiveInput = expanded.count
       ? expandCheckpoints(this.state, ctx, body.input, target, {
           portable: true,
+          diagnostics: checkpointDiagnostics,
         }).input
       : expanded.input;
     const migrationSource = this.targetFromRecord(
@@ -758,13 +795,28 @@ export class Engine {
       )
     ) {
       // Native checkpoints already verified as belonging to this target may remain.
-      body.input = body.input.flatMap((item) =>
-        isCompaction(item) ||
-        (item.type === "additional_tools" &&
-          target.provider === "chatgpt-subscription")
-          ? [item]
-          : portableItems([item]),
-      );
+      // Convert the complete sequence at once so provider-specific tool-search
+      // calls and outputs are validated and removed as atomic pairs.
+      const migrationDiagnostics = {};
+      body.input = portableItems(body.input, {
+        diagnostics: migrationDiagnostics,
+        preserveCompaction: true,
+        preserveAdditionalTools: target.provider === "chatgpt-subscription",
+      });
+      // Responses Lite declarations belong to this request, not portable
+      // history. Restore only the current carriers after historical items have
+      // been normalized so old declarations cannot accumulate across targets.
+      if (target.app?.useResponsesLite === true && requestAdditionalTools.length)
+        body.input = [...requestAdditionalTools, ...body.input];
+      if (migrationDiagnostics.toolSearchPairs)
+        this.log({
+          event: "tool_search_history_canonicalized",
+          ...correlation,
+          source_provider:
+            previousTarget?.provider ?? expanded.source?.provider,
+          target_provider: target.provider,
+          pairs: migrationDiagnostics.toolSearchPairs,
+        });
       this.log({
         event: "full_history_migrated",
         ...correlation,
@@ -858,9 +910,22 @@ export class Engine {
       const search = plan.mode === "tool_fallback";
       if (search && !config.webSearch)
         throw fail("web_search_unavailable", 503);
+      const instructionDelivery = applyInstructionDelivery(target, body, ctx);
+      if (instructionDelivery.applied)
+        this.log({
+          event: "instruction_snapshot_delivered",
+          ...correlation,
+          provider: target.provider,
+          model: target.model,
+          delivery: instructionDelivery.mode,
+          source_model: instructionDelivery.sourceModel,
+          snapshot_version: instructionDelivery.snapshotVersion,
+          content_hash: instructionDelivery.contentHash,
+          instruction_bytes: instructionDelivery.bytes,
+        });
       const toolPolicy = resolvePluginToolPolicy(config, target);
       const filtered = applyPluginToolPolicy(
-        body,
+        instructionDelivery.body,
         toolPolicy,
         this.toolRegistry,
       );
@@ -901,6 +966,12 @@ export class Engine {
             fetchFunction,
           ],
         };
+      const additionalToolDefinitions = (adapted.input ?? [])
+        .filter(
+          (item) =>
+            item?.type === "additional_tools" && Array.isArray(item.tools),
+        )
+        .reduce((total, item) => total + item.tools.length, 0);
       if (target.wireApi === "chat_completions") {
         const namespaceTools = (adapted.tools ?? []).filter(
           (tool) => tool.type === "namespace",
@@ -934,6 +1005,11 @@ export class Engine {
         ).length,
         input_items: body.input.length,
         tool_definitions: adapted.tools?.length ?? 0,
+        additional_tool_definitions: additionalToolDefinitions,
+        effective_tool_definitions:
+          (adapted.tools?.length ?? 0) + additionalToolDefinitions,
+        tool_source_counts: filtered.diagnostics.sourceCounts,
+        inherited_tool_source_count: filtered.diagnostics.inheritedSourceCount,
         payload_bytes: jsonBytes(adapted),
         instructions_bytes: jsonBytes(adapted.instructions),
         input_bytes: jsonBytes(adapted.input),
@@ -943,8 +1019,8 @@ export class Engine {
         policy_ms: policyMs,
         identity_ms: identityMs,
         history_replay_ms: replayMs,
-        estimated_input_tokens: estimateRequestTokens(body),
-        input_budget: inputBudget(target, body),
+        estimated_input_tokens: estimateRequestTokens(adapted),
+        input_budget: inputBudget(target, adapted),
         count_quality: "estimate",
       });
       let events = [];
@@ -1004,6 +1080,11 @@ export class Engine {
             previousTarget ?? expanded.source,
           );
           if (source && source.id !== target.id) {
+            const retainedAdditionalTools =
+              target.provider === "chatgpt-subscription" ||
+              target.app?.useResponsesLite === true
+                ? requestAdditionalTools
+                : [];
             const originalInput = portableItems(body.input);
             const parts = this.summaryParts(originalInput);
             if (!parts.source.length)
@@ -1020,11 +1101,11 @@ export class Engine {
               signal,
               correlation,
               `migration:${target.id}`,
-              this.summaryLimit(target, body, parts.tail),
+              this.summaryLimit(target, adapted, parts.tail),
             );
             body = {
               ...body,
-              input: [...summary, ...parts.tail],
+              input: [...retainedAdditionalTools, ...summary, ...parts.tail],
             };
             migrationSummaryAttempted = true;
             this.log({
@@ -1436,12 +1517,15 @@ export class Engine {
       throw fail("compaction_pending_tools", 409, "Finish outstanding tool calls before compaction");
     let original;
     let view;
+    const checkpointDiagnostics = (event) =>
+      this.log({ ...event, ...correlation });
     if (native) {
       // Retain a portable copy when available, without calling a summary model.
       // Native compaction/continuation must not depend on our migration cache.
       try {
         original = expandCheckpoints(this.state, ctx, body.input, target, {
           portable: true,
+          diagnostics: checkpointDiagnostics,
         }).input.filter((item) => item.type !== "compaction_trigger");
       } catch (error) {
         if (!["compaction_history_unavailable", "history_incompatible"].includes(error.type)) throw error;
@@ -1450,10 +1534,13 @@ export class Engine {
       original = portableItems(
         expandCheckpoints(this.state, ctx, body.input, target, {
           portable: true,
+          diagnostics: checkpointDiagnostics,
         }).input,
       );
       const active = portableItems(
-        expandCheckpoints(this.state, ctx, body.input, target).input,
+        expandCheckpoints(this.state, ctx, body.input, target, {
+          diagnostics: checkpointDiagnostics,
+        }).input,
       );
       // Codex does not include the destination budget in a model-downshift
       // compaction request. Preserve a lossless prepared checkpoint and decide
@@ -1497,7 +1584,9 @@ export class Engine {
     let response,
       events = [];
     if (native) {
-      const expanded = expandCheckpoints(this.state, ctx, body.input, target);
+      const expanded = expandCheckpoints(this.state, ctx, body.input, target, {
+        diagnostics: checkpointDiagnostics,
+      });
       for await (const event of this.sample(
         config,
         target,
@@ -1588,6 +1677,49 @@ export class Engine {
         ? { ...body, model: target.model, stream: true }
         : toChat({ ...body, stream: true }, target.model);
     if (target.provider === "chatgpt-subscription") payload.store = false;
+    let promptCacheAffinity;
+    try {
+      promptCacheAffinity = await this.promptCacheAffinity.resolve(
+        config,
+        target,
+        payload,
+        ctx,
+      );
+    } catch (error) {
+      this.log({
+        event: "prompt_cache_affinity_unavailable",
+        ...(hooks.correlation ?? {}),
+        provider: target.provider,
+        target: target.id,
+        model: target.model,
+        policy: "gateway-opaque",
+        reason: "secret_unavailable",
+        error_type: error?.type ?? "prompt_cache_affinity_key_unavailable",
+      });
+      throw error;
+    }
+    ctx.promptCacheAffinity = promptCacheAffinity;
+    if (promptCacheAffinity.applied)
+      this.log({
+        event: "prompt_cache_affinity_applied",
+        ...(hooks.correlation ?? {}),
+        provider: target.provider,
+        target: target.id,
+        model: target.model,
+        policy: promptCacheAffinity.mode,
+        carrier: promptCacheAffinity.carrier,
+        lineage_source: promptCacheAffinity.lineageSource,
+      });
+    else if (promptCacheAffinity.mode === "gateway-opaque")
+      this.log({
+        event: "prompt_cache_affinity_unavailable",
+        ...(hooks.correlation ?? {}),
+        provider: target.provider,
+        target: target.id,
+        model: target.model,
+        policy: promptCacheAffinity.mode,
+        reason: promptCacheAffinity.unavailableReason,
+      });
     ctx.providerCalls = (ctx.providerCalls ?? 0) + 1;
     const upstreamStartedAt = Date.now();
     let upstream;
@@ -1703,6 +1835,13 @@ export class Engine {
         !Array.isArray(response.output)
       )
         throw fail("invalid_upstream_response", 502);
+      this.logPromptCacheUsage(
+        response,
+        target,
+        promptCacheAffinity,
+        hooks.correlation,
+        upstreamStartedAt,
+      );
       for (const e of completedEvents(response)) {
         assertAllowedPluginToolCalls(
           e,
@@ -1816,6 +1955,13 @@ export class Engine {
         hooks.toolPolicy ?? { mode: "passthrough" },
         hooks.toolRegistry,
       );
+      this.logPromptCacheUsage(
+        terminal.response,
+        target,
+        promptCacheAffinity,
+        hooks.correlation,
+        upstreamStartedAt,
+      );
       yield terminal;
     } else {
       const encoder = new ChatEncoder(body.model);
@@ -1849,5 +1995,39 @@ export class Engine {
         yield e;
       }
     }
+  }
+
+  logPromptCacheUsage(response, target, affinity, correlation, startedAt) {
+    if (
+      target.provider === "chatgpt-subscription" ||
+      target.modelFamily !== "openai-gpt" ||
+      target.wireApi !== "responses" ||
+      !["none", "gateway-opaque"].includes(affinity?.mode)
+    ) return;
+    const usage = response?.usage;
+    const inputTokens = Number.isFinite(usage?.input_tokens)
+      ? usage.input_tokens
+      : null;
+    const cachedTokens = Number.isFinite(usage?.input_tokens_details?.cached_tokens)
+      ? usage.input_tokens_details.cached_tokens
+      : Number.isFinite(usage?.input_tokens_details?.cache_read_tokens)
+        ? usage.input_tokens_details.cache_read_tokens
+        : null;
+    this.log({
+      event: "prompt_cache_usage",
+      ...(correlation ?? {}),
+      provider: target.provider,
+      target: target.id,
+      model: target.model,
+      policy: affinity.mode,
+      lineage_source: affinity.lineageSource ?? null,
+      input_tokens: inputTokens,
+      cached_tokens: cachedTokens,
+      cache_ratio:
+        inputTokens > 0 && cachedTokens != null
+          ? Number((cachedTokens / inputTokens).toFixed(6))
+          : null,
+      duration_ms: Date.now() - startedAt,
+    });
   }
 }
