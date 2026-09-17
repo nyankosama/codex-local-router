@@ -358,7 +358,20 @@ async function shapePreflight() {
     modelFamily: "openai-gpt",
     wireApi: "responses",
   };
-  const direct = await captureCodexProviderShape(target.model);
+  let direct;
+  try {
+    direct = await captureCodexProviderShape(target.model);
+  } catch (error) {
+    if (error?.message !== "no usable codex core binary found") throw error;
+    console.log(JSON.stringify({
+      mode: "shape-preflight",
+      externalNetworkCalls: 0,
+      skipped: true,
+      reason: "codex_core_unavailable",
+      passed: null,
+    }, null, 2));
+    return;
+  }
   const liteFrame = {
     ...direct.body,
     client_metadata: {

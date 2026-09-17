@@ -39,12 +39,17 @@ test("all prompt cache live modes fail closed without explicit run confirmation"
   }
 });
 
-test("prompt cache live comparison reuses the current Codex Provider shape", async () => {
+test("prompt cache live comparison reuses the current Codex Provider shape", async (context) => {
   const { stdout } = await exec(process.execPath, [harness, "--shape-preflight"], {
     timeout: 120000,
   });
   const result = JSON.parse(stdout);
   assert.equal(result.mode, "shape-preflight");
+  if (result.skipped) {
+    assert.equal(result.reason, "codex_core_unavailable");
+    context.skip("Codex core is unavailable in this portable test environment");
+    return;
+  }
   assert.equal(result.externalNetworkCalls, 0);
   assert.equal(result.clientProviderShapeCaptured, true);
   assert.equal(result.liteFrameMetadata, true);
