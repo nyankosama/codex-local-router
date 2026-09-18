@@ -21,7 +21,7 @@ Codex Local Router（仅监听本机回环地址）
 
 Router 不替用户开启或关闭搜索：Codex 继续使用正常搜索模式（默认 cached，或由用户选择 live）。官方 HTTP 与 WebSocket 会共同继承 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`WS_PROXY`、`WSS_PROXY` 并遵守 `NO_PROXY`。
 
-第三方标准 Responses 模型可以显式使用 Gateway 的 `standard-tool` 桥接调用同一 OpenAI 订阅搜索。内部搜索调用不会出现在 Codex 对话记录中，但有界结果会返回模型，普通回答文本继续流式发送。用户 MCP 搜索仍由 Codex 客户端负责，并按正常工具流程显示。详见[通用搜索](docs/public/universal-search.zh-CN.md)。
+第三方标准 Responses target 可以显式把同一订阅搜索暴露为有界普通函数。Gateway 只向固定 OpenAI 目的地执行内部调用，在 App 对话中隐藏内部工具生命周期，并立即流式转发客户端可见文本和普通工具。单轮可多次搜索，上限由 `webSearch.maxRounds` 控制（默认 3，范围 1-10）；超限返回 `tool_loop_limit`。用户自行配置的 MCP 搜索仍由 Codex 持有并执行。详见[通用搜索](docs/public/universal-search.zh-CN.md)。
 
 新建 App-enabled 第三方模型在具备 Responses、工具调用和 freeform 工具能力且 preset 已通过 Provider 准出时，默认采用版本化 `codex-general-v1` 模板：简短中性指令、标准 Responses、Code mode、多代理 v2 元数据和标准 Plugin 白名单。不兼容目标使用 `legacy`；当前 OpenCode Go DeepSeek preset 明确只允许 legacy，已有模型也不会在加载时迁移。官方 GPT 指令快照、Lite、搜索和缓存亲和仍为可选能力。详见[第三方模型模板](docs/public/third-party-templates.zh-CN.md)。
 
@@ -35,18 +35,18 @@ Plugin 白名单只裁剪结构化 Plugin 定义；Codex 核心工具和用户 M
 - Node.js 22 或更高版本
 - [兼容矩阵](docs/public/compatibility.md)列出的 Codex CLI / App 版本
 - Responses 与 Chat Completions
-- ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设、BigModel GLM 5.3/Flash 标准 Responses，以及通用 OpenAI 兼容渠道
-- 用户 MCP 搜索，以及符合条件的第三方标准 Responses 模型显式使用的 OpenAI 订阅搜索桥接
+- ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设、BigModel GLM 5.3/Flash 和通用 OpenAI 兼容渠道
+- 用户自行持有的 MCP 工具，以及面向已准出第三方标准 Responses target 的显式 OpenAI 订阅搜索桥接
 
-v0.5.5 不声明 Linux、Windows 或未知供应商私有协议已受支持。
+v0.5.6 不声明 Linux、Windows 或未知供应商私有协议已受支持。
 
 ## 从 GitHub Release 安装
 
-下载 `v0.5.5` Release 中的 `.tgz` 与 SHA-256 文件：
+下载 `v0.5.6` Release 中的 `.tgz` 与 SHA-256 文件：
 
 ```bash
-shasum -a 256 -c codex-local-router-0.5.5.tgz.sha256
-npm install -g ./codex-local-router-0.5.5.tgz
+shasum -a 256 -c codex-local-router-0.5.6.tgz.sha256
+npm install -g ./codex-local-router-0.5.6.tgz
 codex-local-router --version
 ```
 

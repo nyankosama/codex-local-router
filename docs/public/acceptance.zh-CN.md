@@ -1,6 +1,6 @@
 # 验收说明
 
-历史冻结记录包括[配置空间候选验收报告](configuration-spaces-acceptance.zh-CN.md)和 [v0.4.0 第三方 OpenAI 搜索验收报告](third-party-openai-search-acceptance.zh-CN.md)。它们只描述对应版本与当时环境，不能当作当前本机状态；当前发布准出规则见下文。
+配置空间与 v0.4.0 第三方独立搜索报告是冻结的历史记录，不代表当前已安装服务状态：[配置空间](configuration-spaces-acceptance.zh-CN.md)、[第三方 OpenAI 搜索](third-party-openai-search-acceptance.zh-CN.md)。其中协议证据仍可复用，但 App UI、本机生效和每个新 Release 都需分别签核。
 
 PR 门禁使用 A1-A10 十组等价类：策略解析、来源/名单、工具载体、调用闭环、HTTP 透明性、WS 生命周期、身份边界、历史兼容、产品/隔离、证据/预算。它们由纯函数和本地模拟上游完成，不调用真实模型。
 
@@ -14,7 +14,7 @@ PR 门禁使用 A1-A10 十组等价类：策略解析、来源/名单、工具�
 
 L0-L2 和能力画像门禁均为零凭证、零外网的确定性测试：它们仍会驱动当前 App 内置 Codex core，但官方、Provider 与搜索上游全部由本地注入夹具响应。只有带显式 `--run` 的 live canary 才会读取对应凭证并访问真实上游；默认 `npm test`、`npm run e2e` 和各层门禁不会触发真实渠道。
 
-历史配置空间候选明确未运行 `e2e:focused -- --run`，真实模型调用为零；当时的环境核对继续保留在冻结报告中。当前 App-server 验收仍不能替代 UI 签核。
+历史配置空间候选没有运行 `e2e:focused -- --run`，真实模型调用为零；当次记录中的 Router/切换器未加载、8788 未监听、integration 为 disabled，真实 Codex 仍使用内置 `openai`。这些只描述当次运行，App-server 始终不能替代后续 UI 签核。
 
 ```bash
 npm test
@@ -65,13 +65,13 @@ npm run e2e:prompt-cache -- --live-app-candidate --run  # 当前 App 二进制�
 | 官方 cached 默认 | 官方默认搜索行为不变 |
 | 官方显式 live | 官方 live 覆盖行为不变 |
 
-确定性画像另有五项本地 HTTP／WS、工具、生命周期和性能用例。整个真实门最多五个 turn、十六次模型生成和九次搜索；第三方阶段上限为 `3 / 8 / 3`，其中包含一次客户端 MCP 搜索及 deferred MCP 调用／结果闭环所需的四次发送；官方阶段为 `2 / 8 / 6`，即 cached／live 每轮最多三次官方搜索及四次模型发送。重复 payload、被拦截请求、隐式重试、缺少用例、提交或 Codex 二进制不一致、MCP inventory 不完整、凭证串线或任何非 PASS 阶段都会拒绝 tag。各阶段顺序执行，首个失败即停止，避免本地缺陷继续消耗外部预算。
+确定性画像另有五项本地 HTTP／WS、工具、生命周期和性能用例。整个真实门最多五个 turn、十七次模型生成和九次搜索；第三方阶段上限为 `3 / 8 / 3`，其中包含一次客户端 MCP 搜索及 deferred MCP 调用／结果闭环所需的四次发送；官方阶段为 `2 / 9 / 6`。当前 Codex 0.155 的搜索续接在 cached／live 两轮中可能合理多出一次唯一模型发送，但零重试和重复 payload 规则不变。重复 payload、被拦截请求、隐式重试、缺少用例、提交或 Codex 二进制不一致、MCP inventory 不完整、凭证串线或任何非 PASS 阶段都会拒绝 tag。各阶段顺序执行，首个失败即停止，避免本地缺陷继续消耗外部预算。
 
 发布 runner 必须专用并受 Environment 审批保护；PR 不会在它上面运行真实凭证。OpenAI／Provider 凭证只存在于 runner 的本地登录、Keychain 或服务环境，不作为 workflow 输入。runner 服务必须显式具备 `TAVILY_API_KEY`，需要自定义 CA 时同时提供 `NODE_EXTRA_CA_CERTS`。机器回执写在 checkout 外，workflow 日志只记录哈希与脱敏摘要。App UI 仍单独人工签核，不作为 GitHub Release 的自动阻断项。
 
 缓存亲和采用分阶段 fail-closed 门禁。缺省 `e2e:prompt-cache` 零外网，要求 HMAC 派生 p95 小于 5ms、请求体适配 p95 小于 25ms、Wire 增量小于 128 bytes。当前效果门使用 `--live-comparison --run`：Sol/Astra 共 24 次交错、零重试生成，在请求其余部分固定的条件下比较原始直连形态和候选匿名 key。随后 `--live-app-candidate --run` 使用当前 App 内置 Codex 二进制、临时 Codex/Router Home 和隔离 Gateway，Provider 生成不超过 6 次；每款模型必须完成一个只读 MCP call/result 和下一 turn，同时观察到匿名键指纹稳定、逐 frame Lite Header 正确且订阅/Provider 身份不串线。缺失 usage 记为未知，不记作 0。旧的 `--live-feasibility`、`--live-gateway` 和 `--live-app-protocol` 仍用于复查历史候选，不再构成本轮 30 次准出门。
 
-历史 ai.feei 可行性尝试在第 1 次 control 请求收到 HTTP 403 后停止，该记录继续保留。后续 35 次因果诊断没有覆盖它：35 次合成请求全部完成，严格单变量对照中 Sol 从无 key 的 30.11% 加权缓存复用上升到 Gateway 匿名 key 的 98.55%。这证明特定工作负载下 Gateway 可控字段的效果，不证明 ai.feei 内部账号池算法，也不承诺自然会话固定命中率。任何修改缓存亲和的版本仍必须重新通过 Sol/Astra 与 App 协议门，才能启用。
+历史 ai.feei 可行性尝试在第 1 次 control 请求收到 HTTP 403 后停止，该记录继续保留。后续 35 次因果诊断没有覆盖它：35 次合成请求全部完成，严格单变量对照中 Sol 从无 key 的 30.11% 加权缓存复用上升到 Gateway 匿名 key 的 98.55%。这证明特定工作负载下 Gateway 可控字段的效果，不证明 ai.feei 内部账号池算法，也不承诺自然会话固定命中率。以后任何修改缓存亲和的 Release 都必须重新通过 Sol/Astra 与 App 协议门，才能进入本机启用。
 
 `e2e:tool-search-history` 先用当前 App 内置 app-server 验证新会话模型切换，再通过真实 Gateway HTTP 身份与加密归档边界复现受影响的存量 response 链。它只使用合成 auth/凭证、本地 Provider、注入的官方响应、随机端口和临时 Home；断言目标只收到一个固定标记，不收到动态 schema、查询或 Provider 标识，同时加密归档中的原 pair 保持字节等价。它不会重试真实会话，也不会连接任何外部上游。
 
@@ -81,7 +81,7 @@ npm run e2e:prompt-cache -- --live-app-candidate --run  # 当前 App 二进制�
 npm run e2e:official-search -- --run
 ```
 
-它先通过 Router 的生产级官方 WebSocket 客户端执行一次零生成握手探针并要求 HTTP 101，然后只运行两个隔离的官方订阅短 turn：第一轮不设置 `web_search`、不要求用户增加参数，验证 Codex 正常的 cached 默认模式；第二轮使用单次 `--search` 覆盖，验证 live 模式。两轮都必须看到当前 Codex 版本所选择的官方 Responses 传输成功、固定 OpenAI 目的地的 `/alpha/search` 成功、客户端 `web_search` 完成事件、回答中的来源 hostname，以及不存在第三方出站。预算固定为两个 turn、最多六次生成（一次搜索 turn 可能包含多次模型与工具续接），不保存提示或回答正文。
+它先通过 Router 的生产级官方 WebSocket 客户端执行一次零生成握手探针并要求 HTTP 101，然后只运行两个隔离的官方订阅短 turn：第一轮不设置 `web_search`、不要求用户增加参数，验证 Codex 正常的 cached 默认模式；第二轮使用单次 `--search` 覆盖，验证 live 模式。两轮都必须看到当前 Codex 版本所选择的官方 Responses 传输成功、固定 OpenAI 目的地的 `/alpha/search` 成功、客户端 `web_search` 完成事件、回答中的来源 hostname，以及不存在第三方出站。预算固定为两个 turn、最多九次唯一生成发送和六次搜索（一次搜索 turn 可能包含多次模型与工具续接），不保存提示或回答正文。
 
 第三方 GPT 搜索路由使用独立的两轮 canary：
 

@@ -125,7 +125,7 @@ codex-local-router model edit --id example --subscription-search standard-tool -
 
 它与下方旧版／Lite 独立搜索策略及 Provider 原生 hosted search 相互独立。桥接要求订阅入口已认证、客户端搜索模式可观察，并支持函数调用和结果续接；与 Lite、独立搜索源或原生 hosted search 冲突时配置校验失败。详见[通用搜索](universal-search.zh-CN.md)。
 
-共享配置 `webSearch.maxRounds` 同时限制该桥接的模型／搜索续接循环：默认 `3`，允许 `1` 到 `10`，按轮次而不是同一 Provider 响应里的单个查询计数。因此桥接可以执行多次搜索，但不能无界循环。
+`webSearch.maxRounds` 限制同一 turn 内重复桥接调用（默认 3，范围 1-10）。下一轮超限时返回 `tool_loop_limit`，不会重试或切换搜索源。内部搜索事件只在 Gateway 内部处理，客户端可见文本与普通工具仍正常流式发送。
 
 优先级为：官方模型、target 显式策略、旧 `app.supportsSearchTool` 显式值、显式 App-disabled 截断、第三方 GPT 空间/缺省值、旧 `nativeWebSearch` 兼容层、其他旧行为。只有前两项 target 声明都不存在时才进入 App-disabled 截断，避免已隐藏 GPT 继承仅供 App 使用的搜索广告。可选来源只有 `subscription`、`provider`、`disabled`：
 

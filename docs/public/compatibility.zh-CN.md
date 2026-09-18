@@ -1,15 +1,15 @@
 # 兼容性
 
-| 组件 | v0.5.5 发布状态 |
+| 组件 | 0.5.6 Release 状态 |
 |---|---|
 | macOS / Node.js 22 | 支持；Node 仍把内置 SQLite 标记为 experimental |
-| Codex CLI 0.154.0-alpha.6.2 | v0.5.5 发布门驱动基线，验收记录二进制 SHA-256 |
+| Codex CLI 0.155.0-alpha.2.6 | 当前 Release 驱动基线，验收记录二进制 SHA-256 |
 | Codex App | app-server 协议可自动验收，真实 UI 必须单独确认 |
 | 官方订阅 HTTP/WS/辅助接口 | 固定目的地透明 Relay |
-| BigModel GLM 5.3 Flash | 标准 Responses 与订阅桥接已通过有界发布门；用户 MCP 仍是独立的客户端能力 |
+| BigModel GLM 5.3 / Flash | 标准 Responses 形态及 Flash 订阅桥接通过有界 Release 门；用户 MCP 仍是独立客户端能力 |
 | OpenCode Go DeepSeek | 既有 legacy 接入保留；通用模板、Code mode 与多代理 v2 尚未准出 |
-| ai.feei Sol / Astra Responses | 有内置预设；Sol 订阅桥接与客户端 Tavily 路径已通过有界发布门，其他 live 组合仍需各自证据 |
-| Linux / Windows | v0.5.5 不声明支持 |
+| ai.feei Sol / Astra Responses | 有内置预设；Sol 订阅桥接与客户端 Tavily 路径通过有界 Release 矩阵，其他 live 组合仍需各自证据 |
+| Linux / Windows | v0.5.6 不声明支持 |
 | 运行时配置 Schema 3 | 保持兼容，活动 Router 空间物化为原格式 |
 | 配置空间 Schema 1 | 本机不可变 revision 与单一切换事务 |
 | 集成状态 Schema 4 | 关联受保护 official 与当前物化 Router revision |
@@ -26,7 +26,7 @@ Gateway 能力与真实渠道健康度分别准出。本地确定性夹具可以
 
 显式 `subscriptionSearch.delivery: "standard-tool"` 是第三方标准 Responses target 的模型家族无关路径：只有当前 Codex 请求启用搜索时才暴露一个普通函数，使用订阅身份访问固定 OpenAI 目的地，并把有界、不可信结果送回既有工具循环。它不会启用 Lite、Provider 原生 hosted search 或 `/v1` 的订阅权限。用户 MCP 搜索仍由客户端负责，并可能经当前 Codex 的 `tool_search` 延迟发现。详见[通用搜索](universal-search.zh-CN.md)。
 
-桥接可以执行同一 Provider 响应中的多个调用，也可继续多轮模型／搜索交互；`webSearch.maxRounds` 默认三轮并限制该续接循环。内部订阅搜索调用不会进入客户端对话记录，客户端可见文本和普通工具会立即流式发送。纯工具阶段仍可能没有过程文字，Gateway 不会伪造进度。
+桥接可在单个 turn 内多次搜索，上限由 `webSearch.maxRounds` 控制（默认 3，范围 1-10）；下一次调用返回 `tool_loop_limit`，不重试也不回退。内部搜索调用不会作为客户端工具 item 展示；普通文本和客户端可见工具仍立即流式转发，因此隐藏搜索不等于整轮缓存。
 
 每个模型 turn 会冻结一份按 turn/thread/session/account 关联的搜索路由。`/subscription/v1/alpha/search` 先验证订阅身份，再选择固定 OpenAI 后端，或剥离订阅身份并换成目标 Provider Key。关联缺失或冲突会明确失败。第一版即使选择 Provider 搜索也仍要求有效 Codex 登录；本地 `/v1/alpha/search` 始终不开放。
 

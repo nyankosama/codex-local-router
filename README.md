@@ -21,7 +21,7 @@ Official subscription traffic uses a dedicated transparent relay. Only an explic
 
 The relay does not enable or disable search. Codex keeps its normal search mode (cached by default, or live when the user selects it), while the router forwards official HTTP and WebSocket traffic through the configured `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `WS_PROXY`, or `WSS_PROXY` environment and honors `NO_PROXY`.
 
-Third-party Standard Responses models can explicitly use the same OpenAI subscription search through the Gateway's `standard-tool` bridge. The internal search call stays out of the Codex transcript, while bounded results are returned to the model and ordinary answer text continues to stream. User MCP search remains client-owned and visible through the normal Codex tool flow. See [universal search](docs/public/universal-search.md).
+Third-party Standard Responses targets can explicitly expose the same subscription search as a bounded ordinary function. The Gateway executes those internal calls at the fixed OpenAI origin, hides the internal tool lifecycle from the App transcript, and streams all client-visible text and ordinary tools immediately. A turn may search more than once up to `webSearch.maxRounds` (default 3, range 1-10); exceeding the bound returns `tool_loop_limit`. User-configured MCP search remains owned and executed by Codex. See [universal search](docs/public/universal-search.md).
 
 New App-enabled third-party models default to the versioned `codex-general-v1` template when they support Responses, tool calling and freeform tools and their preset is Provider-qualified. It uses a short provider-neutral instruction, Standard Responses, code mode, multi-agent v2 metadata and the standard Plugin allowlist. Incompatible targets use `legacy`; the current OpenCode Go DeepSeek preset is explicitly legacy-only, and existing models never migrate on load. Official GPT instruction snapshots, Lite, search and cache affinity remain opt-in. See [third-party templates](docs/public/third-party-templates.md).
 
@@ -37,18 +37,18 @@ When a retained conversation crosses providers, provider-specific dynamic tool-s
 - Node.js 22 or later
 - Codex CLI and Codex App versions listed in the [compatibility matrix](docs/public/compatibility.md)
 - Responses and Chat Completions providers
-- ChatGPT subscription routing, OpenCode Go, ai.feei GPT presets, BigModel GLM 5.3/Flash Standard Responses, and generic OpenAI-compatible providers
-- Client-owned MCP search and the explicit OpenAI subscription-search bridge for eligible third-party Standard Responses models
+- ChatGPT subscription routing, OpenCode Go, ai.feei GPT presets, BigModel GLM 5.3/Flash, and generic OpenAI-compatible providers
+- Client-owned MCP tools plus an explicit OpenAI subscription-search bridge for qualified third-party Standard Responses targets
 
-Other operating systems and vendor-specific protocols are not claimed as supported in v0.5.5.
+Other operating systems and vendor-specific protocols are not claimed as supported in v0.5.6.
 
 ## Install from a GitHub Release
 
-Download the `.tgz` and SHA-256 file from the `v0.5.5` release, verify it, and install it locally:
+Download the `.tgz` and SHA-256 file from the `v0.5.6` release, verify it, and install it locally:
 
 ```bash
-shasum -a 256 -c codex-local-router-0.5.5.tgz.sha256
-npm install -g ./codex-local-router-0.5.5.tgz
+shasum -a 256 -c codex-local-router-0.5.6.tgz.sha256
+npm install -g ./codex-local-router-0.5.6.tgz
 codex-local-router --version
 ```
 

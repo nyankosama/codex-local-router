@@ -22,8 +22,8 @@ export const RELEASE_QUALIFICATION = Object.freeze({
   }),
   budgets: Object.freeze({
     universalSearch: Object.freeze({ turns: 3, generations: 8, searches: 3 }),
-    officialSearch: Object.freeze({ turns: 2, generations: 8, searches: 6 }),
-    total: Object.freeze({ turns: 5, generations: 16, searches: 9 }),
+    officialSearch: Object.freeze({ turns: 2, generations: 9, searches: 6 }),
+    total: Object.freeze({ turns: 5, generations: 17, searches: 9 }),
   }),
 });
 

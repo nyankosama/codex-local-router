@@ -40,7 +40,7 @@ function receipts() {
       implementation: { commit },
       driver,
       budget: {
-        turns: 2, generations: 8, searchRequests: 6,
+        turns: 2, generations: 9, searchRequests: 6,
         blockedGenerations: 0, blockedSearchRequests: 0, implicitRetries: 0,
       },
       websocketProbe: { passed: true },
@@ -59,7 +59,7 @@ test("release qualification covers the bounded equivalence classes", () => {
   assert.equal(summary.verdict, "PASS");
   assert.deepEqual(summary.budget, {
     turns: 5,
-    generations: 16,
+    generations: 17,
     searchRequests: 9,
     blockedGenerations: 0,
     blockedSearchRequests: 0,
@@ -71,6 +71,9 @@ test("release qualification covers the bounded equivalence classes", () => {
   const overBudget = receipts();
   overBudget.universalSearch.budget.generations = 9;
   assert.equal(qualifyReleaseReceipts(overBudget, commit).verdict, "FAIL");
+  const officialOverBudget = receipts();
+  officialOverBudget.officialSearch.budget.generations = 10;
+  assert.equal(qualifyReleaseReceipts(officialOverBudget, commit).verdict, "FAIL");
   const missingCase = receipts();
   missingCase.universalSearch.cases.pop();
   assert.equal(qualifyReleaseReceipts(missingCase, commit).verdict, "FAIL");
