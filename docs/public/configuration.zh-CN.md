@@ -117,6 +117,16 @@ codex-local-router provider edit --id example \
 
 独立搜索与 `capabilities.nativeWebSearch` 分离。当前 Codex 通过 Responses Lite 的 `web.run` namespace 提供独立搜索；因此新建 `standard-tools` target 不广告搜索，显式 `lite-search` target 才启用选定来源。官方模型固定使用官方订阅搜索；既有 Responses target 的 `useResponsesLite: true` 或显式旧搜索策略推导出的 Lite 组合保持原有订阅搜索行为，没有这些兼容信号的未画像 App-enabled GPT Responses target 使用新的 Standard 默认值。Lite 订阅搜索仍要求有效的 Codex 官方登录；非 Responses、非 GPT 和其他旧 target 保持原行为。
 
+标准 Responses target 还可以用与模型家族无关的订阅桥接，把 OpenAI 订阅搜索暴露成普通函数工具：
+
+```bash
+codex-local-router model edit --id example --subscription-search standard-tool --yes
+```
+
+它与下方旧版／Lite 独立搜索策略及 Provider 原生 hosted search 相互独立。桥接要求订阅入口已认证、客户端搜索模式可观察，并支持函数调用和结果续接；与 Lite、独立搜索源或原生 hosted search 冲突时配置校验失败。详见[通用搜索](universal-search.zh-CN.md)。
+
+共享配置 `webSearch.maxRounds` 同时限制该桥接的模型／搜索续接循环：默认 `3`，允许 `1` 到 `10`，按轮次而不是同一 Provider 响应里的单个查询计数。因此桥接可以执行多次搜索，但不能无界循环。
+
 优先级为：官方模型、target 显式策略、旧 `app.supportsSearchTool` 显式值、显式 App-disabled 截断、第三方 GPT 空间/缺省值、旧 `nativeWebSearch` 兼容层、其他旧行为。只有前两项 target 声明都不存在时才进入 App-disabled 截断，避免已隐藏 GPT 继承仅供 App 使用的搜索广告。可选来源只有 `subscription`、`provider`、`disabled`：
 
 ```json

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { fail } from "./errors.mjs";
 export class ChatEncoder {
-  constructor(model) {
+  constructor(model, toolNameMap = new Map()) {
     this.response = {
       id: `resp_${randomUUID()}`,
       object: "response",
@@ -13,6 +13,7 @@ export class ChatEncoder {
     this.calls = new Map();
     this.finished = false;
     this.seq = 0;
+    this.toolNameMap = toolNameMap;
   }
   event(type, fields = {}) {
     return { type, sequence_number: this.seq++, ...fields };
@@ -108,11 +109,15 @@ export class ChatEncoder {
       if (index == null) {
         if (!call.id || !call.function?.name)
           throw fail("invalid_upstream_tool_call", 502);
+        const original = this.toolNameMap.get(call.function.name) ?? {
+          name: call.function.name,
+        };
         const x = this.add({
           type: "function_call",
           id: `fc_${randomUUID()}`,
           call_id: call.id,
-          name: call.function.name,
+          name: original.name,
+          ...(original.namespace ? { namespace: original.namespace } : {}),
           arguments: "",
           status: "in_progress",
         });

@@ -282,6 +282,10 @@ test("setup reports pending App integration and core query commands are JSON-saf
     "disabled",
   );
   assert.equal(
+    searchStatus.subscriptionSearch.find((search) => search.target === "feei-sol").delivery,
+    "disabled",
+  );
+  assert.equal(
     searchStatus.appCapabilityProfiles.find((profile) => profile.target === "feei-sol").profile,
     "standard-tools",
   );
@@ -303,6 +307,10 @@ test("setup reports pending App integration and core query commands are JSON-saf
     "target-explicit",
   );
   assert.equal(
+    searchDoctor.subscriptionSearch.find((search) => search.target === "feei-sol").validationStatus,
+    "not-configured",
+  );
+  assert.equal(
     searchDoctor.appCapabilityProfiles.find((profile) => profile.target === "feei-sol").toolSurface,
     "policy-filtered-standard",
   );
@@ -312,6 +320,7 @@ test("setup reports pending App integration and core query commands are JSON-saf
     { env: stoppedEnvironment },
   )).stdout;
   assert.match(humanStatus, /Profiles: .*feei-sol=standard-tools \(target-explicit; policy-filtered-standard\)/);
+  assert.match(humanStatus, /Subscription search: .*feei-sol=disabled \(not-configured; not-configured\)/);
   assert.match(humanStatus, /Prompt cache: .*feei-sol=gateway-opaque \(provider-explicit; carrier=prompt_cache_key; restart=keychain-secret-and-encrypted-lineage-state\)/);
   const humanDoctor = (await exec(
     process.execPath,
@@ -319,6 +328,7 @@ test("setup reports pending App integration and core query commands are JSON-saf
     { env: stoppedEnvironment },
   )).stdout;
   assert.match(humanDoctor, /Profiles: .*feei-sol=standard-tools \(target-explicit; policy-filtered-standard\)/);
+  assert.match(humanDoctor, /Subscription search: .*feei-sol=disabled \(not-configured; not-configured\)/);
   assert.match(humanDoctor, /Prompt cache: .*feei-sol=gateway-opaque \(provider-explicit; carrier=prompt_cache_key; restart=keychain-secret-and-encrypted-lineage-state\)/);
 
   await exec(process.execPath, [

@@ -58,12 +58,50 @@ npm run e2e:live -- --run  # explicit installed-service concurrency (E2E-6)
 npm run e2e -- --include-live --run  # explicit L0-L2 plus live E2E-6
 npm run e2e:official-search -- --run  # two-turn official cached-default + explicit-live search
 npm run e2e:third-party-search -- --run  # two-turn ai.feei + subscription-search acceptance
+npm run e2e:universal-search -- --run  # three third-party bridge/MCP equivalence cases
+npm run e2e:release -- --run  # default pre-release gate: profiles + third-party + official search
 npm run e2e:prompt-cache  # zero-network derivation/adapter performance gate
 npm run e2e:prompt-cache -- --live-feasibility --run  # max 8 direct Provider calls
 npm run e2e:prompt-cache -- --live-comparison --run  # 24-call Sol/Astra direct-vs-candidate comparison
 npm run e2e:prompt-cache -- --live-app-candidate --run  # current App binary, max 6 Provider generations
 npm run e2e:focused -- --run  # explicit five-turn official + ai.feei candidate acceptance
 ```
+
+## Default GitHub Release qualification
+
+Search-enabled streaming is a mandatory local delivery gate: HTTP and WebSocket,
+subscription bridge and legacy fallback, zero and two internal searches (eight
+small probes, zero real generations). The synthetic upstream waits for the client
+to receive each text delta before continuing. A buffered stream cannot pass.
+The gate checks one response lifecycle, ordered unique item IDs, hidden search
+calls, exact history replay, and downstream delivery metrics. Live bridge cases
+also record text delta counts/timing; the GLM app-server case requires multiple
+client text deltas before completion. This is protocol evidence, not App UI signoff.
+
+`sample_first_output_text` measures sampler release only;
+`downstream_first_output_text` now measures successful HTTP/WS sending, with
+`downstream_stream_completed` reporting counts, bytes and timing without content.
+Sending is not a claim about UI paint time. No progress messages are invented:
+models that emit tools but no commentary still have no narrative progress.
+
+Every `v*` tag is fail-closed behind two jobs before assets can be published:
+
+1. GitHub-hosted deterministic gates run the full unit/protocol suite, dependency and package audits, and public-source scan.
+2. A protected `release-live` environment runs `e2e:release` on a dedicated macOS runner labelled `codex-local-router-release` with the current Codex App, subscription login, Router source configuration, Provider credential and Tavily credential available locally.
+
+The live matrix covers equivalence classes rather than every model × client × search-source combination:
+
+| Case | Why it exists |
+|---|---|
+| GLM Flash App + subscription bridge | non-GPT Standard Responses function call, fixed OpenAI search and Provider continuation |
+| ai.feei Sol CLI + subscription bridge | GPT/Provider regression and independent credential leg |
+| ai.feei Sol App + Tavily MCP | client-owned MCP discovery, call/result and continuation without copying MCP authority into Gateway |
+| official cached default | unchanged first-party default behavior |
+| official explicit live | unchanged first-party live-search override |
+
+The deterministic profile stage adds five local HTTP/WS, tool, lifecycle and performance cases. The entire real gate is capped at five turns, sixteen model generations and nine searches. The third-party stage is capped at `3 / 8 / 3`, including its single client-owned MCP search and the four sends required by a deferred MCP call/result closure; the official stage is capped at `2 / 8 / 6`, allowing at most three first-party searches and therefore four model sends per cached/live turn. Repeated payloads, blocked requests, implicit retries, a missing case, a different Codex binary or commit, incomplete MCP inventory, credential crossing, or any non-PASS stage rejects the tag. Stages run sequentially and stop after the first failure, so a local defect cannot consume the remaining external budget.
+
+The release runner must be dedicated and protected; pull requests never execute live credentials on it. OpenAI/Provider credentials remain in its local login, Keychain or service environment and are not GitHub workflow inputs. `TAVILY_API_KEY` and any required `NODE_EXTRA_CA_CERTS` must be available to the runner service. The machine-readable receipt is written outside the checkout, hashed in the workflow log, and contains only the redacted fields described below. App UI remains a separate manual sign-off and is not a GitHub Release blocker.
 
 Prompt-cache affinity has a staged, fail-closed gate. The default `e2e:prompt-cache` command makes zero network calls and checks HMAC derivation p95 below 5 ms, body-adaptation p95 below 25 ms, and wire growth below 128 bytes. The current effect gate uses `--live-comparison --run`: 24 interleaved, no-retry Sol/Astra generations compare the direct client shape with the candidate anonymous key under an otherwise fixed request. `--live-app-candidate --run` then uses the current App-bundled Codex binary, a temporary Codex/Router home and an isolated Gateway for at most six Provider generations. It must close one read-only MCP call/result plus a following turn per model, observe a stable anonymous-key fingerprint and the per-frame Lite header, and keep subscription/provider identity separated. Missing usage remains unknown rather than zero. Older `--live-feasibility`, `--live-gateway` and `--live-app-protocol` modes remain available for earlier candidate reproduction but are not the current 30-generation gate.
 

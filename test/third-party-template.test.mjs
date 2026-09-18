@@ -59,6 +59,11 @@ test("codex-general-v1 materializes one generic instruction, code mode, v2 agent
 test("legacy is a no-op and incompatible generic targets fail closed", () => {
   const target = deepseek();
   assert.deepEqual(applyThirdPartyTemplate(target, "legacy"), target);
+  const materialized = applyThirdPartyTemplate(target, "codex-general-v1");
+  const unmanaged = applyThirdPartyTemplate(materialized, "legacy");
+  assert.equal(unmanaged.app.thirdPartyTemplate, undefined);
+  assert.equal(unmanaged.app.toolMode, "code_mode_only");
+  assert.equal(unmanaged.app.multiAgent.capabilities.multi_agent_version, "v2");
   for (const mutate of [
     (entry) => { entry.wireApi = "chat_completions"; },
     (entry) => { entry.app.enabled = false; },

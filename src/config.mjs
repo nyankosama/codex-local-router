@@ -23,6 +23,10 @@ import {
   assertThirdPartyTemplateCompatible,
   validateThirdPartyTemplate,
 } from "./third-party-template.mjs";
+import {
+  resolveSubscriptionSearchPolicy,
+  validateSubscriptionSearchDelivery,
+} from "./subscription-search.mjs";
 const loopback = (h) => ["127.0.0.1", "localhost", "[::1]"].includes(h);
 const conditions = new Set([
   "modelID",
@@ -323,6 +327,10 @@ export function validate(input) {
       throw Error(
         `default App reasoning level is unsupported for target ${name}`,
       );
+    if (
+      t.app?.shellType != null &&
+      !["shell_command", "unified_exec"].includes(t.app.shellType)
+    ) throw Error(`invalid App shell type for target ${name}`);
     const applyPatch = t.app?.applyPatchToolType;
     if (applyPatch != null && applyPatch !== "freeform")
       throw Error(`invalid App apply patch tool type for target ${name}`);
@@ -390,6 +398,18 @@ export function validate(input) {
           throw Error(`conflicting standalone search policy for target ${name}`);
       }
     }
+    if (t.subscriptionSearch != null) {
+      if (
+        !t.subscriptionSearch ||
+        typeof t.subscriptionSearch !== "object" ||
+        Array.isArray(t.subscriptionSearch) ||
+        Object.keys(t.subscriptionSearch).some((key) => key !== "delivery")
+      ) throw Error(`invalid subscription search configuration for target ${name}`);
+      validateSubscriptionSearchDelivery(
+        t.subscriptionSearch.delivery,
+        `subscription search delivery for target ${name}`,
+      );
+    }
     const explicitProfile = t.app?.capabilityProfile;
     if (
       (explicitProfile === "standard-tools" ||
@@ -404,6 +424,21 @@ export function validate(input) {
     )
       t.standaloneSearch = { source: "disabled" };
     const search = resolveStandaloneSearchPolicy(c, t);
+    const subscriptionSearch = resolveSubscriptionSearchPolicy(t);
+    if (subscriptionSearch.delivery === "standard-tool") {
+      if (
+        t.provider === "chatgpt-subscription" ||
+        t.app?.enabled !== true ||
+        t.capabilities?.toolCalling !== true
+      ) throw Error(
+        `subscription search standard tool requires a third-party App-enabled target with tool calling: ${name}`,
+      );
+      if (
+        t.app?.useResponsesLite === true ||
+        ["subscription", "provider"].includes(search.source) ||
+        t.capabilities?.nativeWebSearch === true
+      ) throw Error(`conflicting subscription search delivery for target ${name}`);
+    }
     if (explicitProfile === "standard-tools") {
       if (t.app.useResponsesLite == null) t.app.useResponsesLite = false;
     } else if (explicitProfile === "lite-search") {

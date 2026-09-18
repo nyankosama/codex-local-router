@@ -1,14 +1,15 @@
 # 兼容性
 
-| 组件 | 当前状态 |
+| 组件 | 0.5.3 候选状态 |
 |---|---|
 | macOS / Node.js 22 | 支持；Node 仍把内置 SQLite 标记为 experimental |
 | Codex CLI 0.154.0-alpha.6.2 | 本次候选驱动基线，验收记录二进制 SHA-256 |
 | Codex App | app-server 协议可自动验收，真实 UI 必须单独确认 |
 | 官方订阅 HTTP/WS/辅助接口 | 固定目的地透明 Relay |
+| BigModel GLM 5.3 Flash | 标准 Responses 目标形态已通过确定性门禁；订阅桥接完成一轮隔离 live 闭环；用户 MCP 搜索尚未完成 live 准出 |
 | OpenCode Go DeepSeek | 既有 legacy 接入保留；通用模板、Code mode 与多代理 v2 尚未准出 |
 | ai.feei Sol / Astra Responses | 有内置预设；是否通过真实渠道以当次候选报告为准 |
-| Linux / Windows | v0.5.2 不声明支持 |
+| Linux / Windows | v0.5.3 不声明支持 |
 | 运行时配置 Schema 3 | 保持兼容，活动 Router 空间物化为原格式 |
 | 配置空间 Schema 1 | 本机不可变 revision 与单一切换事务 |
 | 集成状态 Schema 4 | 关联受保护 official 与当前物化 Router revision |
@@ -21,7 +22,9 @@ Gateway 能力与真实渠道健康度分别准出。本地确定性夹具可以
 
 已有任务从其他 Provider 切到 `lite-search` 时，Router 会删除历史 Lite 声明，只恢复当前请求携带的 `additional_tools`。因此核心工具和通过既有 Plugin 策略的客户端工具在切换后仍可调用；这不会把缩减的 Lite 画像升级为完整 `standard-tools` 工具面。
 
-独立搜索要求 Codex 运行时、模型 catalog 与用户设置同时允许。`standard-tools` 不广告独立搜索；显式 `lite-search` 使用 Responses Lite 和选定来源。对未声明原生 hosted search 的 target，如果仍出现顶层 hosted-search 载体则明确失败，避免搜索在错误渠道执行。CLI 新建 ai.feei target 默认 `standard-tools`，需要时可显式选择订阅或 Provider 搜索；官方模型始终强制使用订阅。没有 `app` 声明的旧 GPT target 保持既有默认；显式 App-disabled GPT target 不继承空间默认或旧 native-search 广告，但显式 target 策略与旧 App 搜索别名仍按更高优先级解析，Provider 搜索依然要求 App-enabled Responses target。非 GPT 与其他旧 target 保持旧行为。Provider endpoint 不根据模型名或 `/models` 推断，选定来源失败也不会切换到其他来源。
+独立搜索要求 Codex 运行时、模型 catalog 与用户设置同时允许。`standard-tools` 不广告独立搜索；显式 `lite-search` 使用 Responses Lite 和选定来源。对未声明原生 hosted-search 的 target，如果仍出现顶层 hosted-search 载体则明确失败，避免搜索在错误渠道执行。CLI 新建 ai.feei target 默认 `standard-tools`，需要时可显式选择订阅或 Provider 搜索；官方模型始终强制使用订阅。没有 `app` 声明的旧 GPT target 保持既有默认；显式 App-disabled GPT target 不继承空间默认或旧 native-search 广告，但显式 target 策略与旧 App 搜索别名仍按更高优先级解析，Provider 搜索依然要求 App-enabled Responses target。非 GPT 与其他旧 target 保持旧行为。Provider endpoint 不根据模型名或 `/models` 推断，选定来源失败也不会切换到其他来源。
+
+显式 `subscriptionSearch.delivery: "standard-tool"` 是第三方标准 Responses target 的模型家族无关路径：只有当前 Codex 请求启用搜索时才暴露一个普通函数，使用订阅身份访问固定 OpenAI 目的地，并把有界、不可信结果送回既有工具循环。它不会启用 Lite、Provider 原生 hosted search 或 `/v1` 的订阅权限。用户 MCP 搜索仍由客户端负责，并可能经当前 Codex 的 `tool_search` 延迟发现。详见[通用搜索](universal-search.zh-CN.md)。
 
 每个模型 turn 会冻结一份按 turn/thread/session/account 关联的搜索路由。`/subscription/v1/alpha/search` 先验证订阅身份，再选择固定 OpenAI 后端，或剥离订阅身份并换成目标 Provider Key。关联缺失或冲突会明确失败。第一版即使选择 Provider 搜索也仍要求有效 Codex 登录；本地 `/v1/alpha/search` 始终不开放。
 

@@ -34,6 +34,30 @@ export function createGateway(config, options = {}) {
       console.error(JSON.stringify({ at: new Date().toISOString(), ...event })));
   const engine = new Engine(config, { ...options, log }),
     controllers = new Set();
+  const delivered = (requestId, transport, model, startedAt) => {
+    let first, last, count = 0, bytes = 0, maxGap = 0;
+    return (event) => {
+      const now = Date.now();
+      if (event.type === "response.output_text.delta" && event.delta) {
+        if (first == null) {
+          first = now;
+          log({ event: "downstream_first_output_text", request_id: requestId,
+            transport, model, duration_ms: now - startedAt });
+        }
+        if (last != null) maxGap = Math.max(maxGap, now - last);
+        last = now;
+        count++;
+        bytes += Buffer.byteLength(event.delta);
+      }
+      if (["response.completed", "response.incomplete"].includes(event.type))
+        log({ event: "downstream_stream_completed", request_id: requestId,
+          transport, model, text_deltas: count, text_bytes: bytes,
+          text_span_ms: first == null ? null : last - first,
+          first_text_to_terminal_ms: first == null ? null : now - first,
+          max_text_gap_ms: count < 2 ? null : maxGap,
+          duration_ms: now - startedAt });
+    };
+  };
   let accepting = true;
   const json = (res, status, value) => {
     res.writeHead(status, { "content-type": "application/json" });
@@ -259,6 +283,7 @@ export function createGateway(config, options = {}) {
 
       phase = "inference";
       res.setHeader("x-gateway-request-id", requestId);
+      const observeDelivery = delivered(requestId, "http", body.model, startedAt);
       let response;
       for await (const event of engine.generate(
         entry,
@@ -266,6 +291,7 @@ export function createGateway(config, options = {}) {
         body,
         c.signal,
         {
+          id: requestId,
           transport: "http",
           responsesLite:
             req.headers["x-openai-internal-codex-responses-lite"] === "true",
@@ -284,6 +310,7 @@ export function createGateway(config, options = {}) {
             `event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number: responseSequence++ })}\n\n`,
             c.signal,
           );
+          observeDelivery(event);
         }
       }
       if (!response) throw fail("upstream_stream_incomplete", 502);
@@ -304,10 +331,7 @@ export function createGateway(config, options = {}) {
         error_name: error.type ? undefined : error.name,
       });
       if (!res.headersSent) json(res, error.status ?? 502, publicError(error));
-      else if (
-        responseStreaming &&
-        ["disallowed_plugin_tool_call", "tool_policy_conflict"].includes(error.type)
-      )
+      else if (responseStreaming)
         res.end(
           `event: error\ndata: ${JSON.stringify({
             type: "error",
@@ -546,21 +570,26 @@ export function createGateway(config, options = {}) {
                 response,
                 sequence_number: seq++,
               });
-            } else
+            } else {
+              const observeDelivery = delivered(requestId, "websocket", body.model, startedAt);
               for await (const event of engine.generate(
                 entryOf(req.url),
                 headers,
                 body,
                 active.signal,
                 {
+                  id: requestId,
                   transport: "websocket",
                   responsesLite:
                     message.client_metadata
                       ?.ws_request_header_x_openai_internal_codex_responses_lite ===
                     "true",
                 },
-              ))
+              )) {
                 await send({ ...event, sequence_number: seq++ });
+                observeDelivery(event);
+              }
+            }
           } catch (e) {
             log({
               event: "ws_error",

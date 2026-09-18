@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  deterministic:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -38,6 +38,51 @@ jobs:
       - run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
       - run: npm run audit:package
       - run: node scripts/audit-public.mjs
+
+  live-e2e:
+    needs: deterministic
+    runs-on: [self-hosted, macOS, codex-local-router-release]
+    environment: release-live
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Qualify current Codex and real search routes
+        shell: bash
+        run: |
+          evidence_dir="$RUNNER_TEMP/release-qualification-$GITHUB_RUN_ID"
+          ACCEPTANCE_COMMIT="$GITHUB_SHA" npm run e2e:release -- --run --out "$evidence_dir"
+          shasum -a 256 "$evidence_dir/summary.json"
+          jq '{verdict, implementation, driver, budget, assertions, stages}' "$evidence_dir/summary.json"
+
+  release:
+    needs: [deterministic, live-e2e]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Recheck immutable release identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          test "$GITHUB_REF_NAME" = "v$version"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace it." >&2
+            exit 1
+          fi
+      - run: npm ci
       - name: Build and verify release assets
         id: assets
         shell: bash

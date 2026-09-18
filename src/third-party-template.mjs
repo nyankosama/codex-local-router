@@ -67,7 +67,10 @@ export function assertThirdPartyTemplateCompatible(target, template) {
 export function applyThirdPartyTemplate(target, template, options = {}) {
   assertThirdPartyTemplateCompatible(target, template);
   const next = structuredClone(target);
-  if (template === "legacy") return next;
+  if (template === "legacy") {
+    if (next.app) delete next.app.thirdPartyTemplate;
+    return next;
+  }
 
   next.app.capabilityProfile = "standard-tools";
   next.app.useResponsesLite = false;

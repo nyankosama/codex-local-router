@@ -78,6 +78,20 @@ export function collectToolNames(tool) {
   return names;
 }
 
+export function classifyMcpToolFailure(error) {
+  const message = String(error?.message ?? "").toLowerCase();
+  if (!message) return null;
+  if (/certificate|self signed|unable to verify/.test(message)) return "tls";
+  if (/invalid api key|unauthorized|\b401\b/.test(message)) return "auth";
+  if (/rate limit|usage limit|quota|\b429\b/.test(message)) return "rate-limit";
+  if (/invalid (?:argument|params)|validation|required|too small|at least/.test(message))
+    return "invalid-arguments";
+  if (/approval|denied/.test(message)) return "approval";
+  if (/timeout|timed out/.test(message)) return "timeout";
+  if (/network|fetch failed|connect|socket|econn/.test(message)) return "network";
+  return "other";
+}
+
 export function isolatedChildEnv(home, overrides = {}) {
   const env = { ...process.env, ...overrides };
   for (const name of Object.keys(env)) {
@@ -971,6 +985,8 @@ export function startAppServer({ corePath, home, cwd }) {
       record.text += message.params.delta;
       record.receivedAgentDelta = true;
       record.firstTextAt ??= Date.now();
+      if (message.params.delta)
+        record.textDeltas.push({ at: Date.now(), bytes: Buffer.byteLength(message.params.delta) });
     }
     if (message.method === "item/completed") {
       const item = message.params.item ?? {};
@@ -990,6 +1006,7 @@ export function startAppServer({ corePath, home, cwd }) {
           id: item.id,
           status: item.status ?? "completed",
           tool: item.tool ?? item.name ?? item.server ?? item.serverLabel ?? null,
+          errorCategory: classifyMcpToolFailure(item.error),
           resultCount: Array.isArray(item.results) ? item.results.length : null,
           at: Date.now(),
         });
@@ -1022,6 +1039,7 @@ export function startAppServer({ corePath, home, cwd }) {
       startedAt: Date.now(),
       firstTextAt: null,
       receivedAgentDelta: false,
+      textDeltas: [],
     };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(Error(`turn timeout for ${threadId}`)), timeoutMs);

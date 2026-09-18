@@ -10,11 +10,14 @@ import {
   TavilyWebSearchAdapter,
   ExaWebSearchAdapter,
   FakeWebSearchAdapter,
+  SubscriptionWebSearchAdapter,
+  WebSearchError,
 } from "./websearch.mjs";
 import { fail } from "./errors.mjs";
 import {
   isSubstantiveResponseEvent,
   stabilizeResponseMessagePhases,
+  SearchResponseStream,
 } from "./response-stream.mjs";
 import {
   expandCheckpoints,
@@ -44,6 +47,7 @@ import {
 } from "./search-routes.mjs";
 import { PromptCacheAffinity } from "./prompt-cache-affinity.mjs";
 import { applyInstructionDelivery } from "./instruction-delivery.mjs";
+import { resolveSubscriptionSearchPolicy } from "./subscription-search.mjs";
 const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value) ?? "");
 const searchFunction = {
   type: "function",
@@ -58,6 +62,11 @@ const searchFunction = {
     required: ["query"],
     additionalProperties: false,
   },
+};
+const subscriptionSearchFunction = {
+  ...searchFunction,
+  name: "gateway_subscription_web_search",
+  description: "Search the web through the user's authenticated OpenAI subscription and return cited results",
 };
 const fetchFunction = {
   type: "function",
@@ -84,6 +93,7 @@ const fetchFunction = {
 };
 const internalSearchNames = new Set([
   searchFunction.name,
+  subscriptionSearchFunction.name,
   fetchFunction.name,
 ]);
 const isInternalSearchCall = (item) =>
@@ -107,6 +117,7 @@ export class Engine {
       promptCacheNow,
       promptCacheTtlMs,
       promptCacheMaxLineages,
+      officialRequest,
     } = {},
   ) {
     this.config = config;
@@ -115,6 +126,7 @@ export class Engine {
     this.archive = archive;
     this.resolveIdentity = resolveIdentity;
     this.toolRegistry = toolRegistry ?? {};
+    this.officialRequest = officialRequest;
     this.state = new StateStore(config.history, archive);
     this.standaloneSearchRoutes = new StandaloneSearchRoutes(this.state);
     this.promptCacheAffinity = new PromptCacheAffinity(this.state, {
@@ -697,10 +709,11 @@ export class Engine {
       if (leaseKey) this.state.set(leaseKey, lease);
     }
     const config = lease.config,
-      requestId = randomUUID(),
+      requestId = request.id ?? randomUUID(),
       startedAt = acceptedAt;
     this.recordStandaloneSearchRoute(config, lease.target, headers, original, ctx);
     ctx.providerCalls = 0;
+    let searchStream;
     let target = lease.target,
       output = false,
       sideEffect = body.input.some((x) =>
@@ -900,15 +913,19 @@ export class Engine {
       if (signal.aborted) throw fail("cancelled", 499);
       const policyStartedAt = Date.now();
       const standaloneSearch = resolveStandaloneSearchPolicy(config, target);
+      const subscriptionSearch = resolveSubscriptionSearchPolicy(target);
       const plan = planCapabilities(target, contextFromRequest(body, headers), {
         standaloneSearchSource: standaloneSearch.source,
+        subscriptionSearchDelivery: subscriptionSearch.delivery,
       });
       if (plan.mode === "unsupported")
         throw fail(plan.reason ?? "capability_error", 400);
+      if (plan.mode === "subscription_bridge" && entry !== "subscription")
+        throw fail("subscription_search_identity_required", 403);
       if (body.tools?.length && target.capabilities?.toolCalling === false)
         throw fail("capability_error", 400);
-      const search = plan.mode === "tool_fallback";
-      if (search && !config.webSearch)
+      const search = ["tool_fallback", "subscription_bridge"].includes(plan.mode);
+      if (plan.mode === "tool_fallback" && !config.webSearch)
         throw fail("web_search_unavailable", 503);
       const instructionDelivery = applyInstructionDelivery(target, body, ctx);
       if (instructionDelivery.applied)
@@ -960,10 +977,12 @@ export class Engine {
           ...adapted,
           tools: [
             ...(adapted.tools ?? []).filter(
-              (x) => !/^web_search/.test(x.type ?? ""),
+              (x) => !["web_search", "web_search_preview"].includes(x.type),
             ),
-            searchFunction,
-            fetchFunction,
+            plan.mode === "subscription_bridge"
+              ? subscriptionSearchFunction
+              : searchFunction,
+            ...(plan.mode === "subscription_bridge" ? [] : [fetchFunction]),
           ],
         };
       const additionalToolDefinitions = (adapted.input ?? [])
@@ -972,26 +991,6 @@ export class Engine {
             item?.type === "additional_tools" && Array.isArray(item.tools),
         )
         .reduce((total, item) => total + item.tools.length, 0);
-      if (target.wireApi === "chat_completions") {
-        const namespaceTools = (adapted.tools ?? []).filter(
-          (tool) => tool.type === "namespace",
-        );
-        if (namespaceTools.length) {
-          adapted = {
-            ...adapted,
-            tools: adapted.tools.filter((tool) => tool.type !== "namespace"),
-          };
-          this.log({
-            event: "unsupported_tool_definitions_omitted",
-            ...correlation,
-            provider: target.provider,
-            model: target.model,
-            wire_api: target.wireApi,
-            tool_type: "namespace",
-            count: namespaceTools.length,
-          });
-        }
-      }
       this.log({
         event: "route",
         ...correlation,
@@ -1023,7 +1022,10 @@ export class Engine {
         input_budget: inputBudget(target, adapted),
         count_quality: "estimate",
       });
-      let events = [];
+      if (search) {
+        searchStream ??= new SearchResponseStream(isInternalSearchCall);
+        searchStream.beginRound();
+      }
       let response;
       let upstreamOutput = false;
       try {
@@ -1057,8 +1059,12 @@ export class Engine {
               }
             }
           }
-          if (search) events.push(event);
-          else {
+          if (search) {
+            for (const projected of searchStream.push(event)) {
+              output = true;
+              yield projected;
+            }
+          } else {
             output = true;
             yield event;
           }
@@ -1153,15 +1159,19 @@ export class Engine {
         throw e;
       }
       if (!response) throw fail("upstream_stream_incomplete", 502);
+      if (search) {
+        for (const event of searchStream.endRound(response)) {
+          output = true;
+          yield event;
+        }
+        // Save the raw provider transcript under the client-visible response ID.
+        // The projected terminal aggregates visible items, not private history.
+        response = { ...response, id: searchStream.id };
+      }
       const calls = search
         ? (response.output ?? []).filter(isInternalSearchCall)
         : [];
       if (!calls.length) {
-        if (search)
-          for (const event of events) {
-            output = true;
-            yield event;
-          }
         this.saveResponse(ctx, response, body.input, target, archiveInput, correlation);
         if (ctx.requestKind === "turn") {
           this.state.set("last-target:" + ctx.owner, { ...target }, ctx);
@@ -1176,22 +1186,32 @@ export class Engine {
           upstream_calls: ctx.providerCalls,
           duration_ms: Date.now() - startedAt,
         });
+        if (search) yield searchStream.finish(response);
         return;
       }
-      if (round++ >= (config.webSearch.maxRounds ?? 3))
+      if (round++ >= (config.webSearch?.maxRounds ?? 3))
         throw fail("tool_loop_limit", 508);
-      const options = {
-        ...config.webSearch,
-        apiKey:
-          process.env[
-            config.webSearch.apiKeyEnv ??
-              (config.webSearch.backend === "exa"
-                ? "EXA_API_KEY"
-                : "TAVILY_API_KEY")
-          ],
-      };
-      const adapter =
-        config.webSearch.backend === "fake"
+      const options = plan.mode === "subscription_bridge"
+        ? null
+        : {
+            ...config.webSearch,
+            apiKey:
+              process.env[
+                config.webSearch.apiKeyEnv ??
+                  (config.webSearch.backend === "exa"
+                    ? "EXA_API_KEY"
+                    : "TAVILY_API_KEY")
+              ],
+          };
+      const adapter = plan.mode === "subscription_bridge"
+        ? new SubscriptionWebSearchAdapter({
+            headers,
+            model: body.model,
+            requestShape: plan.request,
+            timeoutMs: Math.min(config.timeoutMs ?? 180000, 30000),
+            fetchImpl: this.officialRequest,
+          })
+        : config.webSearch.backend === "fake"
           ? new FakeWebSearchAdapter(
               config.webSearch.results,
               config.webSearch.pages,
@@ -1207,7 +1227,7 @@ export class Engine {
         } catch {
           throw fail("invalid_tool_arguments", 400);
         }
-        if (call.name === searchFunction.name) {
+        if ([searchFunction.name, subscriptionSearchFunction.name].includes(call.name)) {
           if (
             typeof args.query !== "string" ||
             !args.query.trim() ||
@@ -1241,7 +1261,7 @@ export class Engine {
         let result;
         try {
           result =
-            call.name === searchFunction.name
+            [searchFunction.name, subscriptionSearchFunction.name].includes(call.name)
               ? await adapter.search({ ...args, signal })
               : await adapter.fetchPage({
                   ...args,
@@ -1251,8 +1271,13 @@ export class Engine {
                     20000,
                   signal,
                 });
-        } catch {
-          throw fail("web_search_unavailable", 503);
+        } catch (error) {
+          throw error instanceof WebSearchError
+            ? fail(
+                error.code,
+                error.status ?? (error.code === "invalid_arguments" ? 400 : 503),
+              )
+            : fail("web_search_unavailable", 503);
         }
         results.push({
           type: "function_call_output",
@@ -1260,11 +1285,14 @@ export class Engine {
           output: JSON.stringify(result),
         });
         this.log(
-          call.name === searchFunction.name
+          [searchFunction.name, subscriptionSearchFunction.name].includes(call.name)
             ? {
                 event: "search",
                 request_id: requestId,
-                backend: config.webSearch.backend,
+                backend:
+                  plan.mode === "subscription_bridge"
+                    ? "openai-subscription"
+                    : config.webSearch.backend,
                 result_count: result.results.length,
               }
             : {
@@ -1278,7 +1306,7 @@ export class Engine {
       }
       const external = response.output.filter(
         (x) =>
-          x.type === "function_call" && !internalSearchNames.has(x.name),
+          ["function_call", "custom_tool_call"].includes(x.type) && !isInternalSearchCall(x),
       );
       if (external.length) {
         const providerResponse = {
@@ -1286,10 +1314,6 @@ export class Engine {
           // Persist the complete assistant output first, then the internal tool
           // outputs. Codex appends external outputs to this continuation later.
           output: [...response.output, ...results],
-        };
-        const clientResponse = {
-          ...response,
-          output: response.output.filter((x) => !calls.includes(x)),
         };
         this.saveResponse(
           ctx,
@@ -1299,7 +1323,7 @@ export class Engine {
           archiveInput,
           correlation,
         );
-        for (const e of completedEvents(clientResponse)) yield e;
+        yield searchStream.finish(response);
         return;
       }
       body = {
@@ -1664,7 +1688,7 @@ export class Engine {
       target.wireApi === "chat_completions" &&
       (body.tools ?? []).some(
         (t) =>
-          !["function", "web_search", "web_search_preview"].includes(t.type),
+          !["function", "namespace", "web_search", "web_search_preview"].includes(t.type),
       )
     )
       throw fail(
@@ -1672,10 +1696,15 @@ export class Engine {
         400,
         "Chat adapter supports JSON function tools only",
       );
+    const toolNameMap = new Map();
     const payload =
       target.wireApi === "responses"
         ? { ...body, model: target.model, stream: true }
-        : toChat({ ...body, stream: true }, target.model);
+        : toChat(
+            { ...body, stream: true },
+            target.model,
+            { toolNameMap },
+          );
     if (target.provider === "chatgpt-subscription") payload.store = false;
     let promptCacheAffinity;
     try {
@@ -1829,7 +1858,7 @@ export class Engine {
         response =
           target.wireApi === "responses"
             ? json
-            : chatToResponse(json, body.model);
+            : chatToResponse(json, body.model, { toolNameMap });
       if (
         !["completed", "incomplete"].includes(response.status) ||
         !Array.isArray(response.output)
@@ -1878,7 +1907,7 @@ export class Engine {
               });
             }
           }
-          if (!upstreamOutputText && event.type === "response.output_text.delta") {
+          if (!upstreamOutputText && event.type === "response.output_text.delta" && event.delta) {
             upstreamOutputText = true;
             engine.log({
               event: "upstream_first_output_text",
@@ -1922,10 +1951,10 @@ export class Engine {
           hooks.toolPolicy ?? { mode: "passthrough" },
           hooks.toolRegistry,
         );
-        if (!downstreamOutputText && event.type === "response.output_text.delta") {
+        if (!downstreamOutputText && event.type === "response.output_text.delta" && event.delta) {
           downstreamOutputText = true;
           this.log({
-            event: "downstream_first_output_text",
+            event: "sample_first_output_text",
             ...(hooks.correlation ?? {}),
             provider: target.provider,
             model: target.model,
@@ -1964,7 +1993,7 @@ export class Engine {
       );
       yield terminal;
     } else {
-      const encoder = new ChatEncoder(body.model);
+      const encoder = new ChatEncoder(body.model, toolNameMap);
       let started = false;
       let receivedBytes = 0;
       for await (const chunk of sseEvents(upstream.body)) {

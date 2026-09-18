@@ -10,6 +10,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { WebSocket } from "ws";
+import { probeSearchStreaming } from "./lib/search-streaming-probe.mjs";
+import { RELEASE_QUALIFICATION } from "./lib/release-qualification.mjs";
 import {
   isolatedCodexHome,
   resolveCore,
@@ -47,6 +49,7 @@ const MARKERS = {
   final: marker("STANDARD_FINAL"),
   searchUrl: `https://fixture.invalid/${marker("SEARCH_RESULT")}`,
   searchFinal: marker("SEARCH_FINAL"),
+  bridgeFinal: marker("BRIDGE_FINAL"),
   cli: marker("CLI_WS"),
   official: marker("OFFICIAL_WS"),
 };
@@ -191,6 +194,19 @@ async function createSyntheticProvider() {
         );
       else
         response = completedResponse(body.model, [message("SEARCH_RESULT_MARKER_MISSING")]);
+    } else if (body.model === "fixture-bridge") {
+      const resultIds = new Set(record.resultCallIds);
+      if (!resultIds.has("call_g2_bridge"))
+        response = completedResponse(body.model, names.includes("gateway_subscription_web_search")
+          ? [{
+              ...functionCall("gateway_subscription_web_search", "call_g2_bridge"),
+              arguments: JSON.stringify({ query: "synthetic bridge qualification", numResults: 2 }),
+            }]
+          : [message("MISSING_SUBSCRIPTION_BRIDGE")]);
+      else if (text.includes(MARKERS.searchUrl))
+        response = completedResponse(body.model, [message(`${MARKERS.searchUrl} ${MARKERS.bridgeFinal}`)]);
+      else
+        response = completedResponse(body.model, [message("BRIDGE_RESULT_MARKER_MISSING")]);
     } else {
       response = completedResponse(body.model ?? "fixture", [message(MARKERS.cli)]);
     }
@@ -284,7 +300,18 @@ function mutateConfig(config, providerUrl) {
     "fixture-standard": {
       ...base,
       model: "fixture-standard",
-      app: { enabled: true, modelId: "fixture-standard", displayName: "Fixture Standard", capabilityProfile: "standard-tools", useResponsesLite: false },
+      modelFamily: "other",
+      pluginToolPolicy: "third-party-gpt-default",
+      capabilities: { ...base.capabilities, freeformTools: false },
+      app: {
+        enabled: true,
+        modelId: "fixture-standard",
+        displayName: "Fixture Standard",
+        capabilityProfile: "standard-tools",
+        useResponsesLite: false,
+        shellType: "shell_command",
+        baseInstructions: "Work as a coding agent and use the requested tools.",
+      },
       standaloneSearch: { source: "disabled" },
     },
     "fixture-lite": {
@@ -292,6 +319,13 @@ function mutateConfig(config, providerUrl) {
       model: "fixture-lite",
       app: { enabled: true, modelId: "fixture-lite", displayName: "Fixture Lite", capabilityProfile: "lite-search", useResponsesLite: true },
       standaloneSearch: { source: "subscription" },
+    },
+    "fixture-bridge": {
+      ...base,
+      model: "fixture-bridge",
+      app: { enabled: true, modelId: "fixture-bridge", displayName: "Fixture Bridge", capabilityProfile: "standard-tools", useResponsesLite: false },
+      standaloneSearch: { source: "disabled" },
+      subscriptionSearch: { delivery: "standard-tool" },
     },
   };
   config.defaultTarget = "fixture-standard";
@@ -568,6 +602,41 @@ try {
     durationMs: Date.now() - standardStartedAt,
   });
 
+  const bridgeHome = join(root, "bridge-home");
+  await prepareHome(bridgeHome, gateway, "fixture-bridge", { webSearch: "live" });
+  app = startAppServer({ corePath: core.path, home: bridgeHome, cwd: workspace });
+  await app.initialize("codex_local_router_g2_bridge");
+  const bridgeThread = await app.rpc("thread/start", {
+    model: "fixture-bridge",
+    modelProvider: "openai",
+    cwd: workspace,
+    ephemeral: true,
+    sandbox: "read-only",
+    approvalPolicy: "never",
+  });
+  const bridgeStartedAt = Date.now();
+  const searchCountBeforeBridge = syntheticSearchRequests.length;
+  const bridgeTurn = await app.request(
+    bridgeThread.thread.id,
+    "fixture-bridge",
+    "Use the configured web search and return the synthetic source.",
+    { timeoutMs: 120000 },
+  );
+  await app.close();
+  app = null;
+  const bridgePayloads = gateway.payloads.filter((item) => item.model === "fixture-bridge");
+  recordCase("standard_subscription_bridge", {
+    appServerCompleted: bridgeTurn.status === "completed",
+    officialSearchRequested: syntheticSearchRequests.length === searchCountBeforeBridge + 1,
+    bridgeResultReachedProvider: bridgePayloads.some((item) => item.markerMatches.includes("searchUrl")),
+    finalAnswerUsesSearchResult:
+      bridgeTurn.text.includes(MARKERS.searchUrl) && bridgeTurn.text.includes(MARKERS.bridgeFinal),
+  }, {
+    profile: "standard-tools",
+    delivery: "standard-tool",
+    durationMs: Date.now() - bridgeStartedAt,
+  });
+
   const cliHome = join(root, "cli-ws-home");
   await prepareHome(cliHome, gateway, "fixture-cli", { websockets: true });
   const cliStartedAt = Date.now();
@@ -579,10 +648,16 @@ try {
     prompt: "Return the fixture marker without tools.",
     timeoutMs: 90000,
   });
+  const cliText = cli.rows
+    .filter((row) => row.type === "item.completed" && row.item?.type === "agent_message")
+    .map((row) => row.item.text ?? "")
+    .join("\n");
   recordCase("cli_http_path", {
     cliCompleted: cli.code === 0,
     providerResponseObserved: gateway.outbound.some((event) => event.path.endsWith("/responses") && !event.official),
     cliLifecycleObserved: ["thread.started", "turn.started", "turn.completed"].every((type) => cli.rows.some((row) => row.type === type)),
+    nonGptUserMcpClosure: [MARKERS.core, MARKERS.plugin, MARKERS.mcp, MARKERS.final]
+      .every((value) => cliText.includes(value)),
   }, {
     rowTypes: [...new Set(cli.rows.map((row) => row.type).filter(Boolean))],
     durationMs: Date.now() - cliStartedAt,
@@ -645,11 +720,26 @@ try {
     durationMs: Date.now() - liteStartedAt,
   });
 
+  const streamingProbes = [];
+  for (const transport of ["http", "websocket"])
+    for (const mode of ["subscription_bridge", "tool_fallback"])
+      for (const rounds of [0, 2])
+        streamingProbes.push(await probeSearchStreaming({ transport, mode, rounds }));
+  recordCase("search_streaming_delivery", {
+    allTextReceivedBeforeUpstreamTerminal: streamingProbes.every((probe) => probe.beforeTerminal),
+  }, { probes: streamingProbes });
+
   const websocketStartedAt = Date.now();
   const socket = await openGatewaySocket(gateway);
   const customEvents = await websocketTurn(socket, {
     model: "fixture-standard",
     input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "G2 custom WS" }] }],
+  });
+  const searchCountBeforeBridgeWs = syntheticSearchRequests.length;
+  const bridgeEvents = await websocketTurn(socket, {
+    model: "fixture-bridge",
+    tools: [{ type: "web_search", mode: "cached" }],
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "G2 bridge WS" }] }],
   });
   const officialEvents = await websocketTurn(socket, {
     model: "gpt-official-g2-unmapped",
@@ -685,8 +775,12 @@ try {
   const contiguous = (events) => events.every((event, index) => event.sequence_number === index);
   recordCase("websocket_switch_lifecycle", {
     customTurnCompleted: terminal(customEvents),
+    bridgeTurnCompleted:
+      terminal(bridgeEvents) &&
+      syntheticSearchRequests.length === searchCountBeforeBridgeWs + 1,
     officialTurnCompleted: terminal(officialEvents),
-    sameConnectionSequencesPreserved: contiguous(customEvents) && contiguous(officialEvents),
+    sameConnectionSequencesPreserved:
+      contiguous(customEvents) && contiguous(bridgeEvents) && contiguous(officialEvents),
     customPrewarmHandledLocally: terminal(prewarmEvents) && prewarmProviderAfter === prewarmProviderCount,
     disconnectCancelledAndCleaned: drained.activeTurns === 0,
     reconnectCompleted: terminal(reconnectEvents),
@@ -696,12 +790,14 @@ try {
     transports: { custom: "websocket-to-http", official: "websocket-opaque-relay" },
     eventCounts: {
       custom: customEvents.length,
+      bridge: bridgeEvents.length,
       official: officialEvents.length,
       prewarm: prewarmEvents.length,
       reconnect: reconnectEvents.length,
     },
     eventTypes: {
       custom: customEvents.map((event) => event.type),
+      bridge: bridgeEvents.map((event) => event.type),
       official: officialEvents.map((event) => event.type),
       prewarm: prewarmEvents.map((event) => event.type),
       reconnect: reconnectEvents.map((event) => event.type),
@@ -740,7 +836,10 @@ const performanceHealthy =
   performance.finalWebsocketConnections === 0;
 const summary = {
   runId: new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14),
-  verdict: harnessError == null && cases.length === 4 && cases.every((item) => item.passed) && performanceHealthy ? "PASS" : "FAIL",
+  verdict: harnessError == null &&
+    cases.length === RELEASE_QUALIFICATION.cases.profiles.length &&
+    RELEASE_QUALIFICATION.cases.profiles.every((name) => cases.some((item) => item.name === name && item.passed)) &&
+    performanceHealthy ? "PASS" : "FAIL",
   scope: "G2-deterministic-current-codex-profile-qualification",
   implementation,
   harness: core ? { source: core.source, version: core.version, sha256: core.sha256 } : null,
@@ -774,6 +873,51 @@ const summary = {
     })),
     gatewayEvents: [...new Set((gateway?.logs ?? []).map((item) => item.event).filter(Boolean))],
     syntheticSearchRequestCount: syntheticSearchRequests.length,
+    syntheticSearchRequestShapes: syntheticSearchRequests.map((request) => ({
+      keys: Object.keys(request).sort(),
+      inputType: Array.isArray(request.input) ? "array" : typeof request.input,
+      inputShapes: Array.isArray(request.input)
+        ? request.input.map((item) => ({
+            type: item?.type ?? null,
+            role: item?.role ?? null,
+            name: item?.name ?? null,
+            keys: item && typeof item === "object" ? Object.keys(item).sort() : [],
+            contentTypes: Array.isArray(item?.content)
+              ? item.content.map((part) => part?.type ?? typeof part)
+              : [],
+          }))
+        : [],
+      commandShapes: Array.isArray(request.commands)
+        ? request.commands.map((command) => ({
+            type: command?.type ?? null,
+            name: command?.name ?? null,
+            keys: command && typeof command === "object" ? Object.keys(command).sort() : [],
+          }))
+        : [],
+      commandsType: Array.isArray(request.commands)
+        ? "array"
+        : request.commands == null
+          ? "null"
+          : typeof request.commands,
+      commandKeys:
+        request.commands && typeof request.commands === "object" && !Array.isArray(request.commands)
+          ? Object.keys(request.commands).sort()
+          : [],
+      model: typeof request.model === "string" ? request.model : null,
+      maxOutputTokens: Number.isInteger(request.max_output_tokens)
+        ? request.max_output_tokens
+        : null,
+      settings:
+        request.settings && typeof request.settings === "object"
+          ? {
+              keys: Object.keys(request.settings).sort(),
+              allowedCallers: Array.isArray(request.settings.allowed_callers)
+                ? request.settings.allowed_callers
+                : [],
+              externalWebAccess: request.settings.external_web_access ?? null,
+            }
+          : {},
+    })),
   },
 };
 if (output) {

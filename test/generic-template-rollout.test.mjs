@@ -19,4 +19,12 @@ test("generic-template rollout scripts fail closed before touching local state",
     exec(process.execPath, [resolve("scripts/e2e/third-party-template-live.mjs")]),
     /requires --run/,
   );
+  await assert.rejects(
+    exec(process.execPath, [resolve("scripts/maintainer/universal-search-activate.mjs")]),
+    /--package VALUE.*--id VALUE/s,
+  );
+  await assert.rejects(
+    exec(process.execPath, [resolve("scripts/maintainer/universal-search-rollback.mjs")]),
+    /--state PATH_TO_ROLLBACK_JSON/,
+  );
 });
