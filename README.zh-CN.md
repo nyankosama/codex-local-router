@@ -35,17 +35,18 @@ Plugin 白名单只裁剪结构化 Plugin 定义；Codex 核心工具和用户 M
 - Node.js 22 或更高版本
 - [兼容矩阵](docs/public/compatibility.md)列出的 Codex CLI / App 版本
 - Responses 与 Chat Completions
-- ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设和通用 OpenAI 兼容渠道
+- ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设、BigModel GLM 5.3/Flash 标准 Responses，以及通用 OpenAI 兼容渠道
+- 用户 MCP 搜索，以及符合条件的第三方标准 Responses 模型显式使用的 OpenAI 订阅搜索桥接
 
-v0.5.4 不声明 Linux、Windows 或未知供应商私有协议已受支持。
+v0.5.5 不声明 Linux、Windows 或未知供应商私有协议已受支持。
 
 ## 从 GitHub Release 安装
 
-下载 `v0.5.4` Release 中的 `.tgz` 与 SHA-256 文件：
+下载 `v0.5.5` Release 中的 `.tgz` 与 SHA-256 文件：
 
 ```bash
-shasum -a 256 -c codex-local-router-0.5.4.tgz.sha256
-npm install -g ./codex-local-router-0.5.4.tgz
+shasum -a 256 -c codex-local-router-0.5.5.tgz.sha256
+npm install -g ./codex-local-router-0.5.5.tgz
 codex-local-router --version
 ```
 

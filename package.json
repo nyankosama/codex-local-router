@@ -1,6 +1,6 @@
 {
   "name": "codex-local-router",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "Local multi-model routing for Codex CLI and App while preserving ChatGPT subscription access",
   "license": "MIT",
   "repository": {
