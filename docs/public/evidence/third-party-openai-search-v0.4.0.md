@@ -1,5 +1,9 @@
 # Third-party OpenAI search candidate report
 
+> **Frozen evidence**  
+> Applies to: `v0.4.0` third-party OpenAI search candidate.  
+> This immutable record does not describe the current release, installed service, or Provider health.
+
 Date: 2026-09-13  
 Live-tested candidate: the final committed candidate (the exact commit is recorded by the acceptance runner)
 Overall verdict: **PASS for the isolated CLI/App protocol gate**

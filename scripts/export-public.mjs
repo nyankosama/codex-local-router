@@ -16,6 +16,7 @@ const repositoryEntries = [
   "scripts/audit-public-history.mjs",
   "scripts/export-public.mjs",
   "scripts/public-boundary.mjs",
+  "scripts/release-scope.mjs",
   "scripts/run-tests.mjs",
   "package-lock.json",
   "CONTRIBUTING.md",

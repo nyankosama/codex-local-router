@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.5.7 - 2026-09-18
+
+- Reorganize the English and Chinese documentation around user tasks, with neutral quick-start examples, a single Provider guide, explicit support-status vocabulary, and accurate macOS and protocol boundaries.
+- Separate evergreen release policy from versioned frozen evidence, add public documentation contribution rules and a credential-safe GitHub bug-report form.
+- Add deterministic documentation checks and a fail-closed release classifier. Documentation-only releases still run tests, audits, clean export, packaging, and installation checks while explicitly skipping and disclosing real-model/App live E2E.
+
 ## 0.5.6 - 2026-09-18
 
 - Adjust the official live-search release sub-budget from eight to nine unique generation sends for the current Codex 0.155 search continuation shape, while retaining two turns, six searches, zero retries and a hard total of seventeen generation sends.

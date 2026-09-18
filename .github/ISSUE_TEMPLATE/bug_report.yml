@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible Codex Local Router problem
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, private conversation text, `auth.json`, raw history databases, or unredacted request and response bodies.
+  - type: input
+    id: version
+    attributes:
+      label: Codex Local Router version
+      placeholder: Output of codex-local-router --version
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: Client
+      options:
+        - Codex CLI
+        - Codex App
+        - Both
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the failure without private prompts or model output.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Optional redacted output from `codex-local-router status --json` and `codex-local-router doctor --json`.
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private conversation content, raw history files, and identifying local paths.
+          required: true
