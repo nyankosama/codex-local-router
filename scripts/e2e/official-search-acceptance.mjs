@@ -32,7 +32,7 @@ const output = value("out") ? resolve(value("out")) : null;
 const root = await mkdtemp(join(tmpdir(), "codex-router-official-search-"));
 const codexHome = join(root, "codex-home");
 const work = join(root, "workspace");
-const budget = new FocusedAcceptanceBudget({ maxTurns: 2, maxGenerations: 8, maxSearchRequests: 6 });
+const budget = new FocusedAcceptanceBudget({ maxTurns: 2, maxGenerations: 9, maxSearchRequests: 6 });
 const cases = [];
 let gateway;
 const finalText = (run) => run.rows

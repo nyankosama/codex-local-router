@@ -1,18 +1,18 @@
 # Compatibility matrix
 
-| Component | v0.5.5 release status |
+| Component | v0.5.6 release status |
 |---|---|
 | macOS | Supported |
 | Node.js 22 | Supported; Node currently labels built-in SQLite experimental |
-| Codex CLI 0.154.0-alpha.6.2 | v0.5.5 release-gate driver; exact binary SHA is recorded by the harness |
+| Codex CLI 0.155.0-alpha.2.6 | Current release driver; exact binary SHA is recorded by the harness |
 | Codex App | App-server integration baseline; UI reload must be verified for each installed build |
 | ChatGPT subscription HTTP/WS and auxiliary APIs | Fixed-origin transparent relay; model/search queries and future paths covered locally |
-| BigModel GLM 5.3 Flash | Standard Responses and the subscription bridge passed the bounded release gate; client-owned MCP remains a separate client capability |
+| BigModel GLM 5.3 / Flash | Standard Responses shape and GLM Flash subscription bridge pass the bounded release gate; client-owned MCP remains a separate client capability |
 | OpenCode Go DeepSeek | Existing legacy integration supported; generic template, Code mode and multi-agent v2 are not qualified |
-| ai.feei GPT 5.6 Sol / GPT 6 Astra Responses | Built-in presets; Sol subscription-bridge and client-owned Tavily paths passed the bounded release gate, while each other live combination requires its own evidence |
+| ai.feei GPT 5.6 Sol / GPT 6 Astra Responses | Built-in presets; Sol subscription bridge and client-owned Tavily path pass the bounded release matrix, while other live combinations require their own evidence |
 | Generic OpenAI-compatible Responses | Configuration support; provider capability requires live probe |
 | Generic OpenAI-compatible Chat Completions | Configuration support with JSON function tools |
-| Linux / Windows | Not supported in v0.5.5 |
+| Linux / Windows | Not supported in v0.5.6 |
 | Runtime configuration schema 3 | Preserved; active Router space materializes into the existing format |
 | Configuration-space schema 1 | Local immutable revisions and one switch transaction |
 | Integration state schema 4 | Links protected official and materialized Router revisions |
@@ -44,7 +44,7 @@ Consequences and limits:
 
 An explicit `subscriptionSearch.delivery: "standard-tool"` is the model-family-neutral alternative for third-party Standard Responses targets. It exposes subscription search as one ordinary function only when the current Codex request enables search, executes the call at the fixed OpenAI destination with subscription identity, and returns bounded untrusted results through the existing tool loop. It does not turn on Lite, Provider-native hosted search, or `/v1` subscription access. User MCP search remains client-owned and may be deferred behind the current Codex `tool_search` discovery function. See [universal search](universal-search.md).
 
-The bridge may execute several calls from one Provider response and may continue through several model/search rounds. `webSearch.maxRounds` defaults to three and bounds those continuation rounds. Internal subscription-search calls stay out of the client transcript; visible text and normal client tools stream immediately. A quiet tool-only interval is therefore possible and is not replaced with fabricated progress.
+The bridge can execute multiple searches in one turn up to `webSearch.maxRounds` (default 3, range 1-10); the next call fails with `tool_loop_limit`, without retry or fallback. Its internal calls are not rendered as client tool items. Ordinary text and client-visible tools continue to stream immediately, so hidden search execution does not imply whole-turn buffering.
 
 The effective `standaloneSearch` policy controls whether the generated Codex catalog advertises the client's standalone search capability. It is intentionally separate from `capabilities.nativeWebSearch`, which declares a provider-hosted tool embedded in model generation. Current Codex carries standalone search as Responses Lite `web.run`; `standard-tools` therefore disables it, while explicit `lite-search` requires an active source. A mismatched top-level hosted-search request to a target without declared native hosted search fails instead of executing on an unintended provider. New ai.feei targets created by the CLI default to `standard-tools`; explicit `lite-search` normally inherits the `openai-gpt` subscription source. Native hosted search remains disabled.
 

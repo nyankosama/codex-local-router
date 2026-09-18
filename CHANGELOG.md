@@ -2,10 +2,14 @@
 
 ## Unreleased
 
+## 0.5.6 - 2026-09-18
+
+- Adjust the official live-search release sub-budget from eight to nine unique generation sends for the current Codex 0.155 search continuation shape, while retaining two turns, six searches, zero retries and a hard total of seventeen generation sends.
+
 ## 0.5.5 - 2026-09-18
 
 - Refresh the English and Chinese README, compatibility matrix, search guide and acceptance overview so current release behavior is separated from frozen historical candidate records.
-- Document hidden internal subscription-search calls, bounded multi-search rounds and immediate streaming of client-visible text and ordinary tools. Runtime routing behavior is unchanged from v0.5.4.
+- Document hidden internal subscription-search calls, bounded multi-search rounds and immediate streaming of client-visible text and ordinary tools.
 
 ## 0.5.4 - 2026-09-18
 
