@@ -18,9 +18,7 @@ transactions/space-switch.json    唯一待完成或待恢复事务
 
 空间名匹配 `[a-z0-9][a-z0-9._-]{0,63}`。revision 只保存环境变量名或 Keychain service/account，不保存明文 Provider 凭证、ChatGPT Token、`auth.json`、用户 MCP、Skills、Hooks、提示和会话历史。`official@1` 永久保留。
 
-## ai.feei
-
-### 显式启用 code mode
+## 显式启用第三方 App Code mode
 
 `targets.<id>.app.toolMode: "code_mode_only"` 只投影为 catalog 的 `tool_mode`，让兼容客户端使用 `exec`/`wait`。要求第三方、App-enabled、Responses 协议且声明 `toolCalling` 和 `freeformTools`；如果 preset 收窄了 Provider 准出范围，还必须通过对应准出。不再以 GPT 家族为准入条件。旧安装不自动迁移。诊断同时显示 `structured-only; embedded-exec-opaque` 边界。
 
@@ -31,41 +29,11 @@ Plugin 白名单继续裁剪结构化工具定义，但不解析或改写 `exec.
 批量预览（仅在预检通过、App 已退出的上线窗口增加 `--yes`）：
 
 ```bash
-codex-local-router model set-tool-mode --ids feei-sol,feei-astra \
+codex-local-router model set-tool-mode --ids target-a,target-b \
   --tool-mode code_mode_only --space default --json
 ```
 
-两个 target 一次提交为同一个不可变空间版本，分别保留空间默认模型和 Codex 当前选模。`--tool-mode default` 清除覆盖；切回精确历史空间引用可恢复旧设置。安全激活并重开后使用新任务验收。App-server 协议通过不能替代 App UI 签核，批量调用也不保证每次任务都减少轮次。
-
-内置两个预设：
-
-| preset | App 模型 ID | 上游模型 | 配置窗口 |
-|---|---|---|---|
-| `feei/gpt-5.6-sol` | `feei-gpt-5.6-sol` | `gpt-5.6-sol` | 272,000 |
-| `feei/gpt-6-astra` | `feei-gpt-6-astra` | `gpt-6-astra` | 272,000 |
-
-两者声明文本/图片输入、freeform 工具、`summary` 压缩、`modelFamily: "openai-gpt"` 和 272,000 的保守窗口。CLI 新建 target 时会叠加 `standard-tools`；旧的纯 preset 或显式 Lite 配置保留原传输，只有搜索生效时才按 `lite-search` 解析，避免静默迁移或能力夸大。272,000 不代表已验证更大容量。
-
-```bash
-printf '%s' "$FEEI_API_KEY" | codex-local-router provider add \
-  --id feei --base-url https://ai.feei.cn/v1 \
-  --adapter openai-compatible --credential-stdin --yes
-codex-local-router model add --id feei-sol --provider feei \
-  --preset feei/gpt-5.6-sol --yes
-codex-local-router model add --id feei-astra --provider feei \
-  --preset feei/gpt-6-astra --yes
-```
-
-以上命令创建 `standard-tools` target。若要让其中一款显式改用独立订阅搜索：
-
-```bash
-codex-local-router model edit --id feei-sol \
-  --app-profile lite-search --search-source subscription --yes
-```
-
-API Key 保存在独立 Keychain 项或由 `FEEI_API_KEY` 提供，不得写入配置。App 模型 ID 带 `feei-` 前缀，不冒用官方模型 ID。
-
-CLI 新建两款 target 时默认写入 `app.capabilityProfile: "standard-tools"`、`useResponsesLite: false` 与禁用的独立搜索；显式增加 `--app-profile lite-search` 才启用 Responses Lite 和选定的订阅/Provider 搜索。`capabilities.nativeWebSearch: false` 表示不宣称 ai.feei 支持嵌入模型请求的 hosted search。既有显式 Lite 配置不变。搜索是否发生仍由 Codex 运行时、catalog 和用户设置共同决定。为兼容 Codex 感知型中转，第三方 GPT Responses 请求只保留不含身份的客户端协商 Header；订阅凭证及账号/session/request/install 关联均留在本机。OpenAI 文档同样要求自定义 Provider、模型和运行时共同支持独立搜索：[Web search](https://learn.chatgpt.com/docs/web-search)。
+多个 target 一次提交为同一个不可变空间版本，分别保留空间默认模型和 Codex 当前选模。`--tool-mode default` 清除覆盖；切回精确历史空间引用可恢复旧设置。安全激活并重开后使用新任务验收。App-server 协议通过不能替代 App UI 签核，批量调用也不保证每次任务都减少轮次。具体 Provider preset、模型 ID 和接入命令见 [Provider 指南](providers.zh-CN.md)。
 
 ## 第三方 App 能力画像
 
@@ -98,7 +66,7 @@ CLI 新建两款 target 时默认写入 `app.capabilityProfile: "standard-tools"
 }
 ```
 
-`affinity` 只接受 `none`、`gateway-opaque`。未配置等价于 `none`；包括 ai.feei 在内的 preset 都不会因升级自动启用。通过配置空间 revision 显式修改：
+`affinity` 只接受 `none`、`gateway-opaque`。未配置等价于 `none`；所有 preset 都不会因升级自动启用。通过配置空间 revision 显式修改：
 
 ```bash
 codex-local-router provider edit --id example \

@@ -1,39 +1,54 @@
-# 兼容性
+# 兼容性与准出
 
-| 组件 | 0.5.6 Release 状态 |
-|---|---|
-| macOS / Node.js 22 | 支持；Node 仍把内置 SQLite 标记为 experimental |
-| Codex CLI 0.155.0-alpha.2.6 | 当前 Release 驱动基线，验收记录二进制 SHA-256 |
-| Codex App | app-server 协议可自动验收，真实 UI 必须单独确认 |
-| 官方订阅 HTTP/WS/辅助接口 | 固定目的地透明 Relay |
-| BigModel GLM 5.3 / Flash | 标准 Responses 形态及 Flash 订阅桥接通过有界 Release 门；用户 MCP 仍是独立客户端能力 |
-| OpenCode Go DeepSeek | 既有 legacy 接入保留；通用模板、Code mode 与多代理 v2 尚未准出 |
-| ai.feei Sol / Astra Responses | 有内置预设；Sol 订阅桥接与客户端 Tavily 路径通过有界 Release 矩阵，其他 live 组合仍需各自证据 |
-| Linux / Windows | v0.5.6 不声明支持 |
-| 运行时配置 Schema 3 | 保持兼容，活动 Router 空间物化为原格式 |
-| 配置空间 Schema 1 | 本机不可变 revision 与单一切换事务 |
-| 集成状态 Schema 4 | 关联受保护 official 与当前物化 Router revision |
+[English](compatibility.md)
 
-Gateway 能力与真实渠道健康度分别准出。本地确定性夹具可以验证路由、身份、协议、生命周期、工具、历史和性能不变量，即使某个真实 Provider 当时不可用；真实渠道则单独记录为 `HEALTHY`、`EXTERNAL_DEGRADED`、`GATEWAY_DEFECT` 或 `UNVERIFIED`。只有 `HEALTHY` 会进入 ready set，而可归因于 Gateway 的缺陷仍然阻断 Core。
+本矩阵把“可以配置”和“已经取得证据”分开。存在 preset 或可填写 endpoint，不构成完整支持承诺；真实结论只属于精确命名的 Provider、模型与路径。
 
-第三方 Responses 无法假设官方服务端工具缓存，因此 Codex 可能携带完整工具面。通用模板的标准策略只裁剪已确认且不在白名单的结构化 Plugin；允许 Plugin、核心工具、用户 MCP 及嵌入 `exec` 的不透明定义仍会占用上下文，不承诺固定 token 降幅。
+| 组件或路径 | 可用性 | 确定性覆盖 | 最近运行时真实证据 | App UI |
+|---|---|---|---|---|
+| macOS / Node.js 22 | 支持 | 默认完整测试 | Release 打包验证 | 本机安装后人工确认 |
+| Linux / Windows | 不支持 | 无 | 无 | 无 |
+| ChatGPT 订阅 HTTP/WS 与辅助接口 | 内置 | 固定目的地 Relay、身份、历史和搜索 | v0.5.6 官方 cached/live 有界验收 | 每个已安装 App 单独确认 |
+| OpenCode Go DeepSeek preset | 内置 preset；legacy 路径 | legacy Responses 适配 | 当前 Release 无真实用例 | 不声明 |
+| ai.feei GPT 5.6 Sol | 内置 preset | Responses、GPT 策略、搜索／缓存／指令路径 | v0.5.6 订阅桥接与客户端 MCP 用例 | 每个已安装 App 单独确认 |
+| ai.feei GPT 6 Astra | 内置 preset | 同一声明协议族 | 当前 Release 无真实用例 | 当前 Release 不声明 |
+| BigModel GLM 5.3 Flash | 支持公开配置 | 标准 Responses、工具、续接与桥接 | v0.5.6 订阅搜索桥接 | 每个已安装 App 单独确认 |
+| BigModel GLM 5.3 main | 支持公开配置 | 通用标准 Responses 覆盖 | 当前无模型专项真实用例 | 不声明 |
+| 通用 OpenAI-compatible Responses | 支持公开配置 | 通用适配器与协议夹具 | 需要 Provider 专项 probe | 按 Provider 单独确认 |
+| 通用 OpenAI-compatible Chat Completions | 支持公开配置 | JSON function-tool 适配 | 需要 Provider 专项 probe | 按 Provider 单独确认 |
 
-新建且能力满足、preset 已通过 Provider 准出的第三方 App target 默认使用通用模板；`lite-search`、官方 GPT 指令快照和缓存亲和均需显式选择。Chat Completions 或缺少 freeform 工具能力的 target 必须使用 `legacy`。OpenCode Go DeepSeek preset 会为自身选择 `legacy`，并拒绝直接开启尚未准出的 Code mode 或多代理 v2。
+精确驱动版本、二进制哈希、调用预算、性能测量和历史失败只保存在对应[冻结证据](evidence/README.zh-CN.md)或 GitHub Release，不进入长期有效的兼容性矩阵。
 
-已有任务从其他 Provider 切到 `lite-search` 时，Router 会删除历史 Lite 声明，只恢复当前请求携带的 `additional_tools`。因此核心工具和通过既有 Plugin 策略的客户端工具在切换后仍可调用；这不会把缩减的 Lite 画像升级为完整 `standard-tools` 工具面。
+## 状态术语
 
-独立搜索要求 Codex 运行时、模型 catalog 与用户设置同时允许。`standard-tools` 不广告独立搜索；显式 `lite-search` 使用 Responses Lite 和选定来源。对未声明原生 hosted-search 的 target，如果仍出现顶层 hosted-search 载体则明确失败，避免搜索在错误渠道执行。CLI 新建 ai.feei target 默认 `standard-tools`，需要时可显式选择订阅或 Provider 搜索；官方模型始终强制使用订阅。没有 `app` 声明的旧 GPT target 保持既有默认；显式 App-disabled GPT target 不继承空间默认或旧 native-search 广告，但显式 target 策略与旧 App 搜索别名仍按更高优先级解析，Provider 搜索依然要求 App-enabled Responses target。非 GPT 与其他旧 target 保持旧行为。Provider endpoint 不根据模型名或 `/models` 推断，选定来源失败也不会切换到其他来源。
+- **Preset available**：CLI 内置了命名 preset。
+- **Configuration supported**：公开 Schema 与 CLI 能表达该渠道。
+- **Deterministic tested**：无凭证本地夹具覆盖声明的 Gateway 行为。
+- **Live release-qualified**：指定 Release 的有界真实渠道用例通过。
+- **App UI confirmed**：用户安装后另行确认 App 实际显示与交互。
 
-显式 `subscriptionSearch.delivery: "standard-tool"` 是第三方标准 Responses target 的模型家族无关路径：只有当前 Codex 请求启用搜索时才暴露一个普通函数，使用订阅身份访问固定 OpenAI 目的地，并把有界、不可信结果送回既有工具循环。它不会启用 Lite、Provider 原生 hosted search 或 `/v1` 的订阅权限。用户 MCP 搜索仍由客户端负责，并可能经当前 Codex 的 `tool_search` 延迟发现。详见[通用搜索](universal-search.zh-CN.md)。
+这些状态不能相互推导。渠道健康度也与 Gateway 责任分离：失败可以归类为 `EXTERNAL_DEGRADED`、`GATEWAY_DEFECT` 或 `UNVERIFIED`，但只有完整正向证据才能形成 live-ready 结论。
 
-桥接可在单个 turn 内多次搜索，上限由 `webSearch.maxRounds` 控制（默认 3，范围 1-10）；下一次调用返回 `tool_loop_limit`，不重试也不回退。内部搜索调用不会作为客户端工具 item 展示；普通文本和客户端可见工具仍立即流式转发，因此隐藏搜索不等于整轮缓存。
+## 稳定兼容边界
 
-每个模型 turn 会冻结一份按 turn/thread/session/account 关联的搜索路由。`/subscription/v1/alpha/search` 先验证订阅身份，再选择固定 OpenAI 后端，或剥离订阅身份并换成目标 Provider Key。关联缺失或冲突会明确失败。第一版即使选择 Provider 搜索也仍要求有效 Codex 登录；本地 `/v1/alpha/search` 始终不开放。
+- 运行时配置保持 Schema 3。
+- 配置空间保持 Schema 1。
+- 集成状态保持 Schema 4。
+- 官方订阅走固定目的地透明 Relay；本地 `/v1` 永远不能借用订阅身份。
+- 标准 Responses 是第三方 App 的主要接入面；Chat Completions 不能承载 namespace 或 freeform 工具。
+- 既有配置不会在加载时自动获得模板、Lite、搜索、缓存亲和或指令快照。
+- 用户 MCP 继续由客户端持有，Router 不复制配置和凭证。
 
-官方 HTTP 和 WSS Relay 使用同一机器代理边界：优先识别 `WS_PROXY` / `WSS_PROXY`，兼容回退到 `HTTP_PROXY` / `HTTPS_PROXY`，再使用通用 `ALL_PROXY`，并始终遵守 `NO_PROXY`。如果安装进程显式使用 `NODE_EXTRA_CA_CERTS`，受管服务和一次性切换器会把该 CA 文件路径与代理变量一起保留；Provider 凭证变量和任意 `NODE_OPTIONS` 不会被复制。运行时支持时，官方 WSS 会合并 Node 默认与系统 CA，同时保持证书和主机名校验，只记录白名单内的 TLS 错误码。代理凭证由代理 agent 处理，不进入官方端到端 Header 或 Router 日志。
+## 工具与搜索限制
 
-官方 HTTP/WS 续接会区分 response 来源。透明官方 Relay 观察到的 response 可以继续原生、保持字节透明；Engine 或本地协议步骤生成的 response 则从加密历史回放，不会把本地 ID 作为上游 `previous_response_id` 发送。缺少来源标记的旧记录也选择安全回放。这样，工具结果续接不会因为前一条 response 实际由 Gateway 生成而被新的官方透明连接拒绝。
+第三方 Provider 不能假设官方后端存在服务端工具处理。通用 Plugin 策略只缩减已确认的结构化 Plugin 定义；核心工具、允许 Plugin、用户 MCP 和嵌在 `exec` 说明中的不透明 schema 仍可能占用上下文。该策略用于上下文控制，不是安全沙箱，也不承诺固定 token 降幅。
 
-完整的动态工具搜索历史可以在官方与第三方 Responses 之间迁移，也可通过固定、无 schema 的历史标记进入 Chat Completions。目标渠道不会收到原搜索参数、Provider 执行元数据、item ID、工具名、描述或 schema；普通函数/custom-tool 调用和结果继续保留。pair 缺失或歧义时返回 `tool_search_history_incomplete`，不回退、不重试。该能力不能恢复 Router 从未观察到完整原文的旧官方 opaque compaction；这类会话仍需要既有可移植 checkpoint。
+`standard-tool` 订阅搜索桥接与模型家族无关，但仍要求标准 Responses function call 和结果续接。搜索只在固定 OpenAI 目的地使用订阅身份，模型生成只使用 Provider 凭证。Provider 原生 hosted search、Responses Lite 独立搜索和用户 MCP 搜索继续是不同路径，不存在隐藏回退。详见[通用搜索](universal-search.zh-CN.md)。
 
-英文完整矩阵见 [compatibility.md](compatibility.md)。
+## 依赖新组合前
+
+1. 在 [Provider 接入](providers.zh-CN.md)中核对 Provider／模型声明。
+2. 先运行 `status`、`doctor` 和非 live 的 `model list`。
+3. 只有接受额度消耗时才执行显式 live probe。
+4. 区分模型菜单可见、app-server 完成与 App UI 人工确认。
+5. Codex 客户端、协议、Provider 或工具集合显著变化后重新验收。

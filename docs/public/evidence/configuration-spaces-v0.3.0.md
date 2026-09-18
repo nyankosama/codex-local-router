@@ -1,5 +1,9 @@
 # Configuration spaces candidate acceptance
 
+> **Frozen evidence**  
+> Applies to: `v0.3.0` configuration-space candidate.  
+> This immutable record does not describe the current release, installed service, or Provider health.
+
 Date: 2026-09-13
 Implementation baseline: `de0548d`
 

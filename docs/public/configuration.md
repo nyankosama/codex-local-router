@@ -81,7 +81,7 @@ Before activating code mode, compare the same client binary, target, prompt, ins
 Batch preview (add `--yes` only after qualification and in an App-closed rollout window):
 
 ```bash
-codex-local-router model set-tool-mode --ids feei-sol,feei-astra \
+codex-local-router model set-tool-mode --ids target-a,target-b \
   --tool-mode code_mode_only --space default --json
 ```
 
@@ -116,7 +116,7 @@ Provider cache affinity is opt-in and applies to compatible third-party Response
 }
 ```
 
-`affinity` accepts `none` or `gateway-opaque`. An absent field is the same effective policy as `none`; presets, including ai.feei, do not enable it automatically. Configure it through an immutable space revision:
+`affinity` accepts `none` or `gateway-opaque`. An absent field is the same effective policy as `none`; no preset enables it automatically. Configure it through an immutable space revision:
 
 ```bash
 codex-local-router provider edit --id example \
@@ -220,16 +220,18 @@ codex-local-router provider add --id my-provider \
   --credential-prompt \
   --concurrency 4 --yes
 
-# 2. Target: declare the protocol, window, modalities, and compression mode.
+# 2. Target: start with a conservative Standard Responses contract.
 codex-local-router model add --id my-model \
   --provider my-provider \
   --upstream-model the-upstream-model-id \
-  --protocol chat_completions \
-  --context-window 200000 \
+  --protocol responses \
+  --context-window 128000 \
   --input-modalities text \
   --compression unsupported \
+  --template legacy \
+  --no-freeform-tools \
   --display-name "My Model" \
-  --reasoning-levels low,medium,high,xhigh \
+  --reasoning-levels low,medium,high \
   --yes
 
 # 3. Apply, then refresh what the Codex App sees, then verify end to end.
@@ -238,29 +240,7 @@ codex-local-router integration sync --yes
 codex-local-router model probe --id my-model --live
 ```
 
-A target can name the built-in preset `opencode-go/deepseek-v4.1-flash` with `--preset`. That preset currently selects the accepted `legacy` path and rejects generic-template, Code-mode and multi-agent overrides until its Provider is requalified. Other explicit flags still override ordinary preset values.
-
-For ai.feei, store the credential independently and create two targets with the built-in presets:
-
-```bash
-printf '%s' "$FEEI_API_KEY" | codex-local-router provider add \
-  --id feei --base-url https://ai.feei.cn/v1 \
-  --adapter openai-compatible --credential-stdin --yes
-
-codex-local-router model add --id feei-sol --provider feei \
-  --preset feei/gpt-5.6-sol --yes
-codex-local-router model add --id feei-astra --provider feei \
-  --preset feei/gpt-6-astra --yes
-```
-
-Those commands create `standard-tools` targets. To opt one target into independent subscription search instead:
-
-```bash
-codex-local-router model edit --id feei-sol \
-  --app-profile lite-search --search-source subscription --yes
-```
-
-The App-visible IDs intentionally remain `feei-gpt-5.6-sol` and `feei-gpt-6-astra`; they do not impersonate official catalog IDs. A new CLI-created target sets `modelFamily: "openai-gpt"`, `app.capabilityProfile: "standard-tools"`, `useResponsesLite: false`, and `standaloneSearch.source: "disabled"`. To opt into the subscription-search split, add `--app-profile lite-search`; an optional `--search-source provider` still requires an explicit Provider endpoint. `capabilities.nativeWebSearch` remains false because the presets do not claim that ai.feei implements an embedded hosted-search tool. Codex still honors the user's runtime search setting; the router does not force search on. Existing explicit Lite configurations are unchanged. For Codex-aware relay compatibility, third-party GPT Responses sends retain only the non-identity client negotiation headers; subscription credentials and all account/session/request/install correlation remain local. OpenAI's custom-provider documentation likewise requires a compatible endpoint and model/runtime support for standalone search: [Web search](https://learn.chatgpt.com/docs/web-search).
+Built-in presets, Provider-specific commands, public examples, and their qualification status are maintained in the [Provider guide](providers.md). Keep the generic configuration reference neutral; a preset does not turn capability metadata into live evidence.
 
 Declarations are validated rather than guessed:
 

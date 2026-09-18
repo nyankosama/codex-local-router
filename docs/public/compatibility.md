@@ -1,59 +1,54 @@
-# Compatibility matrix
+# Compatibility and qualification
 
-| Component | v0.5.6 release status |
-|---|---|
-| macOS | Supported |
-| Node.js 22 | Supported; Node currently labels built-in SQLite experimental |
-| Codex CLI 0.155.0-alpha.2.6 | Current release driver; exact binary SHA is recorded by the harness |
-| Codex App | App-server integration baseline; UI reload must be verified for each installed build |
-| ChatGPT subscription HTTP/WS and auxiliary APIs | Fixed-origin transparent relay; model/search queries and future paths covered locally |
-| BigModel GLM 5.3 / Flash | Standard Responses shape and GLM Flash subscription bridge pass the bounded release gate; client-owned MCP remains a separate client capability |
-| OpenCode Go DeepSeek | Existing legacy integration supported; generic template, Code mode and multi-agent v2 are not qualified |
-| ai.feei GPT 5.6 Sol / GPT 6 Astra Responses | Built-in presets; Sol subscription bridge and client-owned Tavily path pass the bounded release matrix, while other live combinations require their own evidence |
-| Generic OpenAI-compatible Responses | Configuration support; provider capability requires live probe |
-| Generic OpenAI-compatible Chat Completions | Configuration support with JSON function tools |
-| Linux / Windows | Not supported in v0.5.6 |
-| Runtime configuration schema 3 | Preserved; active Router space materializes into the existing format |
-| Configuration-space schema 1 | Local immutable revisions and one switch transaction |
-| Integration state schema 4 | Links protected official and materialized Router revisions |
+[简体中文](compatibility.zh-CN.md)
 
-The DeepSeek preset records the accepted provider-model combination and is explicitly legacy-only. A configured Responses/freeform capability is not sufficient to enable generic-template behavior until the real Provider accepts that Codex payload.
+This matrix separates configuration availability from evidence. A preset or configurable endpoint is not a blanket support claim, and a live result applies only to the named Provider/model/path.
 
-New eligible App-enabled third-party models use `codex-general-v1`; protocol capabilities, rather than GPT naming, gate code mode and direct multi-agent v2 metadata. Chat Completions and models without freeform tools require explicit `legacy`. Existing configurations do not migrate. Official snapshots, Lite, standalone search and cache affinity remain opt-in.
+| Component or path | Availability | Deterministic coverage | Latest runtime live evidence | App UI |
+|---|---|---|---|---|
+| macOS / Node.js 22 | Supported | Full default suite | Release packaging | Manual installation check |
+| Linux / Windows | Not supported | None | None | None |
+| ChatGPT subscription HTTP/WS and auxiliary APIs | Built in | Fixed-origin relay, identity, history and search | v0.5.6 bounded official cached/live search | Manual per installed App |
+| OpenCode Go DeepSeek preset | Preset available; legacy path | Legacy Responses adapter | No current release case | Not claimed |
+| ai.feei GPT 5.6 Sol | Preset available | Responses, GPT policy, search/cache/instruction paths | v0.5.6 subscription bridge and client-owned MCP cases | Manual per installed App |
+| ai.feei GPT 6 Astra | Preset available | Same declared protocol family | No current release case | Not claimed by current release |
+| BigModel GLM 5.3 Flash | Configuration supported | Standard Responses, tools, continuation and bridge | v0.5.6 subscription-search bridge | Manual per installed App |
+| BigModel GLM 5.3 main | Configuration supported | Generic Standard Responses coverage | No model-specific current release case | Not claimed |
+| Generic OpenAI-compatible Responses | Configuration supported | Generic adapter and protocol fixtures | Provider-specific probe required | Provider-specific |
+| Generic OpenAI-compatible Chat Completions | Configuration supported | JSON function-tool adapter | Provider-specific probe required | Provider-specific |
 
-Gateway capability and live channel health are qualified independently. Deterministic local fixtures can qualify routing, identity, protocol, lifecycle, tools, history, and performance invariants even when a real Provider is unavailable. A live channel is reported separately as `HEALTHY`, `EXTERNAL_DEGRADED`, `GATEWAY_DEFECT`, or `UNVERIFIED`; only `HEALTHY` belongs in a ready set, while a Gateway-owned defect still fails the Core gate.
+Exact driver versions, binary hashes, budgets, measurements, and historical failures belong to the corresponding [frozen evidence](evidence/README.md) or GitHub Release. They are intentionally absent from this evergreen matrix.
 
-## Custom providers and the client tool surface
+## Status vocabulary
 
-The official ChatGPT backend can provide its own server-side tool surface. A target declared with `wireApi: responses` and `useResponsesLite: false` cannot rely on that, so the Codex client sends the tool definitions needed by the third-party provider.
+- **Preset available**: the CLI ships a named preset.
+- **Configuration supported**: public schema and CLI can express the channel.
+- **Deterministic tested**: credential-free local fixtures cover the declared Gateway behavior.
+- **Live release-qualified**: a bounded real-channel case passed for the named release.
+- **App UI confirmed**: a user separately verified the rendered App experience after installation.
 
-On an install with Codex Apps connected, that surface is dominated by the app namespaces rather than by the built-in tools. Measured on one such install with a trivial prompt, one request to a custom target carried 21 tool definitions totalling 306 KB, of which about 293 KB was ten `mcp__codex_apps__*` namespaces (figma, github, gmail, alpaca, sites, tavily_ai, plugin_management, codex_document_control, safety_settings, hotline) and roughly 8 KB was built-in tools (`exec_command`, `apply_patch`, `view_image`, and similar). The provider reported 97,610 input tokens for that turn, against 16,197 for the same prompt on an official model.
+These states do not imply each other. Channel health is also separate from Gateway ownership: a run may classify a failure as `EXTERNAL_DEGRADED`, `GATEWAY_DEFECT`, or `UNVERIFIED`, but only complete positive evidence supports a live-ready claim.
 
-The generic third-party template narrows only confirmed structured Plugin tools. The standard allowlist is `github`, `figma`, `sites`, and `connected_documents`; the last identity covers `spreadsheets` and `codex_document_control`. Codex built-ins, `codex_app`, `cua_repl`, router search, and user-configured MCP stay available. Unknown or colliding sources are passed and diagnosed rather than guessed. Existing non-GPT and legacy targets keep their previous behavior until explicitly updated.
+## Stable compatibility boundaries
 
-Consequences and limits:
+- Runtime configuration remains schema 3.
+- Configuration-space storage remains schema 1.
+- Integration state remains schema 4.
+- Official subscription traffic uses a fixed-destination transparent relay; local `/v1` access never borrows subscription identity.
+- Standard Responses is the primary third-party App surface. Chat Completions cannot carry namespace or freeform tools.
+- Existing configurations do not acquire new templates, Lite, search, cache affinity, or instruction snapshots on load.
+- User MCP remains client-owned. The Router does not copy its configuration or credentials.
 
-- Allowed Plugin schemas and all core/user-MCP schemas still count toward the third-party context. The policy reduces known unnecessary Plugin overhead; it does not promise a fixed token reduction.
-- New eligible third-party App targets materialize `standard-tools`, code mode and multi-agent v2; standalone search remains disabled until explicitly selected.
-- `lite-search` is an explicit Responses Lite opt-in. Current Codex requires its `input[].additional_tools` / `web.run` carrier for standalone search, but the observed Lite Plugin/MCP surface is reduced and is not claimed as full tool compatibility. Both carriers remain covered by the same Plugin policy where their tools are present.
-- When an existing task switches from another Provider to `lite-search`, the router removes historical Lite declarations and restores only the current request's `additional_tools` carrier. Core tools and every client-provided tool that passes the existing Plugin policy therefore remain callable after the switch; this does not upgrade the reduced Lite profile into the full `standard-tools` surface.
-- A forbidden direct Plugin call is stopped before client execution. Indirect use through shell/code, unrecognized sources, and tool names preserved inside historical prose are outside this guarantee.
-- Chat Completions cannot carry namespace tools and continues to omit them with a metadata-only diagnostic after the Plugin policy has run.
+## Tool and search limits
 
-## Standalone web search
+Third-party providers cannot assume the official backend's server-side tool handling. The generic Plugin policy narrows only confirmed structured Plugin definitions; core tools, allowed Plugins, user MCP, and opaque schemas embedded in `exec` documentation can still consume context. It is a context-control policy, not a sandbox or a fixed token-reduction promise.
 
-An explicit `subscriptionSearch.delivery: "standard-tool"` is the model-family-neutral alternative for third-party Standard Responses targets. It exposes subscription search as one ordinary function only when the current Codex request enables search, executes the call at the fixed OpenAI destination with subscription identity, and returns bounded untrusted results through the existing tool loop. It does not turn on Lite, Provider-native hosted search, or `/v1` subscription access. User MCP search remains client-owned and may be deferred behind the current Codex `tool_search` discovery function. See [universal search](universal-search.md).
+The `standard-tool` subscription-search bridge is model-family neutral but still requires Standard Responses function calls and result continuation. It uses only subscription identity at the fixed OpenAI destination and only Provider credentials for model generation. Provider-native hosted search, Responses Lite standalone search, and user MCP search remain distinct paths with no hidden fallback. See [universal search](universal-search.md).
 
-The bridge can execute multiple searches in one turn up to `webSearch.maxRounds` (default 3, range 1-10); the next call fails with `tool_loop_limit`, without retry or fallback. Its internal calls are not rendered as client tool items. Ordinary text and client-visible tools continue to stream immediately, so hidden search execution does not imply whole-turn buffering.
+## Before depending on a new combination
 
-The effective `standaloneSearch` policy controls whether the generated Codex catalog advertises the client's standalone search capability. It is intentionally separate from `capabilities.nativeWebSearch`, which declares a provider-hosted tool embedded in model generation. Current Codex carries standalone search as Responses Lite `web.run`; `standard-tools` therefore disables it, while explicit `lite-search` requires an active source. A mismatched top-level hosted-search request to a target without declared native hosted search fails instead of executing on an unintended provider. New ai.feei targets created by the CLI default to `standard-tools`; explicit `lite-search` normally inherits the `openai-gpt` subscription source. Native hosted search remains disabled.
-
-Search only works when the Codex runtime, selected catalog model, and user search setting all allow it. The router does not override a user-disabled setting. Official models are forced to subscription search. A third-party GPT `lite-search` target may use subscription search or explicitly select a compatible Provider endpoint; `standard-tools` does not advertise standalone search. App-absent legacy GPT targets keep their existing default, while explicitly App-disabled GPT targets do not inherit the space default or the legacy native-search advertisement. An explicit target policy or legacy App search alias retains its documented higher precedence, although Provider search still requires an App-enabled Responses target. Non-GPT and other legacy targets keep their old behavior. A Provider endpoint is never inferred from a model name or `/models` response, and a failed source never falls back to another source.
-
-Each model turn freezes a correlation-scoped search route. `/subscription/v1/alpha/search` validates the subscription identity first, then either reaches the fixed OpenAI backend or replaces that identity with the selected Provider key. Ambiguous or missing scoped routes fail explicitly. `/v1/alpha/search` remains unavailable, so a local API key cannot acquire subscription identity. This first version still requires a valid Codex subscription login even when the selected search source is a Provider.
-
-Official HTTP and secure WebSocket relays share the machine's proxy boundary. WebSocket-specific `WS_PROXY` / `WSS_PROXY` take precedence when present; `HTTP_PROXY` / `HTTPS_PROXY` are compatible fallbacks, `ALL_PROXY` remains the generic fallback, and `NO_PROXY` is honored. When the installer process explicitly uses `NODE_EXTRA_CA_CERTS`, the managed service and one-shot switcher preserve that CA file path together with the proxy variables; Provider credential variables and arbitrary `NODE_OPTIONS` are never copied. Official WSS combines Node's default and system CA sets where the runtime supports that API, keeps certificate and hostname verification enabled, and logs only an allowlisted TLS error code. Proxy credentials are handled by the proxy agent and are never copied into the official end-to-end header set or Router logs.
-
-Official continuation is provenance-aware across HTTP and WebSocket. A response observed on the opaque official relay may continue natively and remains byte-transparent. A response created by the Engine or another local protocol operation is replayed from encrypted history instead; its local ID is never forwarded as an upstream `previous_response_id`. Legacy retained records without provenance take the safe replay path. This distinction prevents a tool-result continuation from failing merely because its predecessor was generated by the Gateway rather than by the active opaque relay session.
-
-Completed dynamic tool-search history is portable across official and third-party Responses targets and into Chat Completions through a fixed schema-free marker. The destination does not receive the original search query, provider execution metadata, IDs, tool names, descriptions, or schemas. Ordinary function/custom-tool calls and results remain portable. An incomplete or ambiguous pair fails as `tool_search_history_incomplete` without fallback or retry. This does not make an old opaque official compaction portable when the Router never observed its full source history; that case still requires an existing portable checkpoint.
+1. Confirm the Provider/model declaration in [Provider setup](providers.md).
+2. Run `status`, `doctor`, and a non-live `model list` first.
+3. Use an explicit live probe only when quota use is acceptable.
+4. Treat model menu visibility or app-server completion as different from App UI confirmation.
+5. Requalify after a material Codex client, protocol, Provider, or tool-inventory change.
