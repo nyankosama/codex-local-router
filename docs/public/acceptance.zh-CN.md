@@ -1,7 +1,6 @@
 # 验收说明
 
-本次配置空间候选记录见[配置空间候选验收报告](configuration-spaces-acceptance.zh-CN.md)。
-v0.4.0 第三方独立搜索记录见[第三方 OpenAI 搜索验收报告](third-party-openai-search-acceptance.zh-CN.md)。隔离 CLI/App 协议真实门禁已通过；App UI 和本机安装生效仍需单独确认。
+历史冻结记录包括[配置空间候选验收报告](configuration-spaces-acceptance.zh-CN.md)和 [v0.4.0 第三方 OpenAI 搜索验收报告](third-party-openai-search-acceptance.zh-CN.md)。它们只描述对应版本与当时环境，不能当作当前本机状态；当前发布准出规则见下文。
 
 PR 门禁使用 A1-A10 十组等价类：策略解析、来源/名单、工具载体、调用闭环、HTTP 透明性、WS 生命周期、身份边界、历史兼容、产品/隔离、证据/预算。它们由纯函数和本地模拟上游完成，不调用真实模型。
 
@@ -15,7 +14,7 @@ PR 门禁使用 A1-A10 十组等价类：策略解析、来源/名单、工具�
 
 L0-L2 和能力画像门禁均为零凭证、零外网的确定性测试：它们仍会驱动当前 App 内置 Codex core，但官方、Provider 与搜索上游全部由本地注入夹具响应。只有带显式 `--run` 的 live canary 才会读取对应凭证并访问真实上游；默认 `npm test`、`npm run e2e` 和各层门禁不会触发真实渠道。
 
-本轮配置空间候选明确不运行 `e2e:focused -- --run`，真实模型调用为零。门禁前后需确认本机 Router/切换器未加载、8788 未监听、integration 为 disabled、真实 Codex 仍是内置 `openai`。App-server 不能替代后续 UI 签核。
+历史配置空间候选明确未运行 `e2e:focused -- --run`，真实模型调用为零；当时的环境核对继续保留在冻结报告中。当前 App-server 验收仍不能替代 UI 签核。
 
 ```bash
 npm test
@@ -72,7 +71,7 @@ npm run e2e:prompt-cache -- --live-app-candidate --run  # 当前 App 二进制�
 
 缓存亲和采用分阶段 fail-closed 门禁。缺省 `e2e:prompt-cache` 零外网，要求 HMAC 派生 p95 小于 5ms、请求体适配 p95 小于 25ms、Wire 增量小于 128 bytes。当前效果门使用 `--live-comparison --run`：Sol/Astra 共 24 次交错、零重试生成，在请求其余部分固定的条件下比较原始直连形态和候选匿名 key。随后 `--live-app-candidate --run` 使用当前 App 内置 Codex 二进制、临时 Codex/Router Home 和隔离 Gateway，Provider 生成不超过 6 次；每款模型必须完成一个只读 MCP call/result 和下一 turn，同时观察到匿名键指纹稳定、逐 frame Lite Header 正确且订阅/Provider 身份不串线。缺失 usage 记为未知，不记作 0。旧的 `--live-feasibility`、`--live-gateway` 和 `--live-app-protocol` 仍用于复查历史候选，不再构成本轮 30 次准出门。
 
-历史 ai.feei 可行性尝试在第 1 次 control 请求收到 HTTP 403 后停止，该记录继续保留。后续 35 次因果诊断没有覆盖它：35 次合成请求全部完成，严格单变量对照中 Sol 从无 key 的 30.11% 加权缓存复用上升到 Gateway 匿名 key 的 98.55%。这证明特定工作负载下 Gateway 可控字段的效果，不证明 ai.feei 内部账号池算法，也不承诺自然会话固定命中率。当前候选仍必须重新通过 Sol/Astra 与 App 协议门，才能进入本机启用。
+历史 ai.feei 可行性尝试在第 1 次 control 请求收到 HTTP 403 后停止，该记录继续保留。后续 35 次因果诊断没有覆盖它：35 次合成请求全部完成，严格单变量对照中 Sol 从无 key 的 30.11% 加权缓存复用上升到 Gateway 匿名 key 的 98.55%。这证明特定工作负载下 Gateway 可控字段的效果，不证明 ai.feei 内部账号池算法，也不承诺自然会话固定命中率。任何修改缓存亲和的版本仍必须重新通过 Sol/Astra 与 App 协议门，才能启用。
 
 `e2e:tool-search-history` 先用当前 App 内置 app-server 验证新会话模型切换，再通过真实 Gateway HTTP 身份与加密归档边界复现受影响的存量 response 链。它只使用合成 auth/凭证、本地 Provider、注入的官方响应、随机端口和临时 Home；断言目标只收到一个固定标记，不收到动态 schema、查询或 Provider 标识，同时加密归档中的原 pair 保持字节等价。它不会重试真实会话，也不会连接任何外部上游。
 

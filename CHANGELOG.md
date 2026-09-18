@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.5 - 2026-09-18
+
+- Refresh the English and Chinese README, compatibility matrix, search guide and acceptance overview so current release behavior is separated from frozen historical candidate records.
+- Document hidden internal subscription-search calls, bounded multi-search rounds and immediate streaming of client-visible text and ordinary tools. Runtime routing behavior is unchanged from v0.5.4.
+
 ## 0.5.4 - 2026-09-18
 
 - Stream ordinary text and client tool events immediately when subscription search or legacy search fallback is enabled, including turns that never search. Hide only internal search calls, keep one client response lifecycle across internal generations, and preserve private search results for continuation.

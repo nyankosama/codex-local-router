@@ -37,17 +37,18 @@ When a retained conversation crosses providers, provider-specific dynamic tool-s
 - Node.js 22 or later
 - Codex CLI and Codex App versions listed in the [compatibility matrix](docs/public/compatibility.md)
 - Responses and Chat Completions providers
-- ChatGPT subscription routing, OpenCode Go, ai.feei GPT presets, and generic OpenAI-compatible providers
+- ChatGPT subscription routing, OpenCode Go, ai.feei GPT presets, BigModel GLM 5.3/Flash Standard Responses, and generic OpenAI-compatible providers
+- Client-owned MCP search and the explicit OpenAI subscription-search bridge for eligible third-party Standard Responses models
 
-Other operating systems and vendor-specific protocols are not claimed as supported in v0.5.4.
+Other operating systems and vendor-specific protocols are not claimed as supported in v0.5.5.
 
 ## Install from a GitHub Release
 
-Download the `.tgz` and SHA-256 file from the `v0.5.4` release, verify it, and install it locally:
+Download the `.tgz` and SHA-256 file from the `v0.5.5` release, verify it, and install it locally:
 
 ```bash
-shasum -a 256 -c codex-local-router-0.5.4.tgz.sha256
-npm install -g ./codex-local-router-0.5.4.tgz
+shasum -a 256 -c codex-local-router-0.5.5.tgz.sha256
+npm install -g ./codex-local-router-0.5.5.tgz
 codex-local-router --version
 ```
 

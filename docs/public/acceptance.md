@@ -1,7 +1,6 @@
 # Acceptance harness
 
-The current configuration-space candidate record is [configuration-spaces-acceptance.md](configuration-spaces-acceptance.md).
-The v0.4.0 third-party standalone-search record is [third-party-openai-search-acceptance.md](third-party-openai-search-acceptance.md). Its isolated CLI/App-protocol live gate passed; App UI and installed-environment activation remain separate.
+Historical frozen records remain available for [configuration spaces](configuration-spaces-acceptance.md) and the [v0.4.0 third-party standalone-search candidate](third-party-openai-search-acceptance.md). They describe those releases' environments and must not be read as current installed-machine status. Current release qualification is defined below.
 
 The published package ships the end-to-end acceptance harness and its runtime tests. The installed tarball supports `npm test`, `npm run audit:package`, and the documented `e2e:*` scripts; package audit fails when a declared Node script target or the packaged test suite is missing. The three repository-only public-export tests run in the source/public-export tree and are explicitly skipped in an installed tarball, where the repository export inputs do not exist. The harness drives the Codex App core and reports `PASS` / `ANOMALY` / `FAIL` from machine-checkable criteria. It never drives the App UI.
 
@@ -43,7 +42,7 @@ Configuration spaces add deterministic cases for fresh and legacy migration, app
 
 Compacted-history recovery adds deterministic cases for current-thread lookup, exact direct-parent inheritance and restart persistence; account, parent and compaction-hash isolation; summary-only failure; complete single-file and parent/child rollout reconstruction; repeated recovery; missing bases, bad boundaries, incomplete tool pairs, corrupt JSON, ambiguous files and existing-record conflicts. Validation failures must write zero checkpoints. A recovered checkpoint is expanded before the one simulated third-party request, so the opaque official compaction never reaches that upstream and no retry occurs. Parent lookup p95 is enforced below 10 ms locally and adds no network request.
 
-The configuration-space candidate gate intentionally performs zero real model calls and does not run `e2e:focused -- --run`. Before and after the gate, operators verify that the installed Router and switcher remain unloaded, port 8788 remains closed, integration remains disabled, and the real Codex config still selects its built-in OpenAI provider. App-server coverage cannot replace a later App UI sign-off.
+The historical configuration-space candidate gate intentionally performed zero real model calls and did not run `e2e:focused -- --run`; its frozen environment checks remain in the linked record. Current App-server coverage still cannot replace App UI sign-off.
 
 ## Commands
 
@@ -105,7 +104,7 @@ The release runner must be dedicated and protected; pull requests never execute 
 
 Prompt-cache affinity has a staged, fail-closed gate. The default `e2e:prompt-cache` command makes zero network calls and checks HMAC derivation p95 below 5 ms, body-adaptation p95 below 25 ms, and wire growth below 128 bytes. The current effect gate uses `--live-comparison --run`: 24 interleaved, no-retry Sol/Astra generations compare the direct client shape with the candidate anonymous key under an otherwise fixed request. `--live-app-candidate --run` then uses the current App-bundled Codex binary, a temporary Codex/Router home and an isolated Gateway for at most six Provider generations. It must close one read-only MCP call/result plus a following turn per model, observe a stable anonymous-key fingerprint and the per-frame Lite header, and keep subscription/provider identity separated. Missing usage remains unknown rather than zero. Older `--live-feasibility`, `--live-gateway` and `--live-app-protocol` modes remain available for earlier candidate reproduction but are not the current 30-generation gate.
 
-The historical ai.feei feasibility attempt that stopped on its first HTTP 403 remains recorded. A later 35-request causal diagnostic did not overwrite it: all 35 synthetic calls completed, and a strict single-variable toggle moved Sol from 30.11% weighted cache reuse without a key to 98.55% with the Gateway-derived anonymous key. That result establishes a Gateway-controlled field effect for that workload, not ai.feei's internal account-pool algorithm and not a universal natural-session hit-rate guarantee. The current candidate must still pass its own Sol/Astra and App-protocol gates before local activation.
+The historical ai.feei feasibility attempt that stopped on its first HTTP 403 remains recorded. A later 35-request causal diagnostic did not overwrite it: all 35 synthetic calls completed, and a strict single-variable toggle moved Sol from 30.11% weighted cache reuse without a key to 98.55% with the Gateway-derived anonymous key. That result establishes a Gateway-controlled field effect for that workload, not ai.feei's internal account-pool algorithm and not a universal natural-session hit-rate guarantee. Any release that changes cache affinity must pass its own Sol/Astra and App-protocol gates before activation.
 
 `e2e:tool-search-history` drives the current App-bundled app-server through a
 new-session model switch, then reproduces the affected retained-response path
