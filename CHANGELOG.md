@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.5.4 - 2026-09-18
+
+- Stream ordinary text and client tool events immediately when subscription search or legacy search fallback is enabled, including turns that never search. Hide only internal search calls, keep one client response lifecycle across internal generations, and preserve private search results for continuation.
+- Measure downstream text after the HTTP/WS send boundary, not inside the upstream sampler. Streaming errors produce a sanitized error terminal instead of silently ending the socket. No fabricated progress or reasoning-to-commentary conversion.
+- Make client-acknowledged HTTP/WS streaming probes part of default release qualification, and record real app-server text delta timing alongside live bridge closure. Context windows remain explicit per-user settings; this release does not silently migrate GLM or any other target.
+
+## 0.5.3 - 2026-09-18
+
+- Add an explicit, model-family-neutral `standard-tool` subscription-search bridge for third-party Standard Responses targets. It preserves the current Codex search mode and restrictions, executes only against the fixed OpenAI subscription endpoint, returns bounded untrusted results through the existing tool loop, and never lends subscription identity to `/v1` or a model Provider.
+- Preserve user MCP search as a client-owned path, distinguish exact hosted-search types from ordinary functions such as Tavily, and retain namespace identity across the Chat Completions adapter. Current deferred `tool_search` behavior remains visible instead of copying user MCP configuration or credentials into the Router.
+- Add explicit CLI controls needed to move GLM 5.3 Flash from Lite/Code mode to Standard Responses tools, `shell_command`, client-default agents, `low|high|max` reasoning with default `max`, and the subscription bridge. Version the candidate as 0.5.3 and add hash-bound source-only activation/rollback tooling.
+- Correct the OpenAI `/alpha/search` request to use the current object-shaped `commands.search_query` contract. Isolated live evidence proved GLM and ai.feei subscription bridge closure; GLM deferred-MCP discovery and the CA-isolated Tavily case remain unaccepted, so local activation is still blocked.
+- Add a fail-closed release qualification command and protected self-hosted GitHub Release job. The default real matrix is limited to five equivalence-class turns, thirteen model generations and seven searches across non-GPT/GPT subscription bridges, one client-owned MCP path, and official cached/live regression.
+
 ## 0.5.2 - 2026-09-17
 
 - Allow a trusted direct fork to inherit an exact same-account portable parent checkpoint, persist its own encrypted copy, and remain fail-closed when the parent is missing, mismatched, or summary-only.

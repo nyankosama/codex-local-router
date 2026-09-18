@@ -21,6 +21,8 @@ Codex Local Router（仅监听本机回环地址）
 
 Router 不替用户开启或关闭搜索：Codex 继续使用正常搜索模式（默认 cached，或由用户选择 live）。官方 HTTP 与 WebSocket 会共同继承 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`WS_PROXY`、`WSS_PROXY` 并遵守 `NO_PROXY`。
 
+第三方标准 Responses 模型可以显式使用 Gateway 的 `standard-tool` 桥接调用同一 OpenAI 订阅搜索。内部搜索调用不会出现在 Codex 对话记录中，但有界结果会返回模型，普通回答文本继续流式发送。用户 MCP 搜索仍由 Codex 客户端负责，并按正常工具流程显示。详见[通用搜索](docs/public/universal-search.zh-CN.md)。
+
 新建 App-enabled 第三方模型在具备 Responses、工具调用和 freeform 工具能力且 preset 已通过 Provider 准出时，默认采用版本化 `codex-general-v1` 模板：简短中性指令、标准 Responses、Code mode、多代理 v2 元数据和标准 Plugin 白名单。不兼容目标使用 `legacy`；当前 OpenCode Go DeepSeek preset 明确只允许 legacy，已有模型也不会在加载时迁移。官方 GPT 指令快照、Lite、搜索和缓存亲和仍为可选能力。详见[第三方模型模板](docs/public/third-party-templates.zh-CN.md)。
 
 Plugin 白名单只裁剪结构化 Plugin 定义；Codex 核心工具和用户 MCP 保留，嵌入 `exec` 说明的 schema 仍不透明。这是上下文控制策略，不是安全沙箱，也不保证 Code mode 必然减少字节。
@@ -35,15 +37,15 @@ Plugin 白名单只裁剪结构化 Plugin 定义；Codex 核心工具和用户 M
 - Responses 与 Chat Completions
 - ChatGPT 订阅、OpenCode Go、ai.feei GPT 预设和通用 OpenAI 兼容渠道
 
-v0.5.2 不声明 Linux、Windows 或未知供应商私有协议已受支持。
+v0.5.4 不声明 Linux、Windows 或未知供应商私有协议已受支持。
 
 ## 从 GitHub Release 安装
 
-下载 `v0.5.2` Release 中的 `.tgz` 与 SHA-256 文件：
+下载 `v0.5.4` Release 中的 `.tgz` 与 SHA-256 文件：
 
 ```bash
-shasum -a 256 -c codex-local-router-0.5.2.tgz.sha256
-npm install -g ./codex-local-router-0.5.2.tgz
+shasum -a 256 -c codex-local-router-0.5.4.tgz.sha256
+npm install -g ./codex-local-router-0.5.4.tgz
 codex-local-router --version
 ```
 
@@ -126,7 +128,7 @@ codex-local-router history recover --thread THREAD_ID --json
 
 跨 Provider 续聊时，Provider 私有的动态工具搜索控制项会转换成不含 schema 的固定历史标记；已完成的函数/custom-tool 调用与结果保持顺序，原始加密归档不改写。详见[工具搜索历史迁移](docs/public/tool-search-history-migration.zh-CN.md)。
 
-更多信息见[配置空间指南](docs/public/configuration-spaces.zh-CN.md)、[CLI 说明](docs/public/cli.zh-CN.md)、[配置说明](docs/public/configuration.zh-CN.md)、[架构](docs/public/architecture.zh-CN.md)、[数据流向](docs/public/data-flow.zh-CN.md)、[兼容性](docs/public/compatibility.zh-CN.md)、[开源维护边界](docs/public/open-source-maintenance-boundaries.zh-CN.md)与[验收工具链](docs/public/acceptance.zh-CN.md)。
+更多信息见[配置空间指南](docs/public/configuration-spaces.zh-CN.md)、[CLI 说明](docs/public/cli.zh-CN.md)、[配置说明](docs/public/configuration.zh-CN.md)、[第三方模型通用搜索](docs/public/universal-search.zh-CN.md)、[架构](docs/public/architecture.zh-CN.md)、[数据流向](docs/public/data-flow.zh-CN.md)、[兼容性](docs/public/compatibility.zh-CN.md)、[开源维护边界](docs/public/open-source-maintenance-boundaries.zh-CN.md)与[验收工具链](docs/public/acceptance.zh-CN.md)。
 
 ## 压缩边界
 

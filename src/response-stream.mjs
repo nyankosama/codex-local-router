@@ -1,4 +1,100 @@
 import { fail } from "./errors.mjs";
+import { randomUUID } from "node:crypto";
+
+// One client response can span several private search generations. Only unknown
+// function names wait for classification; ordinary content never waits for EOF.
+export class SearchResponseStream {
+  constructor(isInternalCall) {
+    this.isInternalCall = isInternalCall;
+    this.id = `resp_gateway_${randomUUID()}`;
+    this.output = [];
+    this.beginRound();
+  }
+  beginRound() {
+    this.items = new Map();
+  }
+  push(event) {
+    const events = [];
+    if (!this.started) {
+      this.started = true;
+      events.push({ type: "response.created", response: {
+        ...event.response, id: this.id, object: "response", status: "in_progress", output: [],
+      } });
+    }
+    if (event.response || lifecycleEvents.has(event.type)) return events;
+    const index = event.output_index;
+    let item = this.items.get(index);
+    if (!item && event.type === "response.output_item.done") {
+      events.push(...this.push({ ...event, type: "response.output_item.added" }));
+      item = this.items.get(index);
+    }
+    if (event.type === "response.output_item.added") {
+      if (item || !Number.isInteger(index) || index < 0 || !event.item)
+        throw fail("invalid_upstream_response", 502);
+      item = { pending: [], hidden: null, done: false };
+      this.items.set(index, item);
+    }
+    if (!item) throw fail("invalid_upstream_response", 502);
+    if (item.hidden === null) {
+      const definition = event.item;
+      item.pending.push(event);
+      if (!definition || (definition.type === "function_call" && !definition.name))
+        return events;
+      item.hidden = this.isInternalCall(definition);
+      if (item.hidden) {
+        item.pending = [];
+        item.done = event.type === "response.output_item.done";
+        return events;
+      }
+      item.index = this.output.length;
+      item.id = `item_gateway_${randomUUID()}`;
+      this.output.push({ ...definition, id: item.id });
+      for (const pending of item.pending) {
+        const known = pending.item?.type === "function_call" && !pending.item.name
+          ? { ...pending, item: { ...pending.item, name: definition.name } }
+          : pending;
+        events.push(this.project(known, item));
+      }
+      item.pending = [];
+    } else if (!item.hidden) {
+      if (event.item && this.isInternalCall(event.item))
+        throw fail("invalid_upstream_response", 502);
+      events.push(this.project(event, item));
+    }
+    if (event.type === "response.output_item.done") item.done = true;
+    return events;
+  }
+  project(event, item) {
+    const projected = { ...event, output_index: item.index };
+    if (event.response_id) projected.response_id = this.id;
+    if (event.item_id) projected.item_id = item.id;
+    if (event.item) {
+      projected.item = { ...event.item, id: item.id };
+      this.output[item.index] = projected.item;
+    }
+    if (event.type === "response.output_item.done") item.done = true;
+    return projected;
+  }
+  endRound(response) {
+    const events = [];
+    for (const [output_index, item] of (response.output ?? []).entries()) {
+      if (!this.items.has(output_index))
+        events.push(...this.push({ type: "response.output_item.added", output_index, item }));
+      const state = this.items.get(output_index);
+      if (!state.done)
+        events.push(...this.push({ type: "response.output_item.done", output_index, item }));
+      if (state.hidden === null) throw fail("invalid_upstream_response", 502);
+    }
+    if ([...this.items.values()].some((item) => item.hidden === null || !item.done))
+      throw fail("upstream_stream_incomplete", 502);
+    return events;
+  }
+  finish(response) {
+    return { type: `response.${response.status}`, response: {
+      ...response, id: this.id, output: this.output,
+    } };
+  }
+}
 
 const lifecycleEvents = new Set([
   "response.created",

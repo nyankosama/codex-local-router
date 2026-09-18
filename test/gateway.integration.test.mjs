@@ -243,7 +243,9 @@ test("Gateway does not fallback after a stream has started", async (t) => {
   }
   if (response) {
     assert.equal(response.status, 200);
-    await assert.rejects(response.text());
+    const text = await response.text();
+    assert.match(text, /event: error/);
+    assert.doesNotMatch(text, /event: response.completed/);
   }
   assert.equal(calls, 1);
 });

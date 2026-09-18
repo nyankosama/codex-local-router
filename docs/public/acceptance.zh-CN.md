@@ -28,11 +28,47 @@ npm run e2e:tool-search-history      # 当前 app-server + 存量历史迁移，
 npm run e2e                       # 只运行 L0-L2，不包含 live
 npm run e2e:live -- --run         # 显式运行已安装服务并发用例
 npm run e2e -- --include-live --run
+npm run e2e:official-search -- --run    # 官方 cached 默认＋显式 live
+npm run e2e:universal-search -- --run   # 三项第三方桥接／MCP 等价类
+npm run e2e:release -- --run            # 默认发布门：画像＋第三方＋官方搜索
 npm run e2e:prompt-cache             # 零外网派生/适配性能门
 npm run e2e:prompt-cache -- --live-feasibility --run  # 最多 8 次 Provider 直连
 npm run e2e:prompt-cache -- --live-comparison --run  # Sol/Astra 24 次直连形态与候选对照
 npm run e2e:prompt-cache -- --live-app-candidate --run  # 当前 App 二进制，最多 6 次 Provider 生成
 ```
+
+## GitHub Release 默认准出门
+
+搜索开启时的流式交付新增为硬门禁：HTTP／WS × 订阅桥接／旧搜索后端 ×
+不搜索／两次搜索，共八个小型本地探针，零真实模型调用。模拟上游必须等客户端
+收到每段文本才继续，因此“先整轮缓存、终态再一次放出”不能通过。
+同时验证单一响应生命周期、输出 ID／顺序、内部调用隐藏、完整历史恢复和发送端日志。
+真实桥接用例记录文本 delta 数量和时序，GLM app-server 必须在完成前收到多个文本 delta；
+协议通过不等于 App UI 已签核。
+
+原采样器指标改名 `sample_first_output_text`；`downstream_first_output_text`
+现在位于 HTTP／WS 成功发送边界，`downstream_stream_completed` 只记录数量、字节和耗时。
+发送成功不证明 UI 已渲染。Gateway 不伪造过程消息、不将 reasoning 改成 commentary：
+模型只调用工具而不输出进度文字时，仍不会出现过程讲解。
+
+以后每个 `v*` tag 必须先通过两层门禁，才允许创建 Release 资产：
+
+1. GitHub 托管 runner 执行完整单元／协议测试、依赖与包审计、公开源码扫描。
+2. 受保护的 `release-live` Environment 在标签为 `codex-local-router-release` 的专用 macOS runner 上执行 `e2e:release`；该机器本地具备当前 Codex App、订阅登录、Router 来源配置、Provider 凭证和 Tavily 凭证。
+
+真实矩阵按等价类覆盖，不做模型 × 客户端 × 搜索源全排列：
+
+| 用例 | 覆盖目的 |
+|---|---|
+| GLM Flash App＋订阅桥接 | 非 GPT 标准 Responses 函数、固定 OpenAI 搜索和 Provider 续接 |
+| ai.feei Sol CLI＋订阅桥接 | GPT／Provider 回归和独立凭证链路 |
+| ai.feei Sol App＋Tavily MCP | 客户端拥有的 MCP 发现、调用／结果和续接，Gateway 不接管 MCP 权限 |
+| 官方 cached 默认 | 官方默认搜索行为不变 |
+| 官方显式 live | 官方 live 覆盖行为不变 |
+
+确定性画像另有五项本地 HTTP／WS、工具、生命周期和性能用例。整个真实门最多五个 turn、十六次模型生成和九次搜索；第三方阶段上限为 `3 / 8 / 3`，其中包含一次客户端 MCP 搜索及 deferred MCP 调用／结果闭环所需的四次发送；官方阶段为 `2 / 8 / 6`，即 cached／live 每轮最多三次官方搜索及四次模型发送。重复 payload、被拦截请求、隐式重试、缺少用例、提交或 Codex 二进制不一致、MCP inventory 不完整、凭证串线或任何非 PASS 阶段都会拒绝 tag。各阶段顺序执行，首个失败即停止，避免本地缺陷继续消耗外部预算。
+
+发布 runner 必须专用并受 Environment 审批保护；PR 不会在它上面运行真实凭证。OpenAI／Provider 凭证只存在于 runner 的本地登录、Keychain 或服务环境，不作为 workflow 输入。runner 服务必须显式具备 `TAVILY_API_KEY`，需要自定义 CA 时同时提供 `NODE_EXTRA_CA_CERTS`。机器回执写在 checkout 外，workflow 日志只记录哈希与脱敏摘要。App UI 仍单独人工签核，不作为 GitHub Release 的自动阻断项。
 
 缓存亲和采用分阶段 fail-closed 门禁。缺省 `e2e:prompt-cache` 零外网，要求 HMAC 派生 p95 小于 5ms、请求体适配 p95 小于 25ms、Wire 增量小于 128 bytes。当前效果门使用 `--live-comparison --run`：Sol/Astra 共 24 次交错、零重试生成，在请求其余部分固定的条件下比较原始直连形态和候选匿名 key。随后 `--live-app-candidate --run` 使用当前 App 内置 Codex 二进制、临时 Codex/Router Home 和隔离 Gateway，Provider 生成不超过 6 次；每款模型必须完成一个只读 MCP call/result 和下一 turn，同时观察到匿名键指纹稳定、逐 frame Lite Header 正确且订阅/Provider 身份不串线。缺失 usage 记为未知，不记作 0。旧的 `--live-feasibility`、`--live-gateway` 和 `--live-app-protocol` 仍用于复查历史候选，不再构成本轮 30 次准出门。
 

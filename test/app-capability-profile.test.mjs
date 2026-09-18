@@ -56,6 +56,32 @@ test("explicit standard-tools uses Standard Responses and does not advertise sta
   assert.equal(custom.gateway_tool_surface, "policy-filtered-standard");
 });
 
+test("subscription bridge advertises search without enabling Lite or Provider-native search", () => {
+  const input = fixture();
+  input.targets.gpt.app.capabilityProfile = "standard-tools";
+  input.targets.gpt.subscriptionSearch = { delivery: "standard-tool" };
+  const config = validate(input);
+  const custom = buildModelCatalog(
+    { models: [{ slug: "gpt-official", priority: 10 }] },
+    config,
+  ).models.at(-1);
+  assert.equal(custom.supports_search_tool, true);
+  assert.equal(custom.use_responses_lite, false);
+  assert.equal(custom.gateway_subscription_search_delivery, "standard-tool");
+  assert.equal(config.targets.gpt.capabilities.nativeWebSearch, undefined);
+
+  for (const mutate of [
+    (target) => { target.app.useResponsesLite = true; },
+    (target) => { target.standaloneSearch = { source: "subscription" }; },
+    (target) => { target.capabilities.nativeWebSearch = true; },
+  ]) {
+    const invalid = fixture();
+    invalid.targets.gpt.subscriptionSearch = { delivery: "standard-tool" };
+    mutate(invalid.targets.gpt);
+    assert.throws(() => validate(invalid), /conflicting subscription search delivery/);
+  }
+});
+
 test("explicit lite-search requires Lite transport and an active standalone source", () => {
   const input = fixture();
   input.targets.gpt.app.capabilityProfile = "lite-search";

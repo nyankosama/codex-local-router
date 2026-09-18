@@ -63,6 +63,35 @@ test("plans native, tool fallback and unsupported search", () => {
     "unsupported",
   );
 });
+test("only hosted search types trigger routing and the subscription bridge wins explicitly", () => {
+  const mcp = contextFromRequest({
+    tools: [{ type: "function", name: "tavily_web_search" }],
+  });
+  assert.equal(mcp.requestedWebSearch, false);
+  assert.equal(planCapabilities(config.targets.cheap, mcp).mode, "none");
+
+  const hosted = contextFromRequest({
+    tools: [{
+      type: "web_search",
+      mode: "live",
+      filters: { allowed_domains: ["docs.example.com"] },
+    }],
+  });
+  assert.deepEqual(
+    planCapabilities(config.targets.cheap, hosted, {
+      standaloneSearchSource: "disabled",
+      subscriptionSearchDelivery: "standard-tool",
+    }),
+    {
+      mode: "subscription_bridge",
+      request: {
+        type: "web_search",
+        mode: "live",
+        allowedDomains: ["docs.example.com"],
+      },
+    },
+  );
+});
 test("rejects hosted search when a standalone search route is selected", () => {
   const c = contextFromRequest({ tools: [{ type: "web_search" }] });
   assert.deepEqual(

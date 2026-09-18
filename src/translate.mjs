@@ -1,5 +1,5 @@
 import { fail } from "./errors.mjs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 export function textOf(v) {
   if (typeof v === "string") return v;
   if (!Array.isArray(v)) return v == null ? "" : String(v);
@@ -81,32 +81,67 @@ export function inputToMessages(p) {
   flush();
   return out.length ? out : [{ role: "user", content: "" }];
 }
-export function toolsToChat(tools = []) {
-  return tools.flatMap((t) => {
-    if (t.type === "function" && t.function) return [t];
-    if (t.type !== "function" && t.type !== "custom") return [];
-    const name = t.name ?? t.function?.name;
-    return name
-      ? [
-          {
-            type: "function",
-            function: {
-              name,
-              description: t.description ?? t.function?.description ?? "",
-              parameters: t.parameters ??
-                t.function?.parameters ?? { type: "object", properties: {} },
-            },
-          },
-        ]
-      : [];
-  });
+const flatNamespaceName = (namespace, name) => {
+  const readable = `${namespace}__${name}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const suffix = createHash("sha256")
+    .update(`${namespace}\0${name}`)
+    .digest("hex")
+    .slice(0, 10);
+  return `clr_${readable.slice(0, 48)}_${suffix}`;
+};
+
+const functionTool = (tool, name) => ({
+  type: "function",
+  function: {
+    name,
+    description: tool.description ?? tool.function?.description ?? "",
+    parameters:
+      tool.parameters ??
+      tool.input_schema ??
+      tool.function?.parameters ??
+      { type: "object", properties: {} },
+  },
+});
+
+export function toolsToChat(tools = [], nameMap = new Map()) {
+  const output = [];
+  const register = (external, original) => {
+    const prior = nameMap.get(external);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(original))
+      throw fail("tool_name_collision", 400);
+    nameMap.set(external, original);
+  };
+  for (const tool of tools) {
+    if (tool?.type === "namespace") {
+      const namespace = tool.name ?? tool.namespace;
+      if (!namespace || !Array.isArray(tool.tools))
+        throw fail("invalid_tool_definition", 400);
+      for (const nested of tool.tools) {
+        const name = nested?.name ?? nested?.function?.name;
+        if (!name) throw fail("invalid_tool_definition", 400);
+        const external = flatNamespaceName(namespace, name);
+        register(external, { name, namespace });
+        output.push(functionTool(nested, external));
+      }
+      continue;
+    }
+    if (tool?.type !== "function" && tool?.type !== "custom") continue;
+    const name = tool.name ?? tool.function?.name;
+    if (!name) continue;
+    register(name, { name });
+    output.push(tool.type === "function" && tool.function
+      ? { ...tool, function: { ...tool.function, name } }
+      : functionTool(tool, name));
+  }
+  return output;
 }
 export function toChat(p, model, options = {}) {
   const q = { model, messages: inputToMessages(p), stream: p.stream === true };
   if (q.stream) q.stream_options = { include_usage: true };
   if (p.reasoning?.effort ?? p.thinkLevel)
     q.reasoning_effort = p.reasoning?.effort ?? p.thinkLevel;
-  const tools = toolsToChat(p.tools);
+  const nameMap = options.toolNameMap ?? new Map();
+  const tools = toolsToChat(p.tools, nameMap);
   if (options.webSearchFallback)
     tools.push({
       type: "function",
@@ -126,7 +161,16 @@ export function toChat(p, model, options = {}) {
     if (p.tool_choice != null)
       q.tool_choice =
         p.tool_choice?.type === "function" && p.tool_choice.name
-          ? { type: "function", function: { name: p.tool_choice.name } }
+          ? {
+              type: "function",
+              function: {
+                name:
+                  [...nameMap.entries()].find(([, original]) =>
+                    original.name === p.tool_choice.name &&
+                    original.namespace === p.tool_choice.namespace)?.[0] ??
+                  p.tool_choice.name,
+              },
+            }
           : p.tool_choice;
   }
   if (p.temperature != null) q.temperature = p.temperature;
@@ -134,7 +178,7 @@ export function toChat(p, model, options = {}) {
   if (p.max_output_tokens != null) q.max_tokens = p.max_output_tokens;
   return q;
 }
-export function chatToResponse(chat, requestedModel) {
+export function chatToResponse(chat, requestedModel, options = {}) {
   const m = chat.choices?.[0]?.message ?? {},
     output = [];
   if (m.reasoning_content)
@@ -144,15 +188,20 @@ export function chatToResponse(chat, requestedModel) {
       summary: [{ type: "summary_text", text: m.reasoning_content }],
       status: "completed",
     });
-  for (const c of m.tool_calls ?? [])
+  for (const c of m.tool_calls ?? []) {
+    const original = options.toolNameMap?.get(c.function?.name) ?? {
+      name: c.function?.name ?? "",
+    };
     output.push({
       type: "function_call",
       id: `fc_${randomUUID()}`,
       call_id: c.id,
-      name: c.function?.name ?? "",
+      name: original.name,
+      ...(original.namespace ? { namespace: original.namespace } : {}),
       arguments: c.function?.arguments ?? "{}",
       status: "completed",
     });
+  }
   if (m.content)
     output.push({
       type: "message",

@@ -4,7 +4,7 @@ import { chmod, lstat, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
-import { captureWebSocketProxy, collectToolNames, finalizeTransportFailure, isolatedChildEnv, isolatedCodexHome, persistCaseVerdict, runCliExec, writeDeterministicCodexInputs } from "../scripts/e2e/lib/harness.mjs";
+import { captureWebSocketProxy, classifyMcpToolFailure, collectToolNames, finalizeTransportFailure, isolatedChildEnv, isolatedCodexHome, persistCaseVerdict, runCliExec, writeDeterministicCodexInputs } from "../scripts/e2e/lib/harness.mjs";
 
 test("A10 pre-header transport failures finalize zero response bytes and total time", () => {
   const metadata = { at: 1000, requestBytes: 64 };
@@ -115,6 +115,13 @@ test("A10 tool evidence recursively names nested additional_tools without retain
     }),
     ["functions", "mcp__codex_apps__github", "router_acceptance", "read_marker"],
   );
+});
+
+test("A10 MCP failures are reduced to safe diagnostic categories", () => {
+  assert.equal(classifyMcpToolFailure({ message: "max_results must be at least 5" }), "invalid-arguments");
+  assert.equal(classifyMcpToolFailure({ message: "unable to verify certificate" }), "tls");
+  assert.equal(classifyMcpToolFailure({ message: "private query text" }), "other");
+  assert.equal(classifyMcpToolFailure(null), null);
 });
 
 test("A10 isolated official-search home can preserve the Codex default search mode", async (t) => {

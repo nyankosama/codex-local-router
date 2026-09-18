@@ -13,7 +13,6 @@ import {
   writeCatalog,
 } from "./lib/harness.mjs";
 import { FocusedAcceptanceBudget } from "./lib/focused-budget.mjs";
-import { OfficialWebSocketSession } from "../../src/official-websocket.mjs";
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(`--${name}`);
@@ -33,59 +32,13 @@ const output = value("out") ? resolve(value("out")) : null;
 const root = await mkdtemp(join(tmpdir(), "codex-router-official-search-"));
 const codexHome = join(root, "codex-home");
 const work = join(root, "workspace");
-const budget = new FocusedAcceptanceBudget({ maxTurns: 2, maxGenerations: 6 });
+const budget = new FocusedAcceptanceBudget({ maxTurns: 2, maxGenerations: 8, maxSearchRequests: 6 });
 const cases = [];
 let gateway;
-let websocketProbe = null;
-
 const finalText = (run) => run.rows
   .filter((row) => row.type === "item.completed" && row.item?.type === "agent_message")
   .map((row) => row.item.text ?? "")
   .join("\n");
-
-async function probeOfficialWebSocket() {
-  const auth = JSON.parse(await readFile(authSource, "utf8"));
-  const token = auth?.tokens?.access_token;
-  const account = auth?.tokens?.account_id;
-  if (typeof token !== "string" || typeof account !== "string")
-    throw Object.assign(Error("subscription identity unavailable"), {
-      code: "subscription_identity_unavailable",
-    });
-  const logs = [];
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
-  const startedAt = Date.now();
-  const session = new OfficialWebSocketSession({
-    authorization: `Bearer ${token}`,
-    "chatgpt-account-id": account,
-  }, { log: (event) => logs.push(event) });
-  try {
-    const socket = await session.connect(controller.signal);
-    return {
-      passed: socket.readyState === 1,
-      status: socket.readyState === 1 ? 101 : null,
-      host: "chatgpt.com",
-      path: "/backend-api/codex/responses",
-      durationMs: Date.now() - startedAt,
-      diagnostics: logs,
-    };
-  } catch (error) {
-    return {
-      passed: false,
-      status: null,
-      host: "chatgpt.com",
-      path: "/backend-api/codex/responses",
-      durationMs: Date.now() - startedAt,
-      error: error?.type ?? error?.code ?? "websocket_probe_failed",
-      transportCode: error?.transportCode ?? null,
-      transportCategory: error?.transportCategory ?? null,
-      diagnostics: logs,
-    };
-  } finally {
-    clearTimeout(timer);
-    session.close();
-  }
-}
 
 async function runCase({ name, marker, live }) {
   budget.beginTurn();
@@ -136,6 +89,8 @@ async function runCase({ name, marker, live }) {
           (event.transport === "websocket" && event.status === 101) ||
           (event.transport === "http" && event.status >= 200 && event.status < 300)
         )),
+      officialWebSocketCompleted: responseRequests.some((event) =>
+        event.official && event.transport === "websocket" && event.status === 101),
       markerPresent: text.includes(marker),
       sourceHostMentioned: /(?:learn\.chatgpt\.com|developers\.openai\.com|openai\.com)/i.test(text),
       officialDestinationOnly: outbound.length > 0 && outbound.every((event) => event.official),
@@ -186,11 +141,6 @@ try {
   await writeFile(configPath, JSON.stringify(baseConfig), { mode: 0o600 });
 
   core = await resolveCore();
-  websocketProbe = await probeOfficialWebSocket();
-  if (!websocketProbe.passed)
-    throw Object.assign(Error("official WebSocket probe failed"), {
-      code: "official_websocket_probe_failed",
-    });
   gateway = await startIsolatedGateway({
     configPath,
     authSource,
@@ -237,6 +187,11 @@ try {
   await gateway?.close().catch(() => {});
   await rm(root, { recursive: true, force: true });
 }
+
+const websocketProbe = {
+  passed: cases.length === 2 && cases.every((entry) => entry.assertions.officialWebSocketCompleted),
+  source: "official-search-cases",
+};
 
 const summary = {
   verdict: !harnessError && websocketProbe?.passed &&

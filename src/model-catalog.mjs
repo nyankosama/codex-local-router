@@ -2,6 +2,7 @@ import { resolveStandaloneSearchPolicy } from "./standalone-search.mjs";
 import { resolveAppCapabilityProfile } from "./app-capability-profile.mjs";
 import { catalogInstructions } from "./instruction-source.mjs";
 import { catalogMultiAgent } from "./multi-agent-source.mjs";
+import { resolveSubscriptionSearchPolicy } from "./subscription-search.mjs";
 
 const defaultReasoningLevels = ["low", "medium", "high", "xhigh"].map((effort) => ({
   effort,
@@ -46,6 +47,7 @@ function customModel(target, source, config) {
     ...source.models.map((model) => Number(model.priority ?? 1)),
   );
   const capabilityProfile = resolveAppCapabilityProfile(config, target);
+  const subscriptionSearch = resolveSubscriptionSearchPolicy(target);
   return {
     slug: target.app.modelId,
     display_name: target.app.displayName ?? `${target.model} (custom)`,
@@ -79,11 +81,14 @@ function customModel(target, source, config) {
     effective_context_window_percent: target.effectiveContextWindowPercent,
     experimental_supported_tools: [],
     input_modalities: target.inputModalities,
-    supports_search_tool: resolveStandaloneSearchPolicy(config, target).advertised,
+    supports_search_tool:
+      resolveStandaloneSearchPolicy(config, target).advertised ||
+      subscriptionSearch.advertised,
     use_responses_lite: target.app.useResponsesLite ?? false,
     gateway_capability_profile: capabilityProfile.profile,
     gateway_capability_profile_reason: capabilityProfile.reason,
     gateway_tool_surface: capabilityProfile.toolSurface,
+    gateway_subscription_search_delivery: subscriptionSearch.delivery,
   };
 }
 

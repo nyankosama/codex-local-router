@@ -1,17 +1,18 @@
 # Compatibility matrix
 
-| Component | v0.5.2 status |
+| Component | v0.5.3 candidate status |
 |---|---|
 | macOS | Supported |
 | Node.js 22 | Supported; Node currently labels built-in SQLite experimental |
 | Codex CLI 0.154.0-alpha.6.2 | Current focused-candidate driver; exact binary SHA is recorded by the harness |
 | Codex App | App-server integration baseline; UI reload must be verified for each installed build |
 | ChatGPT subscription HTTP/WS and auxiliary APIs | Fixed-origin transparent relay; model/search queries and future paths covered locally |
+| BigModel GLM 5.3 Flash | Standard Responses target shape qualified deterministically; subscription bridge passed an isolated live round; client-owned MCP search is not yet live-qualified |
 | OpenCode Go DeepSeek | Existing legacy integration supported; generic template, Code mode and multi-agent v2 are not qualified |
 | ai.feei GPT 5.6 Sol / GPT 6 Astra Responses | Built-in configuration presets; live result belongs to each candidate report |
 | Generic OpenAI-compatible Responses | Configuration support; provider capability requires live probe |
 | Generic OpenAI-compatible Chat Completions | Configuration support with JSON function tools |
-| Linux / Windows | Not supported in v0.5.2 |
+| Linux / Windows | Not supported in v0.5.3 |
 | Runtime configuration schema 3 | Preserved; active Router space materializes into the existing format |
 | Configuration-space schema 1 | Local immutable revisions and one switch transaction |
 | Integration state schema 4 | Links protected official and materialized Router revisions |
@@ -40,6 +41,8 @@ Consequences and limits:
 - Chat Completions cannot carry namespace tools and continues to omit them with a metadata-only diagnostic after the Plugin policy has run.
 
 ## Standalone web search
+
+An explicit `subscriptionSearch.delivery: "standard-tool"` is the model-family-neutral alternative for third-party Standard Responses targets. It exposes subscription search as one ordinary function only when the current Codex request enables search, executes the call at the fixed OpenAI destination with subscription identity, and returns bounded untrusted results through the existing tool loop. It does not turn on Lite, Provider-native hosted search, or `/v1` subscription access. User MCP search remains client-owned and may be deferred behind the current Codex `tool_search` discovery function. See [universal search](universal-search.md).
 
 The effective `standaloneSearch` policy controls whether the generated Codex catalog advertises the client's standalone search capability. It is intentionally separate from `capabilities.nativeWebSearch`, which declares a provider-hosted tool embedded in model generation. Current Codex carries standalone search as Responses Lite `web.run`; `standard-tools` therefore disables it, while explicit `lite-search` requires an active source. A mismatched top-level hosted-search request to a target without declared native hosted search fails instead of executing on an unintended provider. New ai.feei targets created by the CLI default to `standard-tools`; explicit `lite-search` normally inherits the `openai-gpt` subscription source. Native hosted search remains disabled.
 

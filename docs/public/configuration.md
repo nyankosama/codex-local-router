@@ -133,6 +133,16 @@ The secret is generated lazily only when the feature is first used and stored as
 
 ## Standalone search routing
 
+For Standard Responses targets, a separate model-family-neutral subscription bridge can expose OpenAI subscription search as a normal function tool:
+
+```bash
+codex-local-router model edit --id example --subscription-search standard-tool --yes
+```
+
+This mode is independent of the legacy/Lite standalone-search policy below and of provider-native hosted search. It requires authenticated subscription entry, an observable client search mode, function calls and result continuation; conflicting Lite, standalone or native-hosted declarations fail validation. See [universal search](universal-search.md).
+
+The shared `webSearch.maxRounds` setting also bounds this bridge's model/search continuation loop. It defaults to `3`, accepts `1` through `10`, and counts rounds rather than individual queries returned in one Provider response. The bridge may therefore execute multiple searches, but it cannot loop without a configured bound.
+
 Standalone client search is separate from `capabilities.nativeWebSearch`, which still means an embedded provider-hosted Responses tool. Current Codex exposes standalone search as the Responses Lite `web.run` namespace. New `standard-tools` targets therefore disable its advertisement; explicit `lite-search` targets use the selected source. Official models always use the fixed ChatGPT subscription backend. Existing Responses targets with `useResponsesLite: true`, or with an explicit legacy search policy that implies Lite, retain the subscription-search behavior provided the user is signed in and the runtime search setting allows it. An unprofiled App-enabled GPT Responses target without those compatibility signals takes the new Standard default. Other, non-Responses, and legacy non-GPT targets keep their prior behavior.
 
 The source precedence is: official model, explicit target policy, legacy explicit `app.supportsSearchTool`, explicit App-disabled cutoff, third-party GPT space/default, legacy `nativeWebSearch` compatibility, then unchanged legacy behavior. The cutoff applies only when neither higher-priority target declaration exists: it prevents an explicitly hidden GPT target from inheriting an App-only search advertisement. Sources are `subscription`, `provider`, and `disabled`:

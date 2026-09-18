@@ -52,6 +52,37 @@ test("converts chat response tool calls", () => {
   assert.equal(r.output[0].type, "function_call");
   assert.equal(r.output[0].call_id, "c1");
 });
+test("flattens namespace tools for Chat and restores the original call identity", () => {
+  const toolNameMap = new Map();
+  const request = toChat(
+    {
+      input: "search",
+      tools: [{
+        type: "namespace",
+        name: "tavily",
+        tools: [{
+          name: "search",
+          description: "Search",
+          parameters: { type: "object", properties: {} },
+        }],
+      }],
+    },
+    "chat",
+    { toolNameMap },
+  );
+  const flat = request.tools[0].function.name;
+  assert.match(flat, /^clr_tavily__search_[a-f0-9]{10}$/);
+  const response = chatToResponse({
+    choices: [{
+      message: {
+        tool_calls: [{ id: "call", function: { name: flat, arguments: "{}" } }],
+      },
+    }],
+  }, "chat", { toolNameMap });
+  assert.equal(response.output[0].name, "search");
+  assert.equal(response.output[0].namespace, "tavily");
+  assert.equal(response.output[0].call_id, "call");
+});
 test("preserves streaming reasoning and text deltas", () => {
   const e = chatChunkToEvents(
     { choices: [{ delta: { reasoning_content: "think", content: "answer" } }] },

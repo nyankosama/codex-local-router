@@ -14,7 +14,11 @@ const pluginAliases = new Map([
 ]);
 
 const corePrefixes = ["mcp__codex_app__", "mcp__cua_repl__"];
-const internalToolNames = new Set(["gateway_web_search", "gateway_web_fetch"]);
+const internalToolNames = new Set([
+  "gateway_web_search",
+  "gateway_subscription_web_search",
+  "gateway_web_fetch",
+]);
 // Names emitted by the current Codex App core in ordinary function form. Unknown
 // future built-ins are still passed through, but these trusted names avoid
 // misreporting the normal Codex surface as an uncertain source.

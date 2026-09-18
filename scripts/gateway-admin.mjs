@@ -48,6 +48,10 @@ import {
   validateStandaloneSearchSource,
 } from "../src/standalone-search.mjs";
 import {
+  resolveSubscriptionSearchPolicy,
+  validateSubscriptionSearchDelivery,
+} from "../src/subscription-search.mjs";
+import {
   resolveAppCapabilityProfile,
   validateAppCapabilityProfile,
 } from "../src/app-capability-profile.mjs";
@@ -178,6 +182,44 @@ function requestedResponsesLite() {
   return undefined;
 }
 
+function requestedFreeformTools() {
+  if (flag("freeform-tools") && flag("no-freeform-tools"))
+    throw Object.assign(Error("freeform tool flags conflict"), { code: "usage_error" });
+  if (flag("freeform-tools")) return true;
+  if (flag("no-freeform-tools")) return false;
+  return undefined;
+}
+
+function requestedShellType() {
+  const type = value("shell-type");
+  if (type != null && !["shell_command", "unified_exec"].includes(type))
+    throw Object.assign(Error("--shell-type must be shell_command or unified_exec"), { code: "usage_error" });
+  return type;
+}
+
+function requestedDefaultReasoningLevel() {
+  const level = value("default-reasoning-level");
+  if (level != null && !["low", "medium", "high", "xhigh", "max", "ultra"].includes(level))
+    throw Object.assign(Error("invalid --default-reasoning-level"), { code: "usage_error" });
+  return level;
+}
+
+function requestedSubscriptionSearch() {
+  const delivery = value("subscription-search");
+  if (delivery == null) return undefined;
+  try {
+    return validateSubscriptionSearchDelivery(
+      delivery,
+      "--subscription-search",
+    );
+  } catch {
+    throw Object.assign(
+      Error("--subscription-search must be standard-tool or disabled"),
+      { code: "usage_error" },
+    );
+  }
+}
+
 function requestedInstructionDelivery() {
   const mode = value("instruction-delivery");
   if (mode == null) return undefined;
@@ -219,6 +261,20 @@ function setMultiAgentVersion(target, version) {
     return next;
   }
   return configureMultiAgent(target, version);
+}
+
+function setSubscriptionSearch(target, delivery) {
+  if (delivery == null) return target;
+  const next = structuredClone(target);
+  next.subscriptionSearch = { delivery };
+  if (delivery === "standard-tool") {
+    next.app ??= {};
+    next.app.capabilityProfile = "standard-tools";
+    next.app.useResponsesLite = false;
+    delete next.app.supportsSearchTool;
+    next.standaloneSearch = { source: "disabled" };
+  }
+  return next;
 }
 
 async function requestedManagedInstructions() {
@@ -314,6 +370,32 @@ function searchSummaries(config, credentials) {
       credentialReady,
     };
   });
+}
+
+function subscriptionSearchSummaries(config, credentials) {
+  return Object.values(config.targets).map((target) => {
+    const policy = resolveSubscriptionSearchPolicy(target);
+    return {
+      target: target.id,
+      ...policy,
+      credentialReady:
+        policy.delivery === "standard-tool"
+          ? credentials?.subscription?.available ?? false
+          : false,
+      validationStatus:
+        policy.delivery === "standard-tool"
+          ? "configured-not-live-validated"
+          : "not-configured",
+    };
+  });
+}
+
+function humanSubscriptionSearchLines(summaries) {
+  return summaries
+    .map((summary) =>
+      `${summary.target}=${summary.delivery} (${summary.reason}; ${summary.validationStatus})`,
+    )
+    .join(", ");
 }
 
 function promptCacheSummaries(config) {
@@ -823,6 +905,10 @@ async function modelCommand() {
     const searches = new Map(
       searchSummaries(config, credentials).map((search) => [search.target, search]),
     );
+    const subscriptionSearches = new Map(
+      subscriptionSearchSummaries(config, credentials)
+        .map((search) => [search.target, search]),
+    );
     const profiles = new Map(
       capabilityProfileSummaries(config).map((profile) => [profile.target, profile]),
     );
@@ -838,6 +924,7 @@ async function modelCommand() {
       pluginToolPolicy: resolvePluginToolPolicy(config, target),
       toolSourceRecognition: toolSourceStatus(registry),
       standaloneSearch: searches.get(target.id),
+      subscriptionSearch: subscriptionSearches.get(target.id),
       appCapabilityProfile: profiles.get(target.id),
       promptCaching: promptCaching.get(target.id),
       template: thirdPartyTemplateStatus(target),
@@ -866,6 +953,8 @@ async function modelCommand() {
       toolSourceRecognition: toolSourceStatus(registry),
       standaloneSearch: searchSummaries(config, credentials)
         .find((search) => search.target === id),
+      subscriptionSearch: subscriptionSearchSummaries(config, credentials)
+        .find((search) => search.target === id),
       appCapabilityProfile: capabilityProfileSummaries(config)
         .find((profile) => profile.target === id),
       promptCaching: promptCacheSummaries(config)
@@ -880,6 +969,8 @@ async function modelCommand() {
       `Profile: ${humanCapabilityProfile(row.appCapabilityProfile)}. ` +
       `Standalone search: ${row.standaloneSearch.source ?? "unchanged"} ` +
       `(${row.standaloneSearch.reason}; ${row.standaloneSearch.advertised ? "advertised" : "not advertised"}). ` +
+      `Subscription search: ${row.subscriptionSearch.delivery} ` +
+      `(${row.subscriptionSearch.reason}; ${row.subscriptionSearch.validationStatus}). ` +
       `Prompt cache: ${humanPromptCacheAffinity(row.promptCaching)}. ` +
       `Instructions: ${JSON.stringify(row.instructions)}. ` +
       `Multi-agent: ${JSON.stringify(row.multiAgent)}. ` +
@@ -954,6 +1045,10 @@ async function modelCommand() {
     throw Object.assign(Error("model add|edit|remove requires --id"), { code: "usage_error" });
   const requestedProfile = requestedAppProfile();
   const requestedLite = requestedResponsesLite();
+  const subscriptionSearch = requestedSubscriptionSearch();
+  const freeformTools = requestedFreeformTools();
+  const shellType = requestedShellType();
+  const defaultReasoningLevel = requestedDefaultReasoningLevel();
   const instructionDelivery = requestedInstructionDelivery();
   const toolMode = requestedToolMode();
   const template = requestedTemplate();
@@ -969,12 +1064,24 @@ async function modelCommand() {
     });
   if (
     flag("no-app") &&
-    (requestedProfile != null || requestedLite != null || requestedSearchSource() != null || instructionDelivery != null || toolMode != null ||
+    (requestedProfile != null || requestedLite != null || requestedSearchSource() != null || subscriptionSearch != null || instructionDelivery != null || toolMode != null || shellType != null || defaultReasoningLevel != null ||
       value("multi-agent-from") != null || multiAgentVersion != null || template != null || managedInstructions != null)
   )
     throw Object.assign(Error("App profile or search flags cannot be combined with --no-app"), {
       code: "usage_error",
     });
+  if (
+    subscriptionSearch === "standard-tool" &&
+    (
+      requestedLite === true ||
+      requestedProfile === "lite-search" ||
+      ["subscription", "provider"].includes(requestedSearchSource()) ||
+      flag("native-search")
+    )
+  ) throw Object.assign(
+    Error("--subscription-search standard-tool conflicts with Lite, hosted native or standalone search"),
+    { code: "usage_error" },
+  );
   await mutateConfig(async (config) => {
     config.targets ??= {};
     if (command === "add" && config.targets[id]) throw Object.assign(Error(`model already exists: ${id}`), { code: "model_exists" });
@@ -1070,6 +1177,8 @@ async function modelCommand() {
         if (config.targets[id].app)
           delete config.targets[id].app.supportsSearchTool;
       }
+      if (effectiveTemplate === "legacy")
+        config.targets[id] = applyThirdPartyTemplate(config.targets[id], "legacy");
       setToolMode(config.targets[id], toolMode);
       const priorMultiAgent = config.targets[id].app?.multiAgent;
       if (value("multi-agent-from") != null) delete config.targets[id].app?.multiAgent;
@@ -1078,6 +1187,11 @@ async function modelCommand() {
         config.targets[id] = applyThirdPartyTemplate(config.targets[id], effectiveTemplate, {
           instructions: managedInstructions == null && value("instructions-from") == null,
         });
+      if (freeformTools != null)
+        config.targets[id].capabilities.freeformTools = freeformTools;
+      if (shellType != null) config.targets[id].app.shellType = shellType;
+      if (defaultReasoningLevel != null)
+        config.targets[id].app.defaultReasoningLevel = defaultReasoningLevel;
       if (profile != null) {
         config.targets[id].app.capabilityProfile = profile;
         config.targets[id].app.useResponsesLite = profile === "lite-search";
@@ -1099,6 +1213,10 @@ async function modelCommand() {
         config.targets[id].app.instructionDelivery = instructionDelivery;
       if (value("instructions-from") === "none")
         delete config.targets[id].app.instructionDelivery;
+      config.targets[id] = setSubscriptionSearch(
+        config.targets[id],
+        subscriptionSearch,
+      );
       config.targets[id] = structuredClone(validate(config).targets[id]);
       return;
     }
@@ -1118,7 +1236,8 @@ async function modelCommand() {
         responses: wireApi === "responses",
         streaming: !flag("no-streaming"),
         toolCalling: !flag("no-tools"),
-        freeformTools: flag("freeform-tools") || current.capabilities?.freeformTools === true,
+        freeformTools:
+          freeformTools ?? (current.capabilities?.freeformTools === true),
         nativeWebSearch: flag("native-search") || current.capabilities?.nativeWebSearch === true,
       },
       app: flag("no-app")
@@ -1133,6 +1252,8 @@ async function modelCommand() {
             modelId: value("app-model") ?? current.app?.modelId ?? value("upstream-model"),
             displayName: value("display-name") ?? current.app?.displayName,
             reasoningLevels: (value("reasoning-levels") ?? current.app?.reasoningLevels?.join(",") ?? "low,medium,high,xhigh").split(","),
+            ...(shellType != null ? { shellType } : {}),
+            ...(defaultReasoningLevel != null ? { defaultReasoningLevel } : {}),
             useResponsesLite: profile != null
               ? profile === "lite-search"
               : requestedLite ?? current.app?.useResponsesLite,
@@ -1176,6 +1297,10 @@ async function modelCommand() {
       config.targets[id].app.instructionDelivery = instructionDelivery;
     if (value("instructions-from") === "none")
       delete config.targets[id].app.instructionDelivery;
+    config.targets[id] = setSubscriptionSearch(
+      config.targets[id],
+      subscriptionSearch,
+    );
   }, `model ${command} ${id}`, {
     preserveCodexSelection: true,
     beforeApply: instructionDelivery === "gateway-lite"
@@ -1583,6 +1708,9 @@ async function doctor() {
     configurationSpace: await configurationSpaceStatus({ env, configPath }),
     credentials,
     standaloneSearch: config ? searchSummaries(config, credentials) : [],
+    subscriptionSearch: config
+      ? subscriptionSearchSummaries(config, credentials)
+      : [],
     appCapabilityProfiles: config ? capabilityProfileSummaries(config) : [],
     promptCaching: config ? promptCacheSummaries(config) : [],
     thirdPartyDefaults: config?.thirdPartyDefaults ?? { template: "codex-general-v1" },
@@ -1597,6 +1725,7 @@ async function doctor() {
   emit({ ok, ...checks }, (x) =>
     `Doctor: ${x.ok ? "OK" : `${x.issues.length} issue(s) found`}${x.warnings.length ? `, ${x.warnings.length} warning(s)` : ""}. No model calls were made.` +
     `\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}` +
+    `\nSubscription search: ${humanSubscriptionSearchLines(x.subscriptionSearch)}` +
     `\nPrompt cache: ${humanPromptCacheLines(x.promptCaching)}` +
     `\nInstructions: ${JSON.stringify(x.instructions)}`,
   );
@@ -1626,6 +1755,7 @@ async function status() {
     configurationSpace: { ...configurationSpace, defaultModel, latestRevision },
     targets: Object.keys(config.targets),
     standaloneSearch: searchSummaries(config, credentials),
+    subscriptionSearch: subscriptionSearchSummaries(config, credentials),
     appCapabilityProfiles: capabilityProfileSummaries(config),
     promptCaching: promptCacheSummaries(config),
     thirdPartyDefaults: config.thirdPartyDefaults ?? { template: "codex-general-v1" },
@@ -1633,7 +1763,7 @@ async function status() {
     instructions: await instructionSummaries(config),
     multiAgent: await multiAgentSummaries(config),
   },
-  (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nSpace: ${x.configurationSpace.active ? `${x.configurationSpace.active.space}@${x.configurationSpace.active.revision}` : "uninitialized"}\nModels: ${x.targets.join(", ")}\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}\nPrompt cache: ${humanPromptCacheLines(x.promptCaching)}\nInstructions: ${JSON.stringify(x.instructions)}`);
+  (x) => `${PRODUCT_NAME} ${x.cliVersion}\nService: ${x.service.running ? "running" : "stopped"}\nIntegration: ${x.integration.pending ? "pending App quit" : x.integration.active ? "active" : "inactive"}\nSpace: ${x.configurationSpace.active ? `${x.configurationSpace.active.space}@${x.configurationSpace.active.revision}` : "uninitialized"}\nModels: ${x.targets.join(", ")}\nProfiles: ${humanCapabilityProfileLines(x.appCapabilityProfiles)}\nSubscription search: ${humanSubscriptionSearchLines(x.subscriptionSearch)}\nPrompt cache: ${humanPromptCacheLines(x.promptCaching)}\nInstructions: ${JSON.stringify(x.instructions)}`);
 }
 
 async function requireRouterServiceSpace() {

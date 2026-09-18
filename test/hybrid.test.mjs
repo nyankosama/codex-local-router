@@ -210,7 +210,7 @@ test("third-party GPT forwards only non-identity Codex compatibility headers", a
   assert.equal(seen.body.client_metadata, undefined);
   assert.equal(seen.body.prompt_cache_key, undefined);
 });
-test("Chat targets omit Codex namespace definitions but keep JSON functions", async () => {
+test("Chat targets flatten Codex namespace definitions without dropping functions", async () => {
   const c = cfg();
   c.defaultTarget = "chat";
   c.targets.chat = {
@@ -235,7 +235,15 @@ test("Chat targets omit Codex namespace definitions but keep JSON functions", as
     model: "chat-model",
     input: "use the function",
     tools: [
-      { type: "namespace", name: "plugin_tools" },
+      {
+        type: "namespace",
+        name: "mcp_search",
+        tools: [{
+          name: "query",
+          description: "Search",
+          parameters: { type: "object", properties: {} },
+        }],
+      },
       {
         type: "function",
         name: "read_file",
@@ -244,10 +252,11 @@ test("Chat targets omit Codex namespace definitions but keep JSON functions", as
       },
     ],
   }, "api", {});
-  assert.deepEqual(sent.tools.map((tool) => tool.function.name), ["read_file"]);
-  assert.ok(logs.some((event) =>
-    event.event === "unsupported_tool_definitions_omitted" &&
-    event.tool_type === "namespace" && event.count === 1));
+  assert.equal(sent.tools.length, 2);
+  assert.match(sent.tools[0].function.name, /^clr_mcp_search__query_/);
+  assert.equal(sent.tools[1].function.name, "read_file");
+  assert.equal(logs.some((event) =>
+    event.event === "unsupported_tool_definitions_omitted"), false);
 });
 test("API passthrough and fixed routing execute real targets; no configured fallback means one attempt", async () => {
   for (const mode of ["passthrough", "fixed", "rules"]) {
@@ -425,6 +434,96 @@ test("search fallback extracts bounded page content without exposing internal to
       ["gateway_web_search", "gateway_web_fetch"].includes(event.item?.name),
     ),
   );
+});
+test("subscription bridge executes fixed-origin search and hides its internal call", async () => {
+  const c = cfg();
+  c.targets.go.app = {
+    enabled: true,
+    modelId: "glm-flash",
+    capabilityProfile: "standard-tools",
+    useResponsesLite: false,
+  };
+  c.targets.go.standaloneSearch = { source: "disabled" };
+  c.targets.go.subscriptionSearch = { delivery: "standard-tool" };
+  c.subscription.customModels = { "glm-flash": "go" };
+  const modelBodies = [];
+  const official = [];
+  let round = 0;
+  const engine = new Engine(validate(c), {
+    send: async (_url, options) => {
+      modelBodies.push(options.body);
+      round++;
+      return json(result(round === 1
+        ? [{
+            type: "function_call",
+            name: "gateway_subscription_web_search",
+            call_id: "subscription-search",
+            arguments: '{"query":"router docs","numResults":2}',
+          }]
+        : [message("https://docs.example.com/router")]),
+      );
+    },
+    officialRequest: async (url, options) => {
+      official.push({ url, options });
+      return json({
+        results: [{
+          title: "Router docs",
+          url: "https://docs.example.com/router",
+          snippet: "fixture",
+          ref_id: "r1",
+        }],
+      });
+    },
+  });
+  const events = await collect(engine, {
+    model: "glm-flash",
+    input: "search",
+    tools: [{
+      type: "web_search",
+      mode: "live",
+      filters: { allowed_domains: ["docs.example.com"] },
+    }],
+  });
+  assert.equal(round, 2);
+  assert.equal(official.length, 1);
+  assert.equal(official[0].url, "https://chatgpt.com/backend-api/codex/alpha/search");
+  assert.equal(official[0].options.headers.authorization, "Bearer official-test");
+  assert.ok(JSON.stringify(modelBodies[1]).includes("https://docs.example.com/router"));
+  assert.equal(events.some((event) =>
+    event.item?.name === "gateway_subscription_web_search"), false);
+});
+test("subscription bridge cannot lend subscription identity to /v1", async () => {
+  const c = cfg();
+  c.targets.go.app = {
+    enabled: true,
+    modelId: "glm-flash",
+    capabilityProfile: "standard-tools",
+    useResponsesLite: false,
+  };
+  c.targets.go.standaloneSearch = { source: "disabled" };
+  c.targets.go.subscriptionSearch = { delivery: "standard-tool" };
+  c.subscription.customModels = { "glm-flash": "go" };
+  let officialCalls = 0;
+  const engine = new Engine(validate(c), {
+    officialRequest: async () => {
+      officialCalls++;
+      throw Error("must not run");
+    },
+  });
+  await assert.rejects(
+    collect(
+      engine,
+      {
+        model: "glm-flash",
+        input: "search",
+        tools: [{ type: "web_search", mode: "cached" }],
+      },
+      "api",
+      { authorization: "Bearer local-api-key" },
+    ),
+    /subscription_search_identity_required/,
+  );
+  assert.equal(officialCalls, 0);
 });
 test("native search passthrough and unavailable fallback errors", async () => {
   let tools;
