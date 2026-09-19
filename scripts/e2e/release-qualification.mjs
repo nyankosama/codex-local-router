@@ -36,20 +36,22 @@ await mkdir(output, { mode: 0o700 });
 
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 const receipts = {};
+const minute = 60 * 1000;
 const stages = [
-  ["profiles", "profile-qualification.mjs", []],
-  ["universalSearch", "universal-search-acceptance.mjs", ["--run", "--max-generations", "8"]],
-  ["officialSearch", "official-search-acceptance.mjs", ["--run"]],
+  ["profiles", "profile-qualification.mjs", [], 15 * minute],
+  ["universalSearch", "universal-search-acceptance.mjs", ["--run", "--max-generations", "8"], 15 * minute],
+  ["officialSearch", "official-search-acceptance.mjs", ["--run"], 15 * minute],
+  ["historyMigration", "history-migration-acceptance.mjs", ["--run", "--max-generations", "18"], 30 * minute],
 ];
 let harnessError = null;
 
-for (const [name, script, args] of stages) {
+for (const [name, script, args, timeout] of stages) {
   const receipt = join(output, `${name}.json`);
   try {
     await exec(process.execPath, [join(import.meta.dirname, script), ...args, "--out", receipt], {
       cwd: projectRoot,
       env: process.env,
-      timeout: 15 * 60 * 1000,
+      timeout,
       maxBuffer: 16 * 1024 * 1024,
     });
     receipts[name] = JSON.parse(await readFile(receipt, "utf8"));

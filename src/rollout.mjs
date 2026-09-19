@@ -1,7 +1,7 @@
 import { createReadStream } from "node:fs";
 import { readFile, readdir } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fail } from "./errors.mjs";
 import { isCompaction } from "./history.mjs";
@@ -32,10 +32,19 @@ async function *records(path) {
   }
 }
 
+async function fileDigest(path) {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
 async function rolloutMeta(path, expectedThread) {
   for await (const { record } of records(path)) {
     if (record.type !== "session_meta") continue;
-    if (!record.payload?.id || record.payload.id !== expectedThread)
+    if (
+      !record.payload?.id ||
+      (expectedThread && record.payload.id !== expectedThread)
+    )
       throw recoveryError(
         "rollout_lineage_conflict",
         "Rollout metadata does not match the requested thread",
@@ -45,84 +54,127 @@ async function rolloutMeta(path, expectedThread) {
   throw recoveryError("rollout_history_incomplete", "Rollout session metadata is missing");
 }
 
-async function locateRollout(sessionsRoot, thread) {
+const escaped = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+async function rolloutBounds(path) {
+  let first = Infinity, last = -1;
+  for await (const { record } of records(path)) {
+    if (!Number.isSafeInteger(record.ordinal)) continue;
+    first = Math.min(first, record.ordinal);
+    last = Math.max(last, record.ordinal);
+  }
+  return { first, last };
+}
+
+async function rolloutPaths(sessionsRoot) {
+  const paths = [];
+  for (const root of [sessionsRoot, join(dirname(sessionsRoot), "archived_sessions")]) {
+    try {
+      paths.push(...(await readdir(root, { recursive: true })).map((name) => join(root, name)));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+  return paths;
+}
+
+async function locateInitialRollout(sessionsRoot, thread) {
   if (!/^[A-Za-z0-9._-]{1,256}$/.test(thread))
     throw recoveryError("rollout_lineage_conflict", "Invalid rollout thread id");
-  let names;
-  try {
-    names = await readdir(sessionsRoot, { recursive: true });
-  } catch (error) {
-    if (error.code === "ENOENT") names = [];
-    else throw error;
+  const pattern = new RegExp(`-${escaped(thread)}(?:_|\\.jsonl$)`);
+  const candidates = (await rolloutPaths(sessionsRoot))
+    .filter((path) => pattern.test(basename(path)));
+  const matches = [];
+  for (const path of candidates) {
+    const meta = await rolloutMeta(path);
+    if (meta.id !== thread) continue;
+    matches.push({ path, ...(await rolloutBounds(path)) });
   }
-  const suffix = `-${thread}.jsonl`;
-  const matches = names
-    .filter((name) => basename(name).endsWith(suffix))
-    .map((name) => join(sessionsRoot, name));
   if (matches.length === 0)
     throw recoveryError(
       "rollout_history_base_missing",
       `Rollout source for ${thread} was not found`,
     );
-  if (matches.length !== 1)
+  const latest = Math.max(...matches.map((match) => match.last));
+  const selected = matches.filter((match) => match.last === latest);
+  if (selected.length !== 1)
     throw recoveryError(
       "rollout_lineage_conflict",
       `Multiple rollout sources match ${thread}`,
+    );
+  return selected[0].path;
+}
+
+async function locateBaseRollout(sessionsRoot, reference, limit, exclude) {
+  if (!/^[A-Za-z0-9._-]{1,256}$/.test(reference))
+    throw recoveryError("rollout_lineage_conflict", "Invalid rollout base reference");
+  const pattern = new RegExp(`(?:-|_)${escaped(reference)}\\.jsonl$`);
+  const candidates = (await rolloutPaths(sessionsRoot))
+    .filter((path) => pattern.test(basename(path)))
+    .filter((path) => resolve(path) !== resolve(exclude));
+  const matches = [];
+  for (const path of candidates) {
+    const bounds = await rolloutBounds(path);
+    if (bounds.first < limit && bounds.last >= limit - 1)
+      matches.push(path);
+  }
+  if (!matches.length && candidates.length)
+    throw recoveryError(
+      "rollout_lineage_conflict",
+      `Rollout base ${reference} does not reach ordinal ${limit}`,
+    );
+  if (!matches.length)
+    throw recoveryError(
+      "rollout_history_base_missing",
+      `Rollout base ${reference} ending at ordinal ${limit} was not found`,
+    );
+  if (matches.length !== 1)
+    throw recoveryError(
+      "rollout_lineage_conflict",
+      `Multiple rollout sources match base ${reference}`,
     );
   return matches[0];
 }
 
 function parentReference(meta) {
-  const ids = [meta.history_base?.thread_id, meta.forked_from_id]
-    .filter((value) => typeof value === "string" && value);
-  const uniqueIds = [...new Set(ids)];
-  const ordinals = [
-    meta.history_base?.end_ordinal_exclusive,
-    meta.forked_from_ordinal_exclusive,
-  ].filter((value) => value != null);
-  const uniqueOrdinals = [...new Set(ordinals)];
-  if (uniqueIds.length > 1 || uniqueOrdinals.length > 1)
-    throw recoveryError(
-      "rollout_lineage_conflict",
-      "Rollout parent metadata conflicts",
-    );
-  if (!uniqueIds.length) {
-    if (uniqueOrdinals.length)
-      throw recoveryError(
-        "rollout_lineage_conflict",
-        "Rollout has a fork boundary without a parent",
-      );
-    return null;
-  }
+  const base = meta.history_base;
+  const reference = base?.thread_id ?? meta.forked_from_id;
+  const limit = base?.end_ordinal_exclusive ?? meta.forked_from_ordinal_exclusive;
+  if (reference == null && limit == null) return null;
   if (
-    uniqueOrdinals.length !== 1 ||
-    !Number.isSafeInteger(uniqueOrdinals[0]) ||
-    uniqueOrdinals[0] <= 0
+    typeof reference !== "string" ||
+    !reference ||
+    !Number.isSafeInteger(limit) ||
+    limit <= 0
   )
     throw recoveryError(
       "rollout_lineage_conflict",
       "Rollout parent boundary is missing or invalid",
     );
-  return { thread: uniqueIds[0], limit: uniqueOrdinals[0] };
+  return { reference, limit };
 }
 
 async function rolloutChain({ thread, source, sessionsRoot, maxDepth = 16 }) {
   const chain = [];
   const seen = new Set();
-  let currentThread = thread;
-  let currentPath = source ? resolve(source) : await locateRollout(sessionsRoot, thread);
+  let currentPath = source ? resolve(source) : await locateInitialRollout(sessionsRoot, thread);
   let limit = Infinity;
   for (let depth = 0; depth < maxDepth; depth++) {
-    if (seen.has(currentThread))
+    const marker = `${resolve(currentPath)}\0${limit}`;
+    if (seen.has(marker))
       throw recoveryError("rollout_lineage_conflict", "Rollout lineage contains a cycle");
-    seen.add(currentThread);
-    const meta = await rolloutMeta(currentPath, currentThread);
+    seen.add(marker);
+    const meta = await rolloutMeta(currentPath, depth === 0 ? thread : undefined);
     chain.push({ path: currentPath, meta, limit });
     const parent = parentReference(meta);
     if (!parent) return chain.reverse();
-    currentThread = parent.thread;
     limit = parent.limit;
-    currentPath = await locateRollout(sessionsRoot, currentThread);
+    currentPath = await locateBaseRollout(
+      sessionsRoot,
+      parent.reference,
+      parent.limit,
+      currentPath,
+    );
   }
   throw recoveryError("rollout_lineage_conflict", "Rollout lineage exceeds 16 levels");
 }
@@ -140,6 +192,34 @@ function updateToolPairs(item, pending, completed) {
   if (!pending.delete(id) || completed.has(id))
     throw recoveryError("rollout_history_incomplete", "Rollout tool result has no matching call");
   completed.add(id);
+}
+
+function preserveAbortedToolCalls(original, pending) {
+  if (!pending.size) return;
+  const uncertain = [];
+  for (let index = original.length - 1; index >= 0; index--) {
+    const item = original[index];
+    if (
+      ["function_call", "custom_tool_call", "tool_search_call"].includes(item?.type) &&
+      pending.has(item.call_id)
+    ) {
+      uncertain.unshift({
+        type: "message",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text:
+              `[Interrupted tool call ${item.name ?? item.type} ` +
+              `(${item.call_id}); execution result is unknown and must not be assumed or repeated automatically.]`,
+          },
+        ],
+      });
+      original.splice(index, 1);
+    }
+  }
+  original.push(...uncertain);
+  pending.clear();
 }
 
 export function checkpointScope(account, thread, branch = thread) {
@@ -168,19 +248,30 @@ export async function planRolloutRecovery({
   for (const entry of chain) {
     let previousOrdinal = -1;
     let lastIncludedOrdinal = -1;
-    const fileHash = createHash("sha256");
+    const inheritedBoundary = parentReference(entry.meta)?.limit;
     for await (const { record, line } of records(entry.path)) {
-      fileHash.update(line).update("\n");
-      if (!Number.isSafeInteger(record.ordinal) || record.ordinal <= previousOrdinal)
+      const effectiveOrdinal =
+        record.type === "session_meta" &&
+        Number.isSafeInteger(inheritedBoundary) &&
+        record.ordinal < inheritedBoundary
+          ? inheritedBoundary - 1
+          : record.ordinal;
+      if (
+        !Number.isSafeInteger(effectiveOrdinal) ||
+        effectiveOrdinal <= previousOrdinal ||
+        (previousOrdinal >= 0 && effectiveOrdinal !== previousOrdinal + 1)
+      )
         throw recoveryError(
           "rollout_history_incomplete",
           "Rollout ordinals are missing or non-monotonic",
         );
-      previousOrdinal = record.ordinal;
+      previousOrdinal = effectiveOrdinal;
       if (record.ordinal >= entry.limit) continue;
       lastIncludedOrdinal = record.ordinal;
       sourceHash.update(line).update("\n");
       relevantRecords++;
+      if (record.type === "event_msg" && record.payload?.type === "turn_aborted")
+        preserveAbortedToolCalls(original, pending);
       if (record.type === "turn_context" && typeof record.payload?.model === "string")
         model = record.payload.model;
       if (record.type === "response_item" && record.payload) {
@@ -210,16 +301,17 @@ export async function planRolloutRecovery({
         );
       const checkpointModel = model ?? entry.meta.model;
       checkpoints.push({
-        thread: entry.meta.id,
-        branch: entry.meta.id,
+        thread,
+        branch: thread,
         item: compacted[0],
         sourceHash: sourceHash.copy().digest("hex"),
         checkpoint: {
           provider: "chatgpt-subscription",
           model: checkpointModel ?? null,
           targetId: checkpointModel ? `official:${checkpointModel}` : null,
-          original: structuredClone(original),
-          view: structuredClone(replacement),
+          original: original.slice(),
+          view: replacement.slice(),
+          completeness: "complete_original",
           virtual: false,
         },
       });
@@ -229,7 +321,7 @@ export async function planRolloutRecovery({
         "rollout_lineage_conflict",
         "Rollout fork boundary does not match the parent source",
       );
-    entry.sourceHash = fileHash.digest("hex");
+    entry.sourceHash = await fileDigest(entry.path);
   }
   if (!checkpoints.length)
     throw recoveryError(
@@ -240,12 +332,23 @@ export async function planRolloutRecovery({
     thread,
     files: chain.map((entry) => ({
       thread: entry.meta.id,
+      path: entry.path,
       sourceHash: entry.sourceHash,
     })),
     sourceHash: sourceHash.digest("hex"),
     relevantRecords,
     checkpoints,
   };
+}
+
+export async function verifyRolloutRecoverySources(plan) {
+  for (const file of plan.files)
+    if ((await fileDigest(file.path)) !== file.sourceHash)
+      throw recoveryError(
+        "rollout_source_changed",
+        "A rollout source changed after recovery planning",
+      );
+  return true;
 }
 
 const sameCheckpoint = (left, right) =>
@@ -256,26 +359,37 @@ const sameCheckpoint = (left, right) =>
   JSON.stringify(left?.original ?? left?.portable) === JSON.stringify(right.original) &&
   JSON.stringify(left?.view ?? left?.portable) === JSON.stringify(right.view);
 
+const canEnrichCheckpoint = (current, recovered) =>
+  current?.provider === recovered.provider &&
+  current?.model === recovered.model &&
+  current?.targetId === recovered.targetId &&
+  current?.virtual === recovered.virtual &&
+  !Array.isArray(current.original ?? current.portable) &&
+  (!current.view || JSON.stringify(current.view) === JSON.stringify(recovered.view));
+
 export function applyRolloutRecovery(archive, plan, { account, apply = false } = {}) {
   const writes = [];
-  let existing = 0;
+  let existing = 0, enriched = 0;
   for (const recovery of plan.checkpoints) {
     const { keyOwner, scope } = checkpointScope(account, recovery.thread, recovery.branch);
     const key = `checkpoint:${keyOwner}:${sha256(recovery.item.encrypted_content)}`;
     const current = archive.getState(key);
     if (current) {
-      if (!sameCheckpoint(current, recovery.checkpoint))
+      if (sameCheckpoint(current, recovery.checkpoint)) {
+        existing++;
+        continue;
+      }
+      if (!canEnrichCheckpoint(current, recovery.checkpoint))
         throw recoveryError(
           "rollout_lineage_conflict",
           "A different checkpoint already exists for this compaction",
         );
-      existing++;
-      continue;
+      enriched++;
     }
     writes.push({ key, scope, recovery });
   }
   if (apply) {
-    archive.setStates(writes.map(({ key, scope, recovery }) => ({
+    const entries = writes.map(({ key, scope, recovery }) => ({
       key,
       scope,
       value: {
@@ -285,7 +399,10 @@ export function applyRolloutRecovery(archive, plan, { account, apply = false } =
           recoveredAt: Date.now(),
         },
       },
-    })));
+    }));
+    if (archive.setRecoveredCheckpoints)
+      archive.setRecoveredCheckpoints(entries);
+    else archive.setStates(entries);
   }
   return {
     applied: apply,
@@ -295,6 +412,7 @@ export function applyRolloutRecovery(archive, plan, { account, apply = false } =
     relevantRecords: plan.relevantRecords,
     checkpoints: plan.checkpoints.length,
     existing,
+    enriched,
     written: apply ? writes.length : 0,
     wouldWrite: apply ? 0 : writes.length,
     events: apply && writes.length

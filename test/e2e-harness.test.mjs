@@ -4,7 +4,20 @@ import { chmod, lstat, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
-import { captureWebSocketProxy, classifyMcpToolFailure, collectToolNames, finalizeTransportFailure, isolatedChildEnv, isolatedCodexHome, persistCaseVerdict, runCliExec, writeDeterministicCodexInputs } from "../scripts/e2e/lib/harness.mjs";
+import { captureWebSocketProxy, classifyMcpToolFailure, collectToolNames, finalizeTransportFailure, hasCompactionEvidence, isolatedChildEnv, isolatedCodexHome, persistCaseVerdict, runCliExec, writeDeterministicCodexInputs } from "../scripts/e2e/lib/harness.mjs";
+
+test("A10 compaction accepts the current item signal and legacy notification", () => {
+  const threadId = "thread";
+  assert.equal(hasCompactionEvidence([
+    { method: "item/completed", threadId, itemType: "contextCompaction" },
+  ], threadId), true);
+  assert.equal(hasCompactionEvidence([
+    { method: "thread/compacted", threadId },
+  ], threadId), true);
+  assert.equal(hasCompactionEvidence([
+    { method: "item/completed", threadId, itemType: "agentMessage" },
+  ], threadId), false);
+});
 
 test("A10 pre-header transport failures finalize zero response bytes and total time", () => {
   const metadata = { at: 1000, requestBytes: 64 };

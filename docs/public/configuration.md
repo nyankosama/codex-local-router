@@ -11,6 +11,12 @@ Runtime configuration remains schema 3. Configuration-space storage is schema 1 
 
 For initialization, cloning, switching, rollback, drift, pending transactions, and rescue workflows, see the [configuration-space guide](configuration-spaces.md).
 
+## Request timeouts
+
+`timeoutMs` defaults to 180,000 ms; a target may override it. HTTP connection establishment is limited to the smaller of 15 seconds and this value. Before response headers and for non-SSE responses, it is a total request deadline. Once the upstream declares `text/event-stream`, it becomes an inactivity deadline, reset by incoming bytes (including heartbeats). A progressing generation may therefore last longer than three minutes. The inactivity clock pauses while downstream backpressure stops reads; cancellation still closes the upstream. Native official WebSocket relay is not subject to this HTTP deadline.
+
+This is not an automatic retry or an unlimited silent wait: an upstream that sends no bytes for the interval still fails. Heartbeats can keep a request alive even without visible text, and a user can cancel it. No configuration-space migration is required.
+
 ## Third-party default template
 
 New App-enabled third-party models default to `codex-general-v1` when they declare Responses, tool calling and freeform tools and their preset is Provider-qualified. The template materializes generic instructions, Standard Responses, code mode, multi-agent v2, disabled standalone search and the standard Plugin policy. `thirdPartyDefaults.template` may be `codex-general-v1` or `legacy`; it affects later creation only. Existing targets change only through `model apply-template`. The current OpenCode Go DeepSeek preset is legacy-only despite its static capability shape. See [third-party templates](third-party-templates.md).
@@ -245,7 +251,7 @@ Built-in presets, Provider-specific commands, public examples, and their qualifi
 Declarations are validated rather than guessed:
 
 - `--context-window` is required by schema 3. Too small a value causes premature summarization; too large a value defers the failure to the upstream.
-- `--compression` states what the channel can do with a full history: `native` (the channel accepts the stored original directly and an explicit same-account compatibility target set is required), `summary` (one source-model summary is allowed after an explicit context-limit rejection), or `unsupported` (never lossy).
+- `--compression` states what the channel can do with a full history: `native` (the channel accepts the stored original directly and an explicit same-account compatibility target set is required), `summary` (one source-model summary is allowed after an explicit context-limit rejection), or `unsupported` (never lossy). `--native-migration-summary` is a separate, default-off option for a trusted official opaque compaction window; it is valid only in `summary` mode and never turns an incomplete lineage into a valid source.
 - `--input-modalities` must match the channel. `chat_completions` targets cannot accept images. An image sent to a text-only target is described by a configured source model when one exists, otherwise the request is rejected with `image_migration_unavailable`.
 - `--no-tools`, `--no-streaming`, `--freeform-tools`, and `--native-search` (Responses only) keep the declared capabilities honest. `--app-profile standard-tools|lite-search` chooses the App contract. `--search-source subscription|provider|disabled` controls standalone search; `--supports-search-tool`, `--no-supports-search-tool`, `--responses-lite`, and `--no-responses-lite` remain compatibility inputs. Contradictory profile/search/transport combinations are invalid. A chat_completions target cannot declare an App capability profile, `--native-search`, or Provider standalone search.
 - `--model-family openai-gpt|other` opts a target into the corresponding default. `--plugin-policy passthrough|third-party-gpt-default|allowlist` selects an explicit policy; `--allowed-plugins` is required with `allowlist`.

@@ -67,6 +67,7 @@ export function relayRequestHeaders(headers, { models = false, websocket = false
       lower === "host" ||
       hopByHop.has(lower) ||
       dynamic.has(lower) ||
+      (websocket && ["content-encoding", "content-length", "content-type"].includes(lower)) ||
       lower.startsWith("proxy-") ||
       lower.startsWith("sec-websocket-")
     ) continue;

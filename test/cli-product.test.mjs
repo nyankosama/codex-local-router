@@ -232,10 +232,24 @@ test("setup reports pending App integration and core query commands are JSON-saf
     "standard-tools",
   );
   await exec(process.execPath, [
+    testCli, "model", "edit", "--id", "generic-gpt",
+    "--native-migration-summary", "--yes", "--json",
+  ], { env: stoppedEnvironment });
+  let generic = JSON.parse((await exec(
+    process.execPath,
+    [testCli, "model", "probe", "--id", "generic-gpt", "--json"],
+    { env: stoppedEnvironment },
+  )).stdout);
+  assert.equal(generic.nativeMigrationSummary, true);
+  await exec(process.execPath, [
+    testCli, "model", "edit", "--id", "generic-gpt",
+    "--no-native-migration-summary", "--yes", "--json",
+  ], { env: stoppedEnvironment });
+  await exec(process.execPath, [
     testCli, "model", "edit", "--id", "generic-gpt", "--app-profile", "lite-search",
     "--yes", "--json",
   ], { env: stoppedEnvironment });
-  let generic = JSON.parse((await exec(
+  generic = JSON.parse((await exec(
     process.execPath,
     [testCli, "model", "list", "--json"],
     { env: stoppedEnvironment },

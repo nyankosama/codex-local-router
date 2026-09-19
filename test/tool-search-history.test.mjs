@@ -90,6 +90,32 @@ test("tool search pairs become fixed portable markers without leaking provider m
   assert.match(serialized, /CUSTOM_RESULT/);
 });
 
+test("visible agent messages and completed search sources remain portable facts", () => {
+  const portable = portableItems([
+    {
+      type: "agent_message",
+      text: "delegated result",
+      encrypted_content: "provider-private-agent-state",
+    },
+    {
+      type: "web_search_call",
+      status: "completed",
+      sources: [{ title: "Public source", url: "https://example.test/source" }],
+      encrypted_content: "provider-private-search-state",
+    },
+  ]);
+  const serialized = JSON.stringify(portable);
+  assert.match(serialized, /delegated result/);
+  assert.match(serialized, /Provider-private agent state was not portable/);
+  assert.match(serialized, /Public source/);
+  assert.match(serialized, /https:\/\/example\.test\/source/);
+  assert.doesNotMatch(serialized, /provider-private/);
+  assert.throws(
+    () => portableItems([{ type: "web_search_call", status: "in_progress" }]),
+    (error) => error.type === "history_incompatible",
+  );
+});
+
 test("multiple interleaved tool search pairs preserve order and allow empty results", () => {
   const [call1, output1] = pair("search-1", "ONE", []);
   const [call2, output2] = pair("search-2", "TWO", [{ type: "function", name: "hidden" }]);

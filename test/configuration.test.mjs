@@ -162,6 +162,25 @@ test("custom native compression requires an explicit same-account compatibility 
   assert.equal(validate(input).targets.deepseek.compression.mode, "native");
 });
 
+test("native migration summaries are explicit and require summary compression", () => {
+  const input = upgradeConfig(legacy()).config;
+  input.targets.deepseek.compression.nativeMigrationSummary = true;
+  assert.equal(
+    validate(input).targets.deepseek.compression.nativeMigrationSummary,
+    true,
+  );
+  input.targets.deepseek.compression.mode = "unsupported";
+  assert.throws(
+    () => validate(input),
+    /native migration summary .* requires summary compression/,
+  );
+  input.targets.deepseek.compression = {
+    mode: "summary",
+    nativeMigrationSummary: "yes",
+  };
+  assert.throws(() => validate(input), /invalid native migration summary setting/);
+});
+
 test("Responses message phase policy is provider-scoped and validated", () => {
   const input = upgradeConfig(legacy()).config;
   input.providers.generic.responsesMessagePhasePolicy = "defer_until_done";

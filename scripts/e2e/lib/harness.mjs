@@ -221,6 +221,16 @@ export function persistCaseVerdict(observation, finalVerdict) {
   return { ...observation, result: finalVerdict };
 }
 
+export function hasCompactionEvidence(notifications, threadId, after = 0) {
+  return notifications.slice(after).some((entry) =>
+    entry.threadId === threadId &&
+    (entry.method === "thread/compacted" ||
+      (entry.method === "item/completed" &&
+        String(entry.itemType ?? "").replaceAll("_", "").toLowerCase() ===
+          "contextcompaction")),
+  );
+}
+
 export async function verifyAcceptanceRevision(projectRoot, expected) {
   if (!expected) return { commit: "working-tree", tree: null };
   const [{ stdout: head }, { stdout: tree }, { stdout: status }] = await Promise.all([
@@ -517,6 +527,11 @@ export async function startIsolatedGateway({
         .update(parsedUrl.pathname)
         .update(requestBytes)
         .digest("hex"),
+      previousResponseIdFingerprint:
+        typeof body?.previous_response_id === "string"
+          ? createHash("sha256").update(body.previous_response_id).digest("hex")
+          : null,
+      hasGatewayVirtualCheckpoint: requestText.includes("gateway-checkpoint-v1:"),
       promptCacheKeyFingerprint:
         typeof body?.prompt_cache_key === "string"
           ? createHash("sha256").update(body.prompt_cache_key).digest("hex")
@@ -736,6 +751,10 @@ export async function startIsolatedGateway({
         if (isBinary) return;
         try {
           const event = JSON.parse(Buffer.from(data).toString("utf8"));
+          if (metadata && typeof event.response?.id === "string")
+            metadata.responseIdFingerprint = createHash("sha256")
+              .update(event.response.id)
+              .digest("hex");
           if (metadata && isSubstantiveResponseEvent(event))
             metadata.firstSubstantiveMs ??= Date.now() - metadata.at;
           if (metadata && event.type === "response.output_text.delta")
@@ -950,6 +969,7 @@ export function startAppServer({ corePath, home, cwd }) {
     env: isolatedChildEnv(home),
     stdio: ["pipe", "pipe", "ignore"],
   });
+  const closed = new Promise((resolve) => child.once("close", resolve));
   const notifications = [];
   const threads = new Map();
   const pending = new Map();
@@ -966,7 +986,10 @@ export function startAppServer({ corePath, home, cwd }) {
       at: Date.now(),
       method: message.method,
       id: message.id,
+      threadId: message.params?.threadId ?? null,
+      turnId: message.params?.turnId ?? message.params?.turn?.id ?? null,
       itemType: message.params?.item?.type,
+      turnStatus: message.params?.turn?.status ?? null,
     });
     if (message.id != null && pending.has(message.id)) {
       const entry = pending.get(message.id);
@@ -1084,7 +1107,8 @@ export function startAppServer({ corePath, home, cwd }) {
       child.stdin.write('{"method":"initialized"}\n');
     },
     async close() {
-      child.kill();
+      if (!exited) child.kill();
+      await closed;
     },
   };
 }

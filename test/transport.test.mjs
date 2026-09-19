@@ -4,6 +4,96 @@ import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { request } from "../src/transport.mjs";
 import { requestRaw } from "../src/transport.mjs";
+import { setTimeout as delay } from "node:timers/promises";
+
+async function fixture(t, handler) {
+  const server = createHttpServer(handler);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  return `http://127.0.0.1:${server.address().port}/responses`;
+}
+
+const consume = async (response) => {
+  const chunks = [];
+  for await (const chunk of response.body) chunks.push(chunk);
+  return Buffer.concat(chunks);
+};
+const isTimeout = (error) => error.type === "upstream_timeout" &&
+  error.transportCode === 28 && error.transportCategory === "timeout";
+
+test("SSE keeps streaming beyond timeoutMs while non-SSE retains its total deadline", async (t) => {
+  for (const streaming of [true, false]) {
+    await t.test(streaming ? "active SSE" : "finite JSON", async (t) => {
+      const url = await fixture(t, (_req, res) => {
+        res.writeHead(200, { "content-type": streaming ? "text/event-stream; charset=utf-8" : "application/json" });
+        res.flushHeaders();
+        let count = 0;
+        const timer = setInterval(() => {
+          res.write(streaming ? `data: ${++count}\n\n` : " ");
+          if (count === 20) res.end("data: [DONE]\n\n");
+        }, 100);
+        res.on("close", () => clearInterval(timer));
+      });
+      const started = Date.now();
+      const result = requestRaw(url, { timeoutMs: 1000 }).then(consume);
+      if (streaming) {
+        assert.match((await result).toString(), /\[DONE\]/);
+        assert.ok(Date.now() - started > 1000);
+      } else await assert.rejects(result, isTimeout);
+    });
+  }
+});
+
+test("silent headers and stalled SSE both time out without retry", async (t) => {
+  for (const headers of [false, true]) {
+    await t.test(headers ? "after headers" : "before headers", async (t) => {
+      let calls = 0;
+      const url = await fixture(t, (_req, res) => {
+        calls++;
+        if (headers) {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.flushHeaders();
+        }
+      });
+      await assert.rejects(requestRaw(url, { timeoutMs: 600 }).then(consume), isTimeout);
+      assert.equal(calls, 1);
+    });
+  }
+});
+
+test("SSE backpressure is not upstream inactivity", async (t) => {
+  const payload = Buffer.alloc(2 * 1024 * 1024, 120);
+  const url = await fixture(t, (_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(payload);
+  });
+  const response = await requestRaw(url, { timeoutMs: 600 });
+  await delay(1300);
+  assert.deepEqual(await consume(response), payload);
+});
+
+test("active SSE remains cancellable and consumer close releases upstream", async (t) => {
+  for (const abort of [true, false]) {
+    await t.test(abort ? "AbortSignal" : "consumer close", async (t) => {
+      let closed;
+      const disconnected = new Promise((resolve) => { closed = resolve; });
+      const url = await fixture(t, (_req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("data: start\n\n");
+        const timer = setInterval(() => res.write(": heartbeat\n\n"), 50);
+        res.on("close", () => { clearInterval(timer); closed(); });
+      });
+      const controller = new AbortController();
+      const response = await requestRaw(url, { timeoutMs: 600, signal: controller.signal });
+      if (abort) {
+        const reading = consume(response);
+        controller.abort();
+        await assert.rejects(reading, (error) => error.type === "cancelled");
+      } else response.body.destroy();
+      await disconnected;
+    });
+  }
+});
 
 test("curl failures expose only a structured transport diagnosis", async (t) => {
   const server = createServer((socket) => socket.destroy());

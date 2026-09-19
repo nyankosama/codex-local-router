@@ -46,6 +46,8 @@ Live cases use the current supported Codex client and a bounded, declared matrix
 
 Missing execution evidence is not a pass. Capability declarations and catalog visibility do not prove live support.
 
+The default runtime Release gate includes two bounded history-lifecycle chains: official model → two native compactions → fork → GLM Flash or third-party GPT → one read-only tool call/result/continuation → same-provider summary reuse → Gateway and App-server restart → official continuation. The GLM chain restarts from a synthetic legacy metadata-only checkpoint before its first cross-provider turn. Together the chains may make at most 18 upstream model requests, including native compaction and an explicitly enabled migration summary. They do not retry failed samples. A pass requires recovery before routing, preserved synthetic facts, the latest instruction and tool result; exactly one tool execution; exactly one source-model migration summary per preparation and none on reuse; no Gateway or reconnect error; credential separation; no official opaque state sent to the third party; and no Gateway virtual checkpoint sent back to OpenAI.
+
 ## Security and evidence handling
 
 Live work uses isolated homes, state, credentials, ports, and synthetic or public content. Public evidence may include versions, hashes, counts, timing, redacted destinations, and result categories. It must not include credentials, private conversations, raw history databases, local configuration, request or response bodies, search queries or results, runner host configuration, or rollback packages.

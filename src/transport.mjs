@@ -71,8 +71,6 @@ export function requestRaw(
         "--suppress-connect-headers",
         "--connect-timeout",
         String(Math.min(15000, timeoutMs) / 1000),
-        "--max-time",
-        String(timeoutMs / 1000),
         "--config",
         "/dev/fd/3",
       ],
@@ -83,16 +81,36 @@ export function requestRaw(
       stderr = "",
       started = false,
       settled = false,
-      aborted = false;
+      aborted = false,
+      streaming = false,
+      timedOut = false,
+      closed = false,
+      timer;
+    const clearDeadline = () => clearTimeout(timer);
+    const armDeadline = () => {
+      clearDeadline();
+      if (closed || aborted || timedOut || output.destroyed) return;
+      timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, timeoutMs);
+      timer.unref?.();
+    };
+    // Finite responses retain a total deadline. SSE measures silence instead:
+    // long reasoning/tool streams must not expire while bytes keep arriving.
+    armDeadline();
     const abort = () => {
       aborted = true;
+      clearDeadline();
       child.kill("SIGTERM");
     };
     signal?.addEventListener("abort", abort, { once: true });
     output.once("close", () => {
+      clearDeadline();
       if (!output.readableEnded) child.kill("SIGTERM");
     });
     const error = (e) => {
+      clearDeadline();
       output.destroy(e);
       if (!settled) {
         settled = true;
@@ -120,6 +138,7 @@ export function requestRaw(
     ].join("\n"));
     child.stdin.end(body ?? undefined);
     child.stdout.on("data", (chunk) => {
+      if (streaming) armDeadline();
       if (!started) {
         header = Buffer.concat([header, chunk]);
         for (;;) {
@@ -149,6 +168,8 @@ export function requestRaw(
               rawHeaders.push([key, value]);
             }
           }
+          streaming = /^text\/event-stream(?:\s*;|$)/i.test(h.get("content-type") ?? "");
+          if (streaming) armDeadline();
           started = true;
           settled = true;
           resolve({
@@ -164,26 +185,33 @@ export function requestRaw(
         }
       }
       if (!output.write(chunk)) {
+        // Downstream backpressure is not upstream silence.
+        if (streaming) clearDeadline();
         child.stdout.pause();
-        output.once("drain", () => child.stdout.resume());
+        output.once("drain", () => {
+          if (streaming) armDeadline();
+          child.stdout.resume();
+        });
       }
     });
     child.on("error", () => error(fail("transport_unavailable", 503)));
     child.on("close", (code) => {
+      closed = true;
+      clearDeadline();
       children.delete(child);
       signal?.removeEventListener("abort", abort);
       if (code !== 0) {
         const failure = fail(
           aborted
             ? "cancelled"
-            : code === 28
+            : timedOut || code === 28
               ? "upstream_timeout"
               : "upstream_connection_error",
-          aborted ? 499 : code === 28 ? 504 : 502,
+          aborted ? 499 : timedOut || code === 28 ? 504 : 502,
         );
         if (!aborted) {
-          failure.transportCode = code;
-          failure.transportCategory = curlFailureCategory(code, stderr);
+          failure.transportCode = timedOut ? 28 : code;
+          failure.transportCategory = timedOut ? "timeout" : curlFailureCategory(code, stderr);
         }
         error(failure);
       }

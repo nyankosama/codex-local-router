@@ -12,7 +12,14 @@ import { createGateway } from "../src/server.mjs";
 import { identity, threadOwner } from "../src/state.mjs";
 import { buildModelCatalog } from "../src/model-catalog.mjs";
 import { Archive } from "../src/archive.mjs";
-import { expandCheckpoints, portableItems } from "../src/history.mjs";
+import {
+  expandCheckpoints,
+  checkpointFor,
+  checkpointKey,
+  checkpointTargetStatus,
+  portableItems,
+  saveCheckpoint,
+} from "../src/history.mjs";
 
 const GPT = "gpt-5.6-sol",
   DS = "deepseek-v4.1-flash";
@@ -90,6 +97,7 @@ const call = async (
   h = headers,
   previousResponseId,
   clientMetadata,
+  request = {},
 ) => {
   const events = [];
   for await (const event of e.generate(
@@ -104,6 +112,7 @@ const call = async (
         : {}),
     },
     new AbortController().signal,
+    request,
   ))
     events.push(event);
   return events.at(-1).response;
@@ -147,6 +156,42 @@ test("provider-private reasoning becomes an explicit migration marker", () => {
   ]);
   assert.match(JSON.stringify(portable), /Provider-private reasoning state/);
   assert.ok(!JSON.stringify(portable).includes("opaque-provider-state"));
+});
+
+test("checkpoint inspection separates usable, summary-needed and blocked history", () => {
+  const target = config().targets.go;
+  const base = {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    virtual: false,
+    view: [opaque],
+  };
+  assert.equal(
+    checkpointTargetStatus({ ...base, original: [msg("user", "portable")] }, target)
+      .reason,
+    "portable_original",
+  );
+  assert.deepEqual(checkpointTargetStatus(base, target), {
+    compatible: false,
+    needsSummary: false,
+    reason: "portable_source_missing",
+  });
+  assert.deepEqual(
+    checkpointTargetStatus(base, {
+      ...target,
+      compression: { mode: "summary", nativeMigrationSummary: true },
+    }),
+    {
+      compatible: false,
+      needsSummary: true,
+      reason: "opaque_source_window",
+    },
+  );
+  assert.equal(
+    checkpointTargetStatus({ ...base, completeness: "gap_present" }, target).reason,
+    "gap_present",
+  );
 });
 
 test("same turn old-model compaction then new-model inference in both directions preserves history and tool results", async () => {
@@ -649,6 +694,128 @@ test("explicit target overflow triggers one persisted source summary; estimates 
   assert.equal(calls, 1);
 });
 
+test("obvious local overflow summarizes before send and rejects an unsummarizable tail without network", async () => {
+  const c = config();
+  c.targets.go.contextWindow = 10000;
+  c.targets.go.effectiveContextWindowPercent = 95;
+  c.targets.go.outputReserveTokens = 1000;
+  const seen = [];
+  const logs = [];
+  let officialSummaries = 0;
+  const e = new Engine(c, {
+    log: (entry) => logs.push(entry),
+    send: async (_, options) => {
+      seen.push(options.body);
+      if (options.body.instructions?.startsWith("Create one factual"))
+        return json(result([msg("assistant", "LOCAL_PREFLIGHT_SUMMARY") ]));
+      return json(result([msg("assistant", "done") ]));
+    },
+  });
+  const preflightCheckpoint = {
+    type: "compaction",
+    encrypted_content: "official-preflight-checkpoint",
+  };
+  const preflightCtx = identity("subscription", headers, {
+    input: [preflightCheckpoint],
+    client_metadata: metadata("preflight-target"),
+  });
+  saveCheckpoint(e.state, preflightCtx, preflightCheckpoint, {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    original: [
+      msg("user", `OLD_HISTORY_${"x".repeat(60000)}`),
+      { ...msg("assistant", "old answer"), id: "item_gateway_preflight" },
+    ],
+    view: [preflightCheckpoint],
+    completeness: "complete_original",
+    virtual: false,
+  });
+  e.state.set("last-target:" + preflightCtx.owner, { ...c.targets.go }, preflightCtx);
+  await call(
+    e,
+    DS,
+    "preflight-target",
+    [
+      preflightCheckpoint,
+      msg("user", "current request"),
+      {
+        type: "function_call_output",
+        id: "fco_app_event",
+        name: "send_message_to_thread",
+        output:
+          "<codex_delegation><input>DELEGATED_RESPONSE_ONLY</input></codex_delegation>",
+      },
+    ],
+    "turn",
+    headers,
+    undefined,
+    undefined,
+    {
+      officialSummary: async (body) => {
+        officialSummaries++;
+        assert.doesNotMatch(JSON.stringify(body.input), /item_gateway_/);
+        return {
+          type: "response.completed",
+          response: result([msg("assistant", "LOCAL_PREFLIGHT_SUMMARY")]),
+        };
+      },
+    },
+  );
+  const targetCalls = seen.filter((body) => body.model === DS);
+  assert.equal(targetCalls.length, 1, "oversized target body must not reach upstream");
+  assert.match(JSON.stringify(targetCalls[0].input), /LOCAL_PREFLIGHT_SUMMARY/);
+  assert.match(JSON.stringify(targetCalls[0].input), /DELEGATED_RESPONSE_ONLY/);
+  assert.ok(
+    targetCalls[0].input.every(
+      (item) => item.type !== "function_call_output" || item.call_id,
+    ),
+  );
+  assert.equal(officialSummaries, 1);
+  assert.equal(
+    seen.filter((body) => body.instructions?.startsWith("Create one factual")).length,
+    0,
+  );
+  assert.ok(logs.some((entry) => entry.event === "context_budget_preflight_blocked"));
+
+  let blockedCalls = 0;
+  const blocked = new Engine(c, {
+    send: async () => {
+      blockedCalls++;
+      return json(result([]));
+    },
+  });
+  await assert.rejects(
+    call(blocked, DS, "preflight-tail", [
+      msg("user", `CURRENT_${"x".repeat(60000)}`),
+    ]),
+    (error) =>
+      error.type === "context_length_exceeded" && error.status === 413,
+  );
+  assert.equal(blockedCalls, 0);
+});
+
+test("official access_programs denial is classified separately from history failures", async () => {
+  const logs = [];
+  const e = new Engine(config(), {
+    log: (entry) => logs.push(entry),
+    send: async () =>
+      upstreamError(
+        403,
+        "permission_denied",
+        "The access_programs parameter is not enabled for this organization.",
+      ),
+  });
+  await assert.rejects(
+    call(e, GPT, "access-programs", [msg("user", "continue")]),
+    (error) => error.type === "official_access_programs_denied" && error.status === 403,
+  );
+  assert.equal(
+    logs.find((entry) => entry.event === "provider_error")?.category,
+    "access_programs_denied",
+  );
+});
+
 test("a migration summary is generated once and a second explicit overflow fails without recursive compression", async () => {
   let summaries = 0;
   const e = new Engine(config(), {
@@ -672,6 +839,580 @@ test("a migration summary is generated once and a second explicit overflow fails
     /one persisted migration summary/,
   );
   assert.equal(summaries, 1);
+});
+
+test("a failed migration summary can be retried but an uncertain result stays blocked", async () => {
+  const e = new Engine(config()),
+    source = e.officialTarget(GPT),
+    ctx = identity("subscription", headers, {
+      input: [],
+      client_metadata: metadata("summary-retry"),
+    }),
+    signal = new AbortController().signal,
+    input = [msg("user", "SUMMARY_RETRY_881")];
+  let attempts = 0;
+  await assert.rejects(
+    e.singleSummary(
+      config(), source, input, ctx, signal, {}, "retryable", 1000,
+      async () => {
+        attempts++;
+        throw Object.assign(Error("temporary failure"), {
+          type: "upstream_connection_error",
+          status: 502,
+        });
+      },
+    ),
+    /temporary failure/,
+  );
+  const view = await e.singleSummary(
+    config(), source, input, ctx, signal, {}, "retryable", 1000,
+    async () => {
+      attempts++;
+      return {
+        type: "response.completed",
+        response: result([msg("assistant", "SUMMARY_RETRY_OK")]),
+      };
+    },
+  );
+  assert.equal(attempts, 2);
+  assert.match(JSON.stringify(view), /SUMMARY_RETRY_OK/);
+
+  let uncertainAttempts = 0;
+  const uncertainInput = [msg("user", "SUMMARY_UNCERTAIN_882")];
+  await assert.rejects(
+    e.singleSummary(
+      config(), source, uncertainInput, ctx, signal, {}, "uncertain", 1000,
+      async () => {
+        uncertainAttempts++;
+        throw Object.assign(Error("cancelled"), { type: "cancelled" });
+      },
+    ),
+    /cancelled/,
+  );
+  await assert.rejects(
+    e.singleSummary(
+      config(), source, uncertainInput, ctx, signal, {}, "uncertain", 1000,
+      async () => {
+        uncertainAttempts++;
+      },
+    ),
+    (error) => error.type === "compaction_result_uncertain",
+  );
+  assert.equal(uncertainAttempts, 1);
+});
+
+test("official summary terminal logs only safe structured diagnostics", async () => {
+  const logs = [];
+  const e = new Engine(config(), { log: (entry) => logs.push(entry) });
+  const source = e.officialTarget(GPT);
+  const ctx = identity("subscription", headers, {
+    input: [],
+    client_metadata: metadata("summary-diagnostic"),
+  });
+  await assert.rejects(
+    e.singleSummary(
+      config(),
+      source,
+      [msg("user", "SUMMARY_DIAGNOSTIC_991")],
+      ctx,
+      new AbortController().signal,
+      {},
+      "diagnostic",
+      1000,
+      async () => ({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          code: "invalid_previous_response",
+          param: "previous_response_id",
+          message: "private-value must not be logged; previous_response_id is invalid",
+        },
+      }),
+    ),
+    (error) => error.type === "compaction_summary_failed",
+  );
+  const terminal = logs.find(
+    (entry) => entry.event === "native_migration_summary_source_terminal",
+  );
+  assert.deepEqual(
+    {
+      type: terminal.error_type,
+      code: terminal.error_code,
+      param: terminal.error_param,
+      category: terminal.error_category,
+    },
+    {
+      type: "invalid_request_error",
+      code: "invalid_previous_response",
+      param: "previous_response_id",
+      category: "previous_response",
+    },
+  );
+  assert.doesNotMatch(JSON.stringify(logs), /private-value/);
+});
+
+test("opaque official compaction creates one reusable native migration summary only when enabled", async (t) => {
+  const next = config();
+  next.targets.go.compression.nativeMigrationSummary = true;
+  const seen = [];
+  const summaries = [];
+  const dir = await mkdtemp(join(tmpdir(), "gateway-native-migration-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = new Archive(join(dir, "history.sqlite"), Buffer.alloc(32, 7));
+  t.after(() => archive.close());
+  const options = {
+    archive,
+    send: async (_, options) => {
+      seen.push(options.body);
+      if (options.body.instructions)
+        return json(result([msg("assistant", "MIGRATED_FACT_771") ]));
+      return json(result([msg("assistant", "continued") ]));
+    },
+  };
+  const e = new Engine(next, options);
+  const officialSummary = async (body) => {
+    summaries.push(body);
+    return {
+      type: "response.completed",
+      response: result([msg("assistant", "MIGRATED_FACT_771")]),
+    };
+  };
+  const postCompactionCall = {
+    type: "custom_tool_call",
+    call_id: "call_post_compaction",
+    name: "shell",
+    input: "POST_COMPACTION_CALL_770",
+  };
+  await e.commitOfficialObservation(
+    headers,
+    { model: GPT, input: [] },
+    {
+      id: "resp_opaque_source",
+      status: "completed",
+      output: [opaque, postCompactionCall],
+    },
+  );
+  const ctx = identity("subscription", headers, {
+    input: [opaque],
+    client_metadata: metadata("migration-summary"),
+  });
+
+  await call(
+    e,
+    DS,
+    "migration-summary",
+    [opaque, msg("user", "LATEST_772")],
+    "turn",
+    headers,
+    undefined,
+    undefined,
+    { officialSummary },
+  );
+  const restarted = new Engine(structuredClone(next), options);
+  await call(
+    restarted,
+    DS,
+    "migration-summary",
+    [opaque, msg("user", "LATEST_772")],
+    "turn",
+    headers,
+    undefined,
+    undefined,
+    { officialSummary },
+  );
+
+  assert.equal(summaries.length, 1);
+  assert.equal(summaries[0].model, GPT);
+  assert.equal(summaries[0].previous_response_id, undefined);
+  assert.deepEqual(summaries[0].tools, []);
+  assert.match(JSON.stringify(summaries[0].input), /official-opaque-test-only/);
+  assert.match(JSON.stringify(summaries[0].input), /Produce the factual continuation summary/);
+  assert.doesNotMatch(JSON.stringify(summaries[0].input), /POST_COMPACTION_CALL_770/);
+  const generations = seen.filter((body) => body.model === DS);
+  assert.equal(generations.length, 2);
+  assert.match(JSON.stringify(generations[0].input), /MIGRATED_FACT_771/);
+  assert.match(JSON.stringify(generations[0].input), /LATEST_772/);
+  assert.doesNotMatch(JSON.stringify(generations[0].input), /official-opaque-test-only/);
+
+  const disabled = config();
+  const blocked = new Engine(disabled, { send: async () => json(result([])) });
+  saveCheckpoint(blocked.state, ctx, opaque, {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    original: undefined,
+    view: [opaque],
+    completeness: "opaque_source_only",
+    virtual: false,
+  });
+  await assert.rejects(
+    call(blocked, DS, "migration-summary", [opaque]),
+    (error) => error.type === "compaction_history_unavailable",
+  );
+});
+
+test("migration summary budget excludes the history window already covered by compaction", async () => {
+  const next = config();
+  next.targets.go.contextWindow = 10000;
+  next.targets.go.outputReserveTokens = 1024;
+  next.targets.go.compression.nativeMigrationSummary = true;
+  const seen = [];
+  const logs = [];
+  const e = new Engine(next, {
+    log: (event) => logs.push(event),
+    send: async (_, request) => {
+      seen.push(request.body);
+      return json(result([
+        msg("assistant", request.body.instructions ? "MIGRATED_WINDOW_991" : "done"),
+      ]));
+    },
+  });
+  const old = msg("user", `OLD_WINDOW_990 ${"padding ".repeat(5000)}`);
+  const latest = msg("user", "LATEST_TAIL_992");
+  const ctx = identity("subscription", headers, {
+    input: [old, opaque, latest],
+    client_metadata: metadata("tail-budget"),
+  });
+  saveCheckpoint(e.state, ctx, opaque, {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    original: [old],
+    view: [old, opaque],
+    completeness: "complete_original",
+    virtual: false,
+  });
+
+  await call(e, DS, "tail-budget", [old, opaque, latest]);
+
+  assert.equal(seen.filter((body) => body.instructions).length, 1);
+  assert.equal(logs.filter((event) => event.event === "native_migration_summary_completed").length, 1);
+  const budget = logs.find((event) => event.event === "native_migration_summary_budget");
+  assert.equal(budget.decision, "summary_required");
+  assert.ok(budget.fixed_tokens < budget.input_budget);
+  assert.ok(budget.input_budget < budget.projected_tokens);
+  assert.match(JSON.stringify(seen.at(-1).input), /MIGRATED_WINDOW_991/);
+  assert.match(JSON.stringify(seen.at(-1).input), /LATEST_TAIL_992/);
+  assert.doesNotMatch(JSON.stringify(seen.at(-1).input), /OLD_WINDOW_990/);
+  assert.doesNotMatch(JSON.stringify(seen.at(-1).input), /official-opaque-test-only/);
+});
+
+test("missing checkpoint view is recovered from encrypted history once", async (t) => {
+  const next = config();
+  next.targets.go.contextWindow = 10000;
+  next.targets.go.outputReserveTokens = 1024;
+  next.targets.go.compression.nativeMigrationSummary = true;
+  const dir = await mkdtemp(join(tmpdir(), "gateway-checkpoint-view-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = new Archive(join(dir, "history.sqlite"), Buffer.alloc(32, 8));
+  t.after(() => archive.close());
+  const seen = [], logs = [];
+  const options = {
+    archive,
+    log: (entry) => logs.push(entry),
+    send: async (_, request) => {
+      seen.push(request.body);
+      return json(result([msg("assistant", "done")]));
+    },
+  };
+  const old = msg("user", `RECOVERED_OLD_WINDOW ${"padding ".repeat(5000)}`);
+  const latest = msg("user", "RECOVERED_LATEST_TAIL");
+  const pending = {
+    type: "custom_tool_call",
+    call_id: "call_recovered_pending",
+    name: "shell",
+    input: "RECOVERED_PENDING_CALL",
+  };
+  const completed = {
+    type: "custom_tool_call_output",
+    call_id: pending.call_id,
+    output: "RECOVERED_PENDING_OUTPUT",
+  };
+  const active = [opaque, pending, completed, latest];
+  const ctx = identity("subscription", headers, {
+    input: active,
+    client_metadata: metadata("checkpoint-view"),
+  });
+  archive.appendHistory({
+    owner: ctx.account,
+    thread: ctx.thread,
+    branch: ctx.branch,
+    target: {
+      id: `official:${GPT}`,
+      provider: "chatgpt-subscription",
+      model: GPT,
+    },
+    original: [old],
+    view: [opaque, pending],
+  });
+  const first = new Engine(next, options);
+  saveCheckpoint(first.state, ctx, opaque, {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    original: [old],
+    virtual: false,
+  });
+  const summaries = [];
+  const officialSummary = async (body) => {
+    summaries.push(body);
+    return {
+      type: "response.completed",
+      response: result([msg("assistant", "RECOVERED_WINDOW_SUMMARY")]),
+    };
+  };
+  await call(
+    first,
+    DS,
+    "checkpoint-view",
+    active,
+    "turn",
+    headers,
+    undefined,
+    undefined,
+    { officialSummary },
+  );
+  await call(
+    new Engine(structuredClone(next), options),
+    DS,
+    "checkpoint-view-restart",
+    active,
+    "turn",
+    headers,
+    undefined,
+    undefined,
+    { officialSummary },
+  );
+
+  assert.equal(summaries.length, 1);
+  assert.doesNotMatch(JSON.stringify(summaries[0].input), /RECOVERED_PENDING_CALL/);
+  assert.equal(
+    logs.filter((entry) => entry.event === "checkpoint_view_recovered").length,
+    1,
+  );
+  assert.equal(seen.length, 2);
+  for (const body of seen) {
+    assert.match(JSON.stringify(body.input), /RECOVERED_WINDOW_SUMMARY/);
+    assert.match(JSON.stringify(body.input), /RECOVERED_LATEST_TAIL/);
+    assert.match(JSON.stringify(body.input), /RECOVERED_PENDING_CALL/);
+    assert.match(JSON.stringify(body.input), /RECOVERED_PENDING_OUTPUT/);
+    assert.doesNotMatch(JSON.stringify(body.input), /RECOVERED_OLD_WINDOW/);
+    assert.doesNotMatch(JSON.stringify(body.input), /official-opaque-test-only/);
+  }
+});
+
+test("the observation gate hydrates a persisted official checkpoint after restart", async (t) => {
+  const next = config();
+  next.targets.go.compression.nativeMigrationSummary = true;
+  const dir = await mkdtemp(join(tmpdir(), "gateway-observation-gate-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = new Archive(join(dir, "history.sqlite"), Buffer.alloc(32, 7));
+  t.after(() => archive.close());
+  const request = {
+    model: DS,
+    input: [opaque, msg("user", "AFTER_RESTART")],
+    client_metadata: metadata("observation-gate"),
+  };
+  const observed = identity("subscription", headers, request);
+  archive.appendHistory({
+    owner: observed.account,
+    thread: observed.thread,
+    branch: observed.branch,
+    target: {
+      id: `official:${GPT}`,
+      provider: "chatgpt-subscription",
+      model: GPT,
+    },
+    original: [msg("user", "BEFORE_COMPACTION")],
+    view: [opaque],
+  });
+  const legacy = new Engine(next, { archive });
+  saveCheckpoint(legacy.state, observed, opaque, {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    virtual: false,
+  });
+
+  const logs = [];
+  const restarted = new Engine(structuredClone(next), {
+    archive,
+    log: (entry) => logs.push(entry),
+  });
+  const ctx = await restarted.requireObservedHistory(headers, request);
+  const checkpoint = checkpointFor(restarted.state, ctx, opaque).checkpoint;
+
+  assert.deepEqual(checkpoint.view, [opaque]);
+  assert.equal(
+    logs.filter((entry) => entry.event === "checkpoint_view_recovered").length,
+    1,
+  );
+});
+
+test("an authenticated fork recovers legacy opaque compaction lineage without client parent metadata", async (t) => {
+  const next = config();
+  next.targets.go.compression.nativeMigrationSummary = true;
+  const dir = await mkdtemp(join(tmpdir(), "gateway-fork-lineage-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = new Archive(join(dir, "history.sqlite"), Buffer.alloc(32, 9));
+  t.after(() => archive.close());
+  const seen = [], logs = [];
+  const options = {
+    archive,
+    log: (entry) => logs.push(entry),
+    send: async (_, request) => {
+      seen.push(request.body);
+      return json(result([msg("assistant", request.body.instructions ? "FORK_SUMMARY_881" : "done") ]));
+    },
+  };
+  const parentHeaders = { ...headers, "thread-id": "opaque-parent" };
+  const parentRequest = { model: GPT, input: [], client_metadata: metadata("parent", "turn", "opaque-parent") };
+  await new Engine(next, options).commitOfficialObservation(
+    parentHeaders,
+    parentRequest,
+    { id: "resp_opaque_parent", status: "completed", output: [opaque] },
+  );
+  const parentCtx = identity("subscription", parentHeaders, parentRequest);
+  const parentKey = checkpointKey(parentCtx, opaque);
+  const checkpoint = archive.getState(parentKey);
+  archive.setState(parentKey, {
+    provider: checkpoint.provider,
+    model: checkpoint.model,
+    targetId: checkpoint.targetId,
+    virtual: false,
+  }, {
+    owner: parentCtx.account,
+    thread: parentCtx.thread,
+    branch: parentCtx.branch,
+  });
+  const restarted = new Engine(structuredClone(next), options);
+  await call(
+    restarted,
+    DS,
+    "fork-turn",
+    [opaque, msg("user", "LATEST_FORK_882")],
+    "turn",
+    { ...headers, "thread-id": "opaque-child" },
+    undefined,
+    metadata("fork-turn", "turn", "opaque-child"),
+  );
+  assert.equal(seen.filter((body) => body.instructions).length, 1);
+  assert.equal(logs.filter((entry) => entry.event === "checkpoint_view_recovered").length, 1);
+  assert.match(JSON.stringify(seen.at(-1).input), /FORK_SUMMARY_881/);
+  assert.match(JSON.stringify(seen.at(-1).input), /LATEST_FORK_882/);
+
+  await assert.rejects(
+    call(
+      restarted,
+      DS,
+      "other-account",
+      [opaque],
+      "turn",
+      { ...headers, authorization: "Bearer other", "thread-id": "other-child" },
+      undefined,
+      metadata("other-account", "turn", "other-child"),
+    ),
+    (error) => error.type === "compaction_history_unavailable",
+  );
+});
+
+test("a fork waits for an in-flight same-account compaction observation", async () => {
+  const next = config();
+  next.history = { observationWaitMs: 1000 };
+  const engine = new Engine(next, {
+    resolveIdentity: async () => "chatgpt:fixture",
+  });
+  const parentBody = {
+    model: GPT,
+    input: [],
+    client_metadata: metadata("parent", "turn", "pending-parent"),
+  };
+  const parentHeaders = { ...headers, "thread-id": "pending-parent" };
+  const prepared = await engine.officialRelayContext(parentHeaders, parentBody);
+  let release;
+  const observation = engine.queueOfficialObservation(prepared, async () => {
+    await new Promise((resolve) => { release = resolve; });
+    return engine.commitOfficialObservation(
+      parentHeaders,
+      parentBody,
+      { id: "resp_pending_parent", status: "completed", output: [opaque] },
+    );
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const childBody = {
+    model: DS,
+    input: [opaque],
+    client_metadata: metadata("child", "turn", "pending-child"),
+  };
+  const childHeaders = { ...headers, "thread-id": "pending-child" };
+  const required = engine.requireObservedHistory(childHeaders, childBody);
+  release();
+  const ctx = await required;
+  await observation;
+  assert.equal(
+    checkpointFor(engine.state, ctx, opaque).checkpoint.provider,
+    "chatgpt-subscription",
+  );
+});
+
+test("official response lineage survives missing or changed thread metadata", async () => {
+  const engine = new Engine(config());
+  const parentHeaders = { ...headers, "thread-id": "response-parent" };
+  await engine.commitOfficialObservation(
+    parentHeaders,
+    {
+      model: GPT,
+      input: [msg("user", "parent")],
+      client_metadata: metadata("parent", "turn", "response-parent"),
+    },
+    {
+      id: "resp_cross_thread_lineage",
+      status: "completed",
+      output: [msg("assistant", "saved")],
+    },
+  );
+  const childBody = {
+    model: GPT,
+    previous_response_id: "resp_cross_thread_lineage",
+    input: [],
+    client_metadata: metadata("child", "turn", "response-child"),
+  };
+  const sameAccount = await engine.officialRelayContext(
+    { ...headers, "thread-id": "response-child" },
+    childBody,
+  );
+  assert.equal(sameAccount.previous?.continuationProvenance, "official-relay");
+  const otherAccount = await engine.officialRelayContext(
+    { ...headers, authorization: "Bearer other", "thread-id": "response-child" },
+    childBody,
+  );
+  assert.equal(otherAccount.previous, undefined);
+});
+
+test("one migration preparation never makes multiple source-model calls", async () => {
+  const next = config();
+  next.targets.go.compression.nativeMigrationSummary = true;
+  const seen = [];
+  const e = new Engine(next, {
+    send: async (_, options) => {
+      seen.push(options.body);
+      return json(result([msg("assistant", "unexpected") ]));
+    },
+  });
+  const second = {
+    type: "compaction",
+    encrypted_content: "official-opaque-second-test-only",
+  };
+  await e.commitOfficialObservation(
+    headers,
+    { model: GPT, input: [] },
+    { id: "resp_two_compactions", status: "completed", output: [opaque, second] },
+  );
+  await assert.rejects(
+    call(e, DS, "two-migrations", [opaque, second, msg("user", "continue")]),
+    (error) => error.type === "migration_summary_call_limit_exceeded",
+  );
+  assert.equal(seen.length, 0);
 });
 
 test("pending tools cannot be compacted away; config snapshot is shared and unlisted official models pass", async () => {
@@ -798,9 +1539,9 @@ test("production reused WebSocket accepts same-turn compaction and model switch,
   await request(GPT, "c", [msg("user", "WS_MEMORY_503")]);
   assert.deepEqual(
     seen.map((x) => x.model),
-    [GPT, DS],
+    [DS],
   );
-  assert.deepEqual(officialSeen, [GPT, GPT]);
+  assert.deepEqual(officialSeen, [GPT, GPT, GPT]);
   ws.close();
 });
 
@@ -1153,13 +1894,15 @@ test("cancelled portable summary does not publish a checkpoint or switch billing
 });
 
 test("zstd HTTP compaction completes and its checkpoint resumes on the same model", async (t) => {
-  const { zstdCompressSync } = await import("node:zlib");
+  const { zstdCompressSync, zstdDecompressSync } = await import("node:zlib");
   const seen = [];
   const gateway = createGateway(config(), {
     log: () => {},
-    send: async (_, options) => {
-      seen.push(options.body);
-      return json(result(options.body.input.some((x) => x.type === "compaction_trigger")
+    send: async () => assert.fail("native official compaction entered Engine"),
+    officialRequest: async (_, options) => {
+      const body = JSON.parse(zstdDecompressSync(options.body));
+      seen.push(body);
+      return json(result(body.input.some((x) => x.type === "compaction_trigger")
         ? [opaque] : [msg("assistant", "continued")]));
     },
   });

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Archive } from "../src/archive.mjs";
@@ -11,6 +11,7 @@ import {
   importRollout,
   planRolloutRecovery,
   readRollout,
+  verifyRolloutRecoverySources,
 } from "../src/rollout.mjs";
 import { expandCheckpoints } from "../src/history.mjs";
 import { StateStore } from "../src/state.mjs";
@@ -195,11 +196,123 @@ test("rollout recovery follows one exact parent chain and preserves fork boundar
   ]);
   const plan = await planRolloutRecovery({ thread: child, source, sessionsRoot: sessions });
   assert.deepEqual(plan.files.map((file) => file.thread), [parent, child]);
-  assert.deepEqual(plan.checkpoints.map((checkpoint) => checkpoint.thread), [parent, child]);
+  assert.deepEqual(
+    plan.checkpoints.map((checkpoint) => checkpoint.thread),
+    [child, child],
+  );
+  assert.equal(plan.checkpoints[0].checkpoint.original.length, 1);
   assert.equal(plan.checkpoints[1].checkpoint.original.length, 2);
   assert.match(JSON.stringify(plan.checkpoints[1].checkpoint.original), /parent/);
   assert.match(JSON.stringify(plan.checkpoints[1].checkpoint.original), /child/);
   assert.doesNotMatch(JSON.stringify(plan.checkpoints[1].checkpoint.original), /after-fork/);
+});
+
+test("rollout recovery follows segmented history before fork provenance", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-rollout-segments-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const sessions = join(dir, "sessions");
+  const archived = join(dir, "archived_sessions");
+  const root = "root-thread", segment = "segment-ref", thread = "current-thread";
+  await rolloutPath(archived, root, [
+    record(0, "session_meta", { id: root, model: "gpt-test" }),
+    record(1, "response_item", { type: "message", role: "user", content: [] }),
+    record(2, "compacted", compacted("root-checkpoint")),
+    record(3, "response_item", { type: "custom_tool_call", call_id: "aborted", name: "read", input: "{}" }),
+  ]);
+  await rolloutPath(sessions, segment, [
+    record(4, "session_meta", {
+      id: root,
+      history_base: { thread_id: root, end_ordinal_exclusive: 4 },
+      forked_from_id: "older-fork-provenance",
+      forked_from_ordinal_exclusive: 1,
+    }),
+    record(5, "event_msg", { type: "turn_aborted" }),
+    record(6, "response_item", { type: "message", role: "assistant", content: [] }),
+    record(7, "compacted", compacted("segment-checkpoint")),
+  ]);
+  const first = await rolloutPath(sessions, thread, [
+    record(8, "session_meta", {
+      id: thread,
+      history_base: { thread_id: segment, end_ordinal_exclusive: 8 },
+      forked_from_id: root,
+      forked_from_ordinal_exclusive: 4,
+    }),
+    record(9, "response_item", { type: "message", role: "user", content: [] }),
+    record(10, "compacted", compacted("first-checkpoint")),
+  ], "2026/09/17");
+  const latest = await rolloutPath(sessions, `${thread}_latest`, [
+    record(11, "session_meta", {
+      id: thread,
+      history_base: { thread_id: thread, end_ordinal_exclusive: 11 },
+      forked_from_id: root,
+      forked_from_ordinal_exclusive: 4,
+    }),
+    record(12, "response_item", { type: "message", role: "assistant", content: [] }),
+    record(13, "compacted", compacted("latest-checkpoint")),
+  ], "2026/09/18");
+  const renamed = latest.replace(`${thread}_latest`, `${thread}_rollout`);
+  await import("node:fs/promises").then(({ rename }) => rename(latest, renamed));
+
+  const plan = await planRolloutRecovery({ thread, source: renamed, sessionsRoot: sessions });
+  assert.deepEqual(plan.files.map((file) => file.thread), [root, root, thread, thread]);
+  assert.equal(plan.checkpoints.length, 4);
+  assert.equal(plan.checkpoints.at(-1).checkpoint.original.length, 5);
+  assert.match(
+    JSON.stringify(plan.checkpoints.at(-1).checkpoint.original),
+    /execution result is unknown/,
+  );
+  assert.equal(first.endsWith(`-${thread}.jsonl`), true);
+});
+
+test("rollout recovery safely enriches an existing checkpoint without portable history", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-rollout-enrich-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const sessions = join(dir, "sessions"), thread = "enrich-thread";
+  const source = await rolloutPath(sessions, thread, [
+    record(0, "session_meta", { id: thread, model: "gpt-test" }),
+    record(1, "turn_context", { model: "gpt-test" }),
+    record(2, "response_item", { type: "message", role: "user", content: [] }),
+    record(3, "compacted", compacted("enrich-checkpoint")),
+  ]);
+  const plan = await planRolloutRecovery({ thread, source, sessionsRoot: sessions });
+  const archive = new Archive(join(dir, "history.sqlite"), key);
+  t.after(() => archive.close());
+  const account = "chatgpt:enrich", { keyOwner, scope } = checkpointScope(account, thread);
+  const digest = createHash("sha256").update("enrich-checkpoint").digest("hex");
+  archive.setState(`checkpoint:${keyOwner}:${digest}`, {
+    provider: "chatgpt-subscription",
+    model: "gpt-test",
+    targetId: "official:gpt-test",
+    virtual: false,
+  }, scope);
+  const preview = applyRolloutRecovery(archive, plan, { account });
+  assert.equal(preview.enriched, 1);
+  assert.equal(preview.wouldWrite, 1);
+  const applied = applyRolloutRecovery(archive, plan, { account, apply: true });
+  assert.equal(applied.enriched, 1);
+  assert.equal(archive.getState(`checkpoint:${keyOwner}:${digest}`).original.length, 1);
+});
+
+test("rollout recovery refuses a source changed after planning", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-rollout-changed-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const sessions = join(dir, "sessions"), thread = "changed-thread";
+  const source = await rolloutPath(sessions, thread, [
+    record(0, "session_meta", { id: thread, model: "gpt-test" }),
+    record(1, "response_item", {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "stable" }],
+    }),
+    record(2, "compacted", compacted("changed-checkpoint")),
+  ]);
+  const plan = await planRolloutRecovery({ thread, source, sessionsRoot: sessions });
+  assert.equal(await verifyRolloutRecoverySources(plan), true);
+  await appendFile(source, record(3, "event_msg", { type: "changed" }) + "\n");
+  await assert.rejects(
+    verifyRolloutRecoverySources(plan),
+    (error) => error.type === "rollout_source_changed",
+  );
 });
 
 test("rollout recovery rejects missing bases, bad boundaries and incomplete tools before writing", async (t) => {
@@ -318,16 +431,30 @@ test("rollout recovery streams a long source within the local linear-time guard"
   const sessions = join(dir, "sessions");
   const thread = "long-thread";
   const rows = [record(0, "session_meta", { id: thread, model: "gpt-test" })];
-  for (let index = 1; index <= 10_000; index++)
-    rows.push(record(index, "response_item", {
+  let ordinal = 1;
+  for (let index = 1; index <= 10_000; index++) {
+    rows.push(record(ordinal++, "response_item", {
       type: "message",
       role: index % 2 ? "user" : "assistant",
       content: [{ type: index % 2 ? "input_text" : "output_text", text: `item-${index}` }],
     }));
-  rows.push(record(10_001, "compacted", compacted("long-checkpoint")));
+    if (index % 1_000 === 0)
+      rows.push(record(ordinal++, "compacted", compacted(`long-checkpoint-${index}`)));
+  }
   const source = await rolloutPath(sessions, thread, rows);
   const started = performance.now();
   const plan = await planRolloutRecovery({ thread, source, sessionsRoot: sessions });
-  assert.equal(plan.checkpoints[0].checkpoint.original.length, 10_000);
+  assert.equal(plan.checkpoints.length, 10);
+  assert.equal(plan.checkpoints.at(-1).checkpoint.original.length, 10_000);
   assert.ok(performance.now() - started < 2_000);
+  const archive = new Archive(join(dir, "history.sqlite"), key);
+  t.after(() => archive.close());
+  applyRolloutRecovery(archive, plan, {
+    account: "chatgpt:large-recovery",
+    apply: true,
+  });
+  const stats = archive.stats();
+  assert.equal(stats.records, 10);
+  assert.equal(stats.versions, 10);
+  assert.ok(stats.events < 20_000, `expected shared event storage, got ${stats.events}`);
 });

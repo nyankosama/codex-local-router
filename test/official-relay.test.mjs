@@ -6,6 +6,7 @@ import { Readable } from "node:stream";
 import { EventEmitter } from "node:events";
 import { WebSocket } from "ws";
 import { createGateway } from "../src/server.mjs";
+import { Engine } from "../src/engine.mjs";
 import {
   OFFICIAL_CODEX_ORIGIN,
   officialRelayUrl,
@@ -19,6 +20,8 @@ import {
   officialWebSocketCaCertificates,
   officialWebSocketProxyForUrl,
 } from "../src/official-websocket.mjs";
+import { expandCheckpoints } from "../src/history.mjs";
+import { request, requestRaw } from "../src/transport.mjs";
 
 const listen = (server) =>
   new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server.address().port)));
@@ -97,6 +100,24 @@ test("A5/A7 official URL is fixed, query-preserving and rejects path/method atta
     "chatgpt-account-id": "acct",
     "x-end-to-end": "keep",
   });
+  assert.deepEqual(
+    relayRequestHeaders(
+      {
+        authorization: "Bearer subscription",
+        "chatgpt-account-id": "acct",
+        "content-encoding": "zstd",
+        "content-length": "223986",
+        "content-type": "application/json",
+        "x-end-to-end": "keep",
+      },
+      { websocket: true },
+    ),
+    {
+      authorization: "Bearer subscription",
+      "chatgpt-account-id": "acct",
+      "x-end-to-end": "keep",
+    },
+  );
 });
 
 test("A6 official relay waits for downstream drain before forwarding the next chunk", async () => {
@@ -364,6 +385,212 @@ test("A8 Engine-managed and legacy official response IDs stay on Engine replay",
   await gateway.close();
 });
 
+test("A8 native official compaction stays transparent and records a portable checkpoint", async () => {
+  const gateway = createGateway(config(), {
+    resolveIdentity: async () => "chatgpt:fixture",
+  });
+  const headers = {
+    authorization: "Bearer subscription",
+    "thread-id": "thread-native-compaction",
+  };
+  const request = {
+    model: "gpt-5.6-sol",
+    input: [
+      { role: "user", content: "portable fixture" },
+      { type: "compaction_trigger" },
+    ],
+  };
+  assert.equal(
+    (await gateway.engine.officialRequestNeedsEngine(headers, request)).needsEngine,
+    false,
+  );
+
+  const item = {
+    type: "compaction",
+    encrypted_content: "official-native-fixture",
+  };
+  assert.equal(
+    (await gateway.engine.officialRequestNeedsEngine(headers, {
+      model: request.model,
+      input: [item, { role: "user", content: "continue" }],
+    })).needsEngine,
+    false,
+  );
+  assert.equal(
+    (await gateway.engine.officialRequestNeedsEngine(headers, {
+      model: request.model,
+      input: [{
+        type: "compaction",
+        encrypted_content: "gateway-checkpoint-v1:fixture",
+      }],
+    })).needsEngine,
+    true,
+  );
+  for (const encrypted_content of [null, "", 123]) {
+    assert.equal((await gateway.engine.officialRequestNeedsEngine(headers, {
+      model: request.model, input: [{ type: "compaction", encrypted_content }],
+    })).needsEngine, true, "malformed checkpoints still require validation");
+  }
+
+  await gateway.engine.commitOfficialObservation(headers, request, {
+    id: "resp_native_compaction",
+    status: "completed",
+    output: [item],
+  });
+  const prepared = await gateway.engine.officialRelayContext(headers, request);
+  const portable = expandCheckpoints(
+    gateway.engine.state,
+    prepared.ctx,
+    [item],
+    config().targets.vendor,
+    { portable: true },
+  );
+  assert.match(JSON.stringify(portable.input), /portable fixture/);
+  const repeated = { type: "compaction", encrypted_content: "official-recompaction-fixture" };
+  await gateway.engine.commitOfficialObservation(headers, {
+    ...request,
+    input: [item, { role: "user", content: "second fixture" }, { type: "compaction_trigger" }],
+  }, { id: "resp_recompaction", status: "completed", output: [repeated] });
+  const expanded = expandCheckpoints(gateway.engine.state, prepared.ctx, [repeated],
+    config().targets.vendor, { portable: true }).input;
+  assert.deepEqual(expanded, [
+    { role: "user", content: "portable fixture" },
+    { role: "user", content: "second fixture" },
+  ]);
+  gateway.engine.state.set(`last-target:${prepared.ctx.owner}`, config().targets.vendor, prepared.ctx);
+  assert.equal((await gateway.engine.officialRequestNeedsEngine(headers, {
+    model: request.model, input: [item, { role: "user", content: "switch back" }],
+  })).needsEngine, true, "native compaction must not bypass cross-provider migration");
+  await gateway.close();
+});
+
+test("A8 compaction emitted by an ordinary official turn replaces the active window", async () => {
+  const gateway = createGateway(config(), {
+    resolveIdentity: async () => "chatgpt:fixture",
+  });
+  const headers = {
+    authorization: "Bearer subscription",
+    "thread-id": "thread-inline-compaction",
+  };
+  await gateway.engine.commitOfficialObservation(
+    headers,
+    { model: "gpt-5.6-sol", input: [{ role: "user", content: "old" }] },
+    {
+      id: "resp_before_inline_compaction",
+      status: "completed",
+      output: [{ role: "assistant", content: "old answer" }],
+    },
+  );
+  const item = {
+    type: "compaction",
+    encrypted_content: "official-inline-compaction-fixture",
+  };
+  await gateway.engine.commitOfficialObservation(
+    headers,
+    {
+      model: "gpt-5.6-sol",
+      previous_response_id: "resp_before_inline_compaction",
+      input: [{ role: "user", content: "latest" }],
+    },
+    {
+      id: "resp_inline_compaction",
+      status: "completed",
+      output: [{ role: "user", content: "latest" }, item],
+    },
+  );
+  const prepared = await gateway.engine.officialRelayContext(headers, {
+    previous_response_id: "resp_inline_compaction",
+    input: [],
+  });
+  assert.deepEqual(prepared.previous.input, [
+    { role: "user", content: "latest" },
+    item,
+  ]);
+  const portable = expandCheckpoints(
+    gateway.engine.state,
+    prepared.ctx,
+    prepared.previous.input,
+    config().targets.vendor,
+    { portable: true },
+  ).input;
+  assert.match(JSON.stringify(portable), /old/);
+  assert.match(JSON.stringify(portable), /old answer/);
+  assert.match(JSON.stringify(portable), /latest/);
+  await gateway.engine.requireObservedHistory(headers, { input: [item] });
+  await gateway.close();
+});
+
+test("official HTTP relay and Engine HTTP/WS replay survive active streams beyond their deadline", async (t) => {
+  for (const mode of ["relay-http", "engine-http", "engine-ws"]) {
+    await t.test(mode, async (t) => {
+      let sends = 0;
+      const upstreamServer = http.createServer((_req, res) => {
+        sends++;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"type":"response.created","response":{"id":"resp_long","output":[]}}\n\n');
+        let count = 0;
+        const timer = setInterval(() => {
+          res.write(": heartbeat\n\n");
+          if (++count === 20) res.end('data: {"type":"response.completed","response":{"id":"resp_long","status":"completed","output":[]}}\n\n');
+        }, 100);
+        res.on("close", () => clearInterval(timer));
+      });
+      const upstreamPort = await listen(upstreamServer);
+      t.after(() => { upstreamServer.closeAllConnections(); upstreamServer.close(); });
+      const cfg = config();
+      cfg.timeoutMs = 1000;
+      const gateway = createGateway(cfg, {
+        resolveIdentity: async () => "chatgpt:fixture",
+        officialRequest: async (_url, options) => {
+          assert.equal(mode, "relay-http");
+          assert.equal(JSON.parse(options.body).input[0].encrypted_content, "native-fixture");
+          return requestRaw(`http://127.0.0.1:${upstreamPort}`, options);
+        },
+        send: async (_url, options) => {
+          assert.notEqual(mode, "relay-http");
+          assert.equal(options.body.previous_response_id, undefined);
+          return request(`http://127.0.0.1:${upstreamPort}`, options);
+        },
+      });
+      const port = await listen(gateway.server);
+      t.after(() => gateway.close());
+      const headers = { authorization: "Bearer subscription", "thread-id": mode };
+      const body = { model: "gpt-official", stream: true,
+        input: [{ type: "compaction", encrypted_content: "native-fixture" }, { role: "user", content: "continue" }] };
+      if (mode !== "relay-http") {
+        const prepared = await gateway.engine.officialRelayContext(headers, body);
+        gateway.engine.state.save(prepared.ctx, { id: "resp_engine", output: [] }, [], gateway.engine.officialTarget(body.model));
+        body.previous_response_id = "resp_engine";
+      }
+      const started = Date.now();
+      if (mode === "engine-ws") {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/subscription/v1/responses`, { headers });
+        t.after(() => ws.terminate());
+        await new Promise((resolve, reject) => { ws.once("open", resolve); ws.once("error", reject); });
+        const completed = new Promise((resolve, reject) => {
+          ws.on("message", (data) => {
+            const event = JSON.parse(data);
+            if (event.type === "error") reject(Error(event.error?.type));
+            if (event.type === "response.completed") resolve(event);
+          });
+          ws.once("close", () => reject(Error("closed before completion")));
+          ws.once("error", reject);
+        });
+        ws.send(JSON.stringify({ type: "response.create", ...body }));
+        assert.equal((await completed).response.id, "resp_long");
+      } else {
+        const response = await fetch(`http://127.0.0.1:${port}/subscription/v1/responses`, {
+          method: "POST", headers: { ...headers, "content-type": "application/json" }, body: JSON.stringify(body),
+        });
+        assert.equal(response.status, 200);
+        assert.match(await response.text(), /response.completed/);
+      }
+      assert.equal(sends, 1);
+      assert.ok(Date.now() - started > cfg.timeoutMs);
+    });
+  }
+});
+
 test("A6/A8 WebSocket continuations after Engine-managed official responses replay every turn", async (t) => {
   const upstreamSockets = [];
   const providerCalls = [];
@@ -588,6 +815,69 @@ test("A8 WebSocket model switches enter Engine when the App omits previous_respo
   await gateway.close();
 });
 
+test("A8 projected third-party history stays portable on repeated official turns and forks", async (t) => {
+  const providerCalls = [];
+  const gateway = createGateway(config(), {
+    resolveIdentity: async () => "chatgpt:fixture",
+    officialRequest: async () => assert.fail("projected history entered opaque relay"),
+    send: async (_url, request) => {
+      providerCalls.push(request.body);
+      return upstream(200, { "content-type": "application/json" }, Buffer.from(JSON.stringify({
+        id: `resp_portable_${providerCalls.length}`,
+        status: "completed",
+        output: [{
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "portable" }],
+        }],
+      })));
+    },
+  });
+  const port = await listen(gateway.server);
+  t.after(() => gateway.close());
+  const headers = {
+    authorization: "Bearer subscription",
+    "content-type": "application/json",
+    "thread-id": "thread-projected-history",
+  };
+  const projected = {
+    type: "reasoning",
+    id: "item_gateway_projected_reasoning",
+    summary: [{ type: "summary_text", text: "portable reasoning summary" }],
+    encrypted_content: null,
+  };
+  const prepared = await gateway.engine.officialRelayContext(headers, {
+    model: "gpt-unlisted-future",
+    input: [projected],
+  });
+  gateway.engine.state.set(
+    `last-target:${prepared.ctx.owner}`,
+    gateway.engine.officialTarget("gpt-unlisted-future"),
+    prepared.ctx,
+  );
+  for (const [thread, prompt] of [
+    ["thread-projected-history", "second official turn"],
+    ["thread-projected-history", "third official turn"],
+    ["fork-projected-history", "forked official turn"],
+  ]) {
+    const response = await fetch(`http://127.0.0.1:${port}/subscription/v1/responses`, {
+      method: "POST",
+      headers: { ...headers, "thread-id": thread },
+      body: JSON.stringify({
+        model: "gpt-unlisted-future",
+        input: [projected, { role: "user", content: prompt }],
+        stream: false,
+      }),
+    });
+    assert.equal(response.status, 200);
+  }
+  assert.equal(providerCalls.length, 3);
+  for (const call of providerCalls) {
+    assert.doesNotMatch(JSON.stringify(call.input), /item_gateway_/);
+    assert.equal(call.input.some((item) => item.type === "reasoning"), false);
+  }
+});
+
 test("A8 an observation write failure does not fail an ordinary official response", async (t) => {
   const logs = [];
   const terminal = Buffer.from('data: {"type":"response.completed","response":{"id":"resp_archive_failure","status":"completed","output":[]}}\n\n');
@@ -642,6 +932,28 @@ test("A8 an ordinary official response does not wait for observation I/O", async
   releaseObservation();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(gateway.engine.officialObservations.size, 0);
+});
+
+test("A8 official observations commit in account order across changing thread metadata", async () => {
+  const engine = new Engine(config());
+  const firstContext = { ctx: { auth: "account", owner: "owner-1", branch: "branch-1" } };
+  const secondContext = { ctx: { auth: "account", owner: "owner-2", branch: "branch-2" } };
+  const order = [];
+  let release;
+  const first = engine.queueOfficialObservation(firstContext, async () => {
+    order.push("first-start");
+    await new Promise((resolve) => { release = resolve; });
+    order.push("first-end");
+  });
+  const second = engine.queueOfficialObservation(secondContext, async () => {
+    order.push("second");
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["first-start"]);
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ["first-start", "first-end", "second"]);
+  assert.equal(engine.officialObservations.size, 0);
 });
 
 test("A6 official WebSocket proxy resolution honors native variables, compatible fallbacks and bypass", () => {
@@ -819,7 +1131,7 @@ test("A6 official WebSocket exposes only allowlisted TLS error codes", async () 
   }]);
 });
 
-test("A6 official WebSocket relays message payloads and sequence without Engine rewriting", async (t) => {
+test("A6 official WebSocket archives prewarm lineage without rewriting relay payloads", async (t) => {
   const upstreamSockets = [];
   const received = [];
   class FakeUpstream extends EventEmitter {
@@ -880,7 +1192,9 @@ test("A6 official WebSocket relays message payloads and sequence without Engine 
   const request = Buffer.from(JSON.stringify({
     type: "response.create",
     model: "gpt-future-ws",
+    generate: false,
     input: "fixture",
+    access_programs: { cyber: "current_turn" },
     stream: true,
   }));
   const messages = [];

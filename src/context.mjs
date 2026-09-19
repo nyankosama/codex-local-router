@@ -1,7 +1,7 @@
 const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value));
 
-// This deliberately reports an estimate. It controls observability and attempt
-// order only; it must never be the sole reason for lossy compression.
+// This deliberately reports an estimate. Borderline context decisions remain
+// upstream-owned; the Engine only blocks requests above a wide safety margin.
 export function estimateRequestTokens(body) {
   return Math.ceil(jsonBytes({
     instructions: body.instructions,
