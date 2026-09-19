@@ -242,6 +242,20 @@ export function validate(input) {
       throw Error(`target ${name} requires an explicit context window`);
     if (!compressionModes.has(t.compression.mode))
       throw Error(`invalid compression mode for target ${name}`);
+    if (
+      t.compression.nativeMigrationSummary != null &&
+      typeof t.compression.nativeMigrationSummary !== "boolean"
+    )
+      throw Error(
+        `invalid native migration summary setting for target ${name}`,
+      );
+    if (
+      t.compression.nativeMigrationSummary === true &&
+      t.compression.mode !== "summary"
+    )
+      throw Error(
+        `native migration summary for target ${name} requires summary compression`,
+      );
     if (t.compression.mode === "native") {
       const compatibility = t.compression.compatibility;
       if (

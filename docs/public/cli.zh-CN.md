@@ -18,6 +18,7 @@
 - `model set-tool-mode --ids ID,... --tool-mode code_mode_only|default [--space NAME] [--yes]`：批量预览/修改，一次只生成一个版本，不刷新指令快照。要求 App-enabled 第三方 Responses、工具调用和 freeform 工具支持，不再以 GPT 家族作为准入条件；`--no-app` 清除覆盖，不能与 `--tool-mode` 同传。诊断增加 `appCapabilityProfile.toolMode`。启用前必须检查实际工具上下文体积，详见[代码模式预检](configuration.zh-CN.md#显式启用-code-mode)。
 - `--instructions-template codex-generic-v1`、`--instructions-file FILE`、`--instructions-from OFFICIAL_MODEL|none`：互斥的基础指令来源。
 - `--subscription-search standard-tool|disabled`：为标准 Responses 选择订阅搜索桥接；它不等于 `--search-source`、`--native-search` 或 Lite。
+- `--native-migration-summary` / `--no-native-migration-summary`：显式开启／关闭可信官方 opaque 压缩窗口的一次性、关闭工具的迁移摘要；开启时必须使用 `--compression summary`。
 - `--no-freeform-tools`、`--shell-type shell_command|unified_exec`、`--default-reasoning-level LEVEL`：显式收敛 GLM 等 target 的工具和推理声明；冲突会在生成空间 revision 前失败。
 - `--multi-agent-version v1|v2|client-default`：直接配置能力元数据；不覆盖用户的代理开关、权限和显式选模。
 - `model sync-instructions --ids ID,... [--space NAME] [--yes]`：批量预览/同步，一次确认只生成一个空间版本。见[指令快照与当前 Lite 阻断](instruction-snapshots.zh-CN.md)。诊断会显示来源、哈希、状态和可同步更新；活动 Codex 选模与空间默认不一致时拒绝修改，不重置默认模型。
@@ -46,4 +47,4 @@ Provider 凭证环境变量只供前台进程使用，不会写入受管 LaunchA
 
 完整英文命令参考见 [cli.md](cli.md)。
 
-`history recover --thread THREAD_ID [--source ROLLOUT.jsonl]` 缺省只做脱敏预览。只有完整 rollout 谱系、ordinal 边界、compaction 和工具 call/result 都能无损验证时才生成可移植 checkpoint；加 `--yes` 应用前必须退出 App 并等待 Gateway 空闲。详见 [Fork 与压缩历史恢复](compaction-recovery.zh-CN.md)。
+`history recover --thread THREAD_ID [--source ROLLOUT.jsonl]` 缺省只做脱敏预览。加 `--yes` 后要求 App 已退出且 Gateway 空闲；命令会停止已加载服务、复核所有来源哈希、原子写入可精确恢复的 checkpoint，并恢复原服务状态。`history inspect --thread THREAD_ID --target TARGET_ID --json` 只输出直接兼容、需要摘要和阻塞数量，不输出历史正文。详见 [Fork 与压缩历史恢复](compaction-recovery.zh-CN.md)。

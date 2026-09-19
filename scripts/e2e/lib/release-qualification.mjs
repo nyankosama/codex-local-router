@@ -1,5 +1,5 @@
 export const RELEASE_QUALIFICATION = Object.freeze({
-  schemaVersion: 1,
+  schemaVersion: 3,
   type: "codex-local-router-release-qualification",
   cases: Object.freeze({
     profiles: Object.freeze([
@@ -19,11 +19,16 @@ export const RELEASE_QUALIFICATION = Object.freeze({
       "official-cached-natural",
       "official-live-explicit",
     ]),
+    historyMigration: Object.freeze([
+      "official-fork-glm-flash",
+      "official-fork-third-party-gpt",
+    ]),
   }),
   budgets: Object.freeze({
     universalSearch: Object.freeze({ turns: 3, generations: 8, searches: 3 }),
     officialSearch: Object.freeze({ turns: 2, generations: 9, searches: 6 }),
-    total: Object.freeze({ turns: 5, generations: 17, searches: 9 }),
+    historyMigration: Object.freeze({ turns: 14, generations: 18, searches: 0 }),
+    total: Object.freeze({ turns: 19, generations: 35, searches: 9 }),
   }),
 });
 
@@ -41,22 +46,23 @@ function withinBudget(actual = {}, limit) {
     actual.implicitRetries === 0;
 }
 
-export function qualifyReleaseReceipts({ profiles, universalSearch, officialSearch }, commit) {
-  const drivers = [profiles?.harness, universalSearch?.driver, officialSearch?.driver];
-  const implementationMatches = [profiles, universalSearch, officialSearch]
+export function qualifyReleaseReceipts({ profiles, universalSearch, officialSearch, historyMigration }, commit) {
+  const drivers = [profiles?.harness, universalSearch?.driver, officialSearch?.driver, historyMigration?.driver];
+  const implementationMatches = [profiles, universalSearch, officialSearch, historyMigration]
     .every((receipt) => receipt?.implementation?.commit === commit);
   const driverMatches = drivers.every((driver) =>
     driver?.sha256 && driver.sha256 === drivers[0]?.sha256,
   );
   const universalBudget = universalSearch?.budget ?? {};
   const officialBudget = officialSearch?.budget ?? {};
+  const historyBudget = historyMigration?.budget ?? {};
   const budget = {
-    turns: (universalBudget.turns ?? 0) + (officialBudget.turns ?? 0),
-    generations: (universalBudget.generations ?? 0) + (officialBudget.generations ?? 0),
+    turns: (universalBudget.turns ?? 0) + (officialBudget.turns ?? 0) + (historyBudget.turns ?? 0),
+    generations: (universalBudget.generations ?? 0) + (officialBudget.generations ?? 0) + (historyBudget.generations ?? 0),
     searchRequests: (universalBudget.searchRequests ?? 0) + (officialBudget.searchRequests ?? 0),
-    blockedGenerations: (universalBudget.blockedGenerations ?? 0) + (officialBudget.blockedGenerations ?? 0),
+    blockedGenerations: (universalBudget.blockedGenerations ?? 0) + (officialBudget.blockedGenerations ?? 0) + (historyBudget.blockedGenerations ?? 0),
     blockedSearchRequests: (universalBudget.blockedSearchRequests ?? 0) + (officialBudget.blockedSearchRequests ?? 0),
-    implicitRetries: (universalBudget.implicitRetries ?? 0) + (officialBudget.implicitRetries ?? 0),
+    implicitRetries: (universalBudget.implicitRetries ?? 0) + (officialBudget.implicitRetries ?? 0) + (historyBudget.implicitRetries ?? 0),
     limits: RELEASE_QUALIFICATION.budgets.total,
   };
   const assertions = {
@@ -73,6 +79,12 @@ export function qualifyReleaseReceipts({ profiles, universalSearch, officialSear
       exactCases(officialSearch.cases, RELEASE_QUALIFICATION.cases.officialSearch) &&
       withinBudget(officialBudget, RELEASE_QUALIFICATION.budgets.officialSearch) &&
       officialSearch.websocketProbe?.passed === true,
+    historyMigrationPassed: historyMigration?.verdict === "PASS" &&
+      exactCases(historyMigration.cases, RELEASE_QUALIFICATION.cases.historyMigration) &&
+      historyMigration.lifecycle?.legacyCheckpointRecoveryPassed === true &&
+      historyMigration.lifecycle?.summaryReusePassed === true &&
+      historyMigration.lifecycle?.gatewayErrorFree === true &&
+      withinBudget(historyBudget, RELEASE_QUALIFICATION.budgets.historyMigration),
     totalBudgetPassed: withinBudget(budget, RELEASE_QUALIFICATION.budgets.total),
   };
   return {
@@ -104,6 +116,15 @@ export function qualifyReleaseReceipts({ profiles, universalSearch, officialSear
         budget: officialBudget,
         websocketProbePassed: officialSearch?.websocketProbe?.passed === true,
       },
+      {
+        name: "history-migration",
+        verdict: historyMigration?.verdict ?? "NOT_RUN",
+        cases: historyMigration?.cases ?? [],
+        budget: historyBudget,
+        lifecyclePassed: historyMigration?.lifecycle?.legacyCheckpointRecoveryPassed === true &&
+          historyMigration?.lifecycle?.summaryReusePassed === true &&
+          historyMigration?.lifecycle?.gatewayErrorFree === true,
+      },
     ].map((stage) => ({
       ...stage,
       cases: stage.cases.map((entry) => ({ name: entry.name, passed: entry.passed })),
@@ -114,7 +135,7 @@ export function qualifyReleaseReceipts({ profiles, universalSearch, officialSear
 export function validateReleaseQualification(summary, commit) {
   const assertionNames = [
     "implementationMatches", "driverMatches", "profilesPassed",
-    "universalSearchPassed", "officialSearchPassed", "totalBudgetPassed",
+    "universalSearchPassed", "officialSearchPassed", "historyMigrationPassed", "totalBudgetPassed",
   ];
   if (summary?.schemaVersion !== RELEASE_QUALIFICATION.schemaVersion ||
       summary?.type !== RELEASE_QUALIFICATION.type || summary?.verdict !== "PASS" ||
@@ -123,7 +144,7 @@ export function validateReleaseQualification(summary, commit) {
       !assertionNames.every((name) => summary?.assertions?.[name] === true) ||
       !withinBudget(summary?.budget, RELEASE_QUALIFICATION.budgets.total))
     throw Error("release qualification receipt is incomplete");
-  const stageNames = ["profiles", "universal-search", "official-search"];
+  const stageNames = ["profiles", "universal-search", "official-search", "history-migration"];
   for (const [index, expected] of Object.values(RELEASE_QUALIFICATION.cases).entries())
     if (summary.stages?.[index]?.name !== stageNames[index] ||
         !exactCases(summary.stages[index].cases, expected) || summary.stages[index].verdict !== "PASS")
@@ -132,7 +153,9 @@ export function validateReleaseQualification(summary, commit) {
       summary.stages[1].mcpInventoryPassed !== true ||
       !withinBudget(summary.stages[1].budget, RELEASE_QUALIFICATION.budgets.universalSearch) ||
       summary.stages[2].websocketProbePassed !== true ||
-      !withinBudget(summary.stages[2].budget, RELEASE_QUALIFICATION.budgets.officialSearch))
+      !withinBudget(summary.stages[2].budget, RELEASE_QUALIFICATION.budgets.officialSearch) ||
+      summary.stages[3].lifecyclePassed !== true ||
+      !withinBudget(summary.stages[3].budget, RELEASE_QUALIFICATION.budgets.historyMigration))
     throw Error("release qualification stage evidence is incomplete");
   return summary;
 }

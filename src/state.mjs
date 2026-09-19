@@ -4,7 +4,9 @@ import { fail } from "./errors.mjs";
 const durablePrefixes = [
   "session:",
   "response:",
+  "response-lineage:",
   "checkpoint:",
+  "checkpoint-lineage:",
   "last-target:",
   "last-provider:",
   "search:",
@@ -18,6 +20,8 @@ const durablePrefixes = [
 
 export const threadOwner = (auth, thread) =>
   auth + "\0" + (thread ?? "http");
+const responseLineageKey = (ctx, id) =>
+  `response-lineage:${ctx.auth}:${createHash("sha256").update(id).digest("hex")}`;
 
 export function identity(entry, headers, body, trustedAccount) {
   const auth = trustedAccount
@@ -171,9 +175,7 @@ export class StateStore {
   replay(ctx, body) {
     if (!body.previous_response_id)
       return { body, previous: null, delta: body.input ?? [] };
-    const previous = this.get(
-      "response:" + ctx.owner + ":" + body.previous_response_id,
-    );
+    const previous = this.response(ctx, body.previous_response_id);
     if (!previous)
       throw fail(
         "previous_response_not_found",
@@ -189,17 +191,33 @@ export class StateStore {
     return { body: next, previous, delta };
   }
 
+  response(ctx, id) {
+    const current = this.get(`response:${ctx.owner}:${id}`);
+    if (current) return current;
+    const lineage = this.get(responseLineageKey(ctx, id));
+    return typeof lineage?.owner === "string"
+      ? this.get(`response:${lineage.owner}:${id}`)
+      : undefined;
+  }
+
   save(
     ctx,
     response,
     viewInput,
     target,
     originalInput = viewInput,
-    { continuationProvenance = "gateway-replay" } = {},
+    {
+      continuationProvenance = "gateway-replay",
+      replacement = false,
+    } = {},
   ) {
     const record = {
-      input: [...viewInput, ...(response.output ?? [])],
-      original: [...originalInput, ...(response.output ?? [])],
+      input: replacement
+        ? [...(response.output ?? [])]
+        : [...viewInput, ...(response.output ?? [])],
+      original: replacement
+        ? [...originalInput]
+        : [...originalInput, ...(response.output ?? [])],
       target: target ? structuredClone(target) : null,
       // Old cache compatibility for sessions created before target identities.
       provider: target?.provider ?? null,
@@ -225,12 +243,22 @@ export class StateStore {
           ? { thread: ctx.parentThread, branch: ctx.parentThread }
           : undefined,
       };
-      if (!responseKey) return this.archive.appendHistory(history);
-      const saved = this.archive.saveResponse(responseKey, record, history);
-      if (saved.inserted) this.setMemory(responseKey, record);
-      else this.get(responseKey);
-      return saved.version;
+      let version;
+      if (!responseKey) version = this.archive.appendHistory(history);
+      else {
+        const saved = this.archive.saveResponse(responseKey, record, history);
+        if (saved.inserted) this.setMemory(responseKey, record);
+        else this.get(responseKey);
+        version = saved.version;
+      }
+      if (response.id && continuationProvenance === "official-relay")
+        this.set(responseLineageKey(ctx, response.id), { owner: ctx.owner }, ctx);
+      return version;
     }
-    if (responseKey) this.set(responseKey, record);
+    if (responseKey) {
+      this.set(responseKey, record, ctx);
+      if (continuationProvenance === "official-relay")
+        this.set(responseLineageKey(ctx, response.id), { owner: ctx.owner }, ctx);
+    }
   }
 }

@@ -46,6 +46,21 @@ function receipts() {
       websocketProbe: { passed: true },
       cases: cases(RELEASE_QUALIFICATION.cases.officialSearch),
     },
+    historyMigration: {
+      verdict: "PASS",
+      implementation: { commit },
+      driver,
+      budget: {
+        turns: 14, generations: 18, searchRequests: 0,
+        blockedGenerations: 0, blockedSearchRequests: 0, implicitRetries: 0,
+      },
+      cases: cases(RELEASE_QUALIFICATION.cases.historyMigration),
+      lifecycle: {
+        legacyCheckpointRecoveryPassed: true,
+        summaryReusePassed: true,
+        gatewayErrorFree: true,
+      },
+    },
   };
 }
 
@@ -58,8 +73,8 @@ test("release qualification covers the bounded equivalence classes", () => {
   };
   assert.equal(summary.verdict, "PASS");
   assert.deepEqual(summary.budget, {
-    turns: 5,
-    generations: 17,
+    turns: 19,
+    generations: 35,
     searchRequests: 9,
     blockedGenerations: 0,
     blockedSearchRequests: 0,
@@ -74,6 +89,12 @@ test("release qualification covers the bounded equivalence classes", () => {
   const officialOverBudget = receipts();
   officialOverBudget.officialSearch.budget.generations = 10;
   assert.equal(qualifyReleaseReceipts(officialOverBudget, commit).verdict, "FAIL");
+  const historyOverBudget = receipts();
+  historyOverBudget.historyMigration.budget.generations = 19;
+  assert.equal(qualifyReleaseReceipts(historyOverBudget, commit).verdict, "FAIL");
+  const missingLifecycle = receipts();
+  missingLifecycle.historyMigration.lifecycle.summaryReusePassed = false;
+  assert.equal(qualifyReleaseReceipts(missingLifecycle, commit).verdict, "FAIL");
   const missingCase = receipts();
   missingCase.universalSearch.cases.pop();
   assert.equal(qualifyReleaseReceipts(missingCase, commit).verdict, "FAIL");
@@ -106,4 +127,23 @@ test("official qualification proves WebSocket through the real search cases", as
   assert.match(harness, /officialWebSocketCompleted/);
   assert.match(harness, /source: "official-search-cases"/);
   assert.doesNotMatch(harness, /OfficialWebSocketSession/);
+});
+
+test("release qualification includes bounded compaction, fork and restart migration chains", async () => {
+  const harness = await readFile(resolve("scripts/e2e/history-migration-acceptance.mjs"), "utf8");
+  assert.match(harness, /thread\/compact\/start/);
+  assert.match(harness, /thread\/fork/);
+  assert.match(harness, /thread\/resume/);
+  assert.match(harness, /maxTurns[^\n]+14/);
+  assert.match(harness, /maxGenerations[^\n]+18/);
+  assert.match(harness, /nativeMigrationSummary: true/);
+  assert.match(harness, /appWebSocketObserved/);
+  assert.match(harness, /legacyCheckpointRecovered/);
+  assert.match(harness, /summaryReusePassed/);
+  assert.match(harness, /gatewayErrorFree/);
+  assert.match(harness, /noReconnectRetries/);
+  assert.doesNotMatch(harness, /httpTransportObserved/);
+  assert.doesNotMatch(harness, /responses_websockets/);
+  const releaseHarness = await readFile(resolve("scripts/e2e/release-qualification.mjs"), "utf8");
+  assert.match(releaseHarness, /history-migration-acceptance\.mjs/);
 });

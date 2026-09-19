@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+## 0.5.20 - 2026-09-19
+
+- Recover a trusted legacy official checkpoint before the cross-provider observation gate runs, including forks whose encrypted source window remains on another thread in the same authenticated account. App model switches after a Router restart can now reach the existing one-time migration summary instead of returning `history_observation_incomplete` locally.
+- Reuse the same exact compaction-window recovery in both the observation gate and migration-summary preparation, including archived checkpoint references and the encrypted event index.
+- Make Release qualification reproduce the legacy-checkpoint restart boundary, require error-free same-thread summary reuse, and keep its declared turn budget aligned with the executed lifecycle.
+
+## 0.5.19 - 2026-09-19
+
+- Bound each official checkpoint view at its exact compaction item. Output after compaction remains an unsummarized continuation tail, so pending tool calls are never placed before an injected summary instruction.
+- Recover legacy checkpoint views from the encrypted per-thread event index and persist a lightweight history reference. Oversized complete originals can use the existing one-time native migration summary instead of re-sending the full history.
+- Log only allowlisted structured fields for official summary terminal errors, keeping provider messages and conversation content out of diagnostics.
+
+## 0.5.18 - 2026-09-18
+
+- Strip HTTP entity headers before opening an internal official WebSocket. HTTP-originated migration summaries no longer advertise a compressed request body on the WebSocket handshake and get reset before generation.
+
+## 0.5.17 - 2026-09-18
+
+- Allow a later request to retry a migration summary that ended in a definite failure. Running and uncertain summaries remain blocked, so retries cannot race or repeat an outcome whose completion is unknown.
+
+## 0.5.16 - 2026-09-18
+
+- Prefer an expanded checkpoint's recorded source over the most recent target when selecting an overflow summary provider. A long official history can still use its authenticated official summary after an earlier successful turn on the destination provider.
+
+## 0.5.15 - 2026-09-18
+
+- Preserve call-less Codex application outputs as portable user messages instead of invalid provider tool results. Cross-task delegation instructions now survive migration without leaving orphan tool output.
+
+## 0.5.14 - 2026-09-18
+
+- Drop Codex application-level tool output events that have no portable `call_id` while rewriting cross-provider history. This prevents migration summaries from retaining an orphan output after its source-side call has been summarized away.
+
+## 0.5.13 - 2026-09-18
+
+- Route overflow migration summaries for official-source history through the existing authenticated official WebSocket session. This closes the real long-history path that previously retried an unsupported direct subscription request and returned HTTP 400 before the destination call.
+
+## 0.5.12 - 2026-09-18
+
+- Re-canonicalize Gateway-projected history on every official continuation, including repeated turns and forks whose current route already appears official, so provider-private reasoning IDs never reach the opaque OpenAI relay.
+- Stop clearly over-budget requests before any destination call. Cross-provider history reuses the existing one-summary migration path; an oversized unsummarizable tail returns a local HTTP 413 without upstream timeout or retry.
+
+## 0.5.11 - 2026-09-18
+
+- Keep `history inspect` memory-bounded on large recovered archives by reading latest-version counts from metadata and evaluating recovered checkpoints one at a time instead of retaining every hydrated history window.
+
+## 0.5.10 - 2026-09-18
+
+- Treat official compaction output as a replacement context window for HTTP, WebSocket and persisted replay, including compaction emitted during an ordinary response. Retained tails are removed only by exact position, while original archives and target-visible views remain distinct.
+- Reconstruct complete segmented and forked rollout lineage with strict ordinal, boundary, source-hash and tool-result validation. Interrupted tools remain explicit unknown-result facts; recovery stops the managed service before one atomic encrypted commit and reuses shared event storage.
+- Add opt-in `compression.nativeMigrationSummary` for controlled cross-provider migration of trusted official opaque windows. One source-model, tool-free summary is persisted and reused without sending subscription state to the destination; GLM Flash remains the only planned local opt-in.
+- Preserve visible `agent_message` facts, completed search sources and function/custom-tool pairs in portable history while rejecting malformed or incomplete records. `history inspect --target` now separates complete originals, reusable summaries, summary-needed checkpoints and hard blockers.
+- Add deterministic lifecycle coverage and bounded release E2E definitions for official compaction, fork, third-party migration, tool continuation, recompaction and return-to-official flows. Official `access_programs` entitlement denial is classified separately and never disguised as a history repair.
+
+## 0.5.9 - 2026-09-18
+
+- Recover portable compaction history across segmented and archived Codex rollouts, preferring the exact `history_base` chain over older fork provenance and discarding only tool calls explicitly terminated by `turn_aborted`.
+- Enrich matching metadata-only checkpoints for the requested thread without rewriting source rollouts or duplicating ancestor checkpoints. Large histories use shared immutable event snapshots to avoid quadratic memory growth.
+- Keep official `access_programs` fields byte-transparent. Upstream organization-entitlement errors remain visible and are not stripped, retried, or routed through Engine.
+
+## 0.5.8 - 2026-09-18
+
+- Keep native official compaction triggers and opaque compaction items on the transparent relay unless virtual Gateway history or cross-provider continuation requires Engine replay. Observe portable checkpoints without making official completion depend on archive availability.
+- Treat `timeoutMs` as upstream inactivity for HTTP SSE in the shared transport, rather than truncating active long-running generations at a fixed total duration. Keep connection limits, finite-response total deadlines, cancellation and backpressure handling; add no retries.
+- Add local HTTP/WS regression coverage for long official relay and Engine replay streams, repeated native compaction and cross-provider checkpoint recovery. Configuration spaces, selected/default models and third-party policies are unchanged.
+
 ## 0.5.7 - 2026-09-18
 
 - Reorganize the English and Chinese documentation around user tasks, with neutral quick-start examples, a single Provider guide, explicit support-status vocabulary, and accurate macOS and protocol boundaries.

@@ -234,7 +234,7 @@ export class Archive {
 
   encode(value) {
     const raw = Buffer.from(JSON.stringify(value));
-    const hash = createHmac("sha256", this.key).update(raw).digest("hex");
+    const hash = this.blobHash(raw);
     const iv = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", this.key, iv);
     cipher.setAAD(Buffer.from(hash));
@@ -247,6 +247,13 @@ export class Archive {
         cipher.getAuthTag(),
       ]),
     };
+  }
+
+  blobHash(value) {
+    const raw = Buffer.isBuffer(value)
+      ? value
+      : Buffer.from(JSON.stringify(value));
+    return createHmac("sha256", this.key).update(raw).digest("hex");
   }
 
   decode(row) {
@@ -417,6 +424,12 @@ export class Archive {
     if (!value?.historyRef) return value;
     const history = this.history(value.historyRef);
     if (!history) throw fail("history_corrupt", 503);
+    if (value.historyKind === "checkpoint")
+      return {
+        ...value,
+        original: history.original,
+        view: value.checkpointView ?? history.view,
+      };
     return {
       ...value,
       input: history.view,
@@ -448,6 +461,42 @@ export class Archive {
     this.transaction(() => {
       for (const { key, value, scope } of entries)
         this.writeState(key, value, scope);
+    });
+  }
+
+  setRecoveredCheckpoints(entries) {
+    this.transaction(() => {
+      for (const { key, value, scope } of entries) {
+        const version = this.appendHistoryRow({
+          owner: scope.owner,
+          thread: scope.thread,
+          branch: scope.branch,
+          target: {
+            id: value.targetId,
+            provider: value.provider,
+            model: value.model,
+          },
+          status: value.completeness ?? "complete_original",
+          original: value.original,
+          view: value.view,
+        });
+        this.writeState(
+          key,
+          {
+            ...value,
+            original: undefined,
+            view: undefined,
+            historyKind: "checkpoint",
+            historyRef: {
+              owner: scope.owner,
+              thread: scope.thread,
+              branch: scope.branch,
+              version,
+            },
+          },
+          scope,
+        );
+      }
     });
   }
 
@@ -627,6 +676,47 @@ export class Archive {
     };
   }
 
+  historySummary({ owner, thread, branch, version }) {
+    const values = [this.opaque(owner), this.opaque(thread), this.opaque(branch)];
+    const row = version == null
+      ? this.db
+          .prepare(
+            "SELECT * FROM history_versions WHERE owner=? AND thread=? AND branch=? ORDER BY version DESC LIMIT 1",
+          )
+          .get(...values)
+      : this.db
+          .prepare(
+            "SELECT * FROM history_versions WHERE owner=? AND thread=? AND branch=? AND version=?",
+          )
+          .get(...values, version);
+    if (!row) return undefined;
+    const count = (kind) => {
+      if (row[`${kind}_count`] != null) return row[`${kind}_count`];
+      const legacy = this.getBlob(row[`${kind}_hash`]);
+      if (!Array.isArray(legacy)) throw fail("history_corrupt", 503);
+      return legacy.length;
+    };
+    return {
+      version: row.version,
+      parentVersion: row.parent_version,
+      target: {
+        id: row.target_id,
+        provider: row.provider,
+        model: row.model,
+      },
+      responseId: row.response_id,
+      status: row.status,
+      originalItems: count("original"),
+      viewItems: count("view"),
+      created: row.created,
+      branch: this.db
+        .prepare(
+          "SELECT parent_version FROM branches WHERE owner=? AND thread=? AND branch=?",
+        )
+        .get(...values),
+    };
+  }
+
   listHistory({ owner, thread, branch, limit = 100 } = {}) {
     const where = [];
     const values = [];
@@ -643,29 +733,115 @@ export class Archive {
     return this.db.prepare(sql).all(...values, limit);
   }
 
-  checkpointStats({ owner, thread, branch }) {
+  historyViewForItem({ owner, thread, branch, item }) {
+    const scope = [this.opaque(owner), this.opaque(thread), this.opaque(branch)];
+    const row = this.db.prepare(`
+      SELECT version FROM history_event_items
+      WHERE owner=? AND thread=? AND branch=? AND kind='view' AND hash=?
+      ORDER BY version ASC LIMIT 1
+    `).get(...scope, this.blobHash(item));
+    if (!row) return undefined;
+    const historyRef = { owner, thread, branch, version: row.version };
+    const history = this.history(historyRef);
+    const serialized = JSON.stringify(item);
+    if (!history?.view?.some((candidate) => JSON.stringify(candidate) === serialized))
+      return undefined;
+    return { view: history.view, historyRef };
+  }
+
+  historyViewForStateItem({ key, item }) {
+    const scope = this.db.prepare(
+      "SELECT owner,thread,branch FROM records WHERE key=?",
+    ).get(this.opaque(key));
+    if (!scope?.owner || !scope.thread || !scope.branch) return undefined;
+    const versions = this.db.prepare(`
+      SELECT version FROM history_versions
+      WHERE owner=? AND thread=? AND branch=?
+      ORDER BY version DESC
+    `).all(scope.owner, scope.thread, scope.branch);
+    for (const { version } of versions) {
+      const view = this.readEventStream({ ...scope, version }, "view");
+      if (view?.some((candidate) =>
+        candidate?.encrypted_content === item.encrypted_content))
+        return { view };
+    }
+    return undefined;
+  }
+
+  checkpoints({ owner, thread, branch, hydrate = false }) {
     const rows = this.db.prepare(`
       SELECT b.hash,b.body,r.updated FROM records r
       JOIN blobs b ON b.hash=r.hash
       WHERE r.owner=? AND r.thread=? AND r.branch=?
       ORDER BY r.updated DESC
     `).all(this.opaque(owner), this.opaque(thread), this.opaque(branch));
-    const checkpoints = rows
-      .map((row) => ({ value: this.decode(row), updated: row.updated }))
+    return rows
+      .map((row) => {
+        const value = this.decode(row);
+        if (
+          !hydrate ||
+          !value?.historyRef ||
+          value.historyKind !== "checkpoint"
+        )
+          return { value, updated: row.updated };
+        const history = this.history(value.historyRef);
+        if (!history) throw fail("history_corrupt", 503);
+        return {
+          value: {
+            ...value,
+            original: history.original,
+            view: value.checkpointView ?? history.view,
+          },
+          updated: row.updated,
+        };
+      })
       .filter(({ value }) =>
         value &&
         typeof value === "object" &&
         Object.hasOwn(value, "virtual") &&
-        Object.hasOwn(value, "targetId") &&
-        Array.isArray(value.view),
+        Object.hasOwn(value, "targetId"),
       );
-    const portable = checkpoints.filter(({ value }) =>
-      Array.isArray(value.original ?? value.portable) &&
-      (value.original ?? value.portable).length,
+  }
+
+  checkpointStats({ owner, thread, branch }) {
+    const checkpoints = this.checkpoints({ owner, thread, branch });
+    const originalComplete = checkpoints.filter(({ value }) =>
+      (Array.isArray(value.original ?? value.portable) &&
+        (value.original ?? value.portable).length) ||
+      (value.historyKind === "checkpoint" &&
+        value.completeness === "complete_original"),
+    );
+    const summaryPortable = checkpoints.filter(
+      ({ value }) =>
+        value.migration?.status === "completed" &&
+        (Array.isArray(value.migration.view) || value.historyKind === "checkpoint"),
+    );
+    const portable = checkpoints.filter(
+      (checkpoint) =>
+        originalComplete.includes(checkpoint) ||
+        summaryPortable.includes(checkpoint),
     );
     return {
       portable: portable.length,
       unrecoverable: checkpoints.length - portable.length,
+      completeOriginal: originalComplete.length,
+      metadataOnly: checkpoints.filter(({ value }) =>
+        !["complete_original", "gap_present", "observing"].includes(
+          value.completeness,
+        ) && value.migration?.status !== "completed",
+      ).length,
+      observing: checkpoints.filter(
+        ({ value }) => value.completeness === "observing",
+      ).length,
+      gapPresent: checkpoints.filter(
+        ({ value }) => value.completeness === "gap_present",
+      ).length,
+      summaryPortable: summaryPortable.length,
+      migrationFailed: checkpoints.filter(
+        ({ value }) =>
+          value.migration?.status === "failed" ||
+          value.migration?.status === "uncertain",
+      ).length,
       recovered: checkpoints.filter(({ value }) => value.recovery?.sourceHash).length,
       recentRecoverySourceHash:
         checkpoints.find(({ value }) => value.recovery?.sourceHash)?.value.recovery.sourceHash ?? null,

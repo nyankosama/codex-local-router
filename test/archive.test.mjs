@@ -319,6 +319,26 @@ test("new history versions store only event suffixes and reconstruct exact prefi
   archive.appendHistory({ owner: ctx.account, thread: ctx.thread, branch: ctx.branch, target, original: second, view: second });
   assert.equal(archive.stats().events, 8);
   assert.deepEqual(archive.history({ owner: ctx.account, thread: ctx.thread, branch: ctx.branch }).original, second);
+  const readEventStream = archive.readEventStream;
+  archive.readEventStream = () => {
+    throw Error("historySummary must not hydrate event streams");
+  };
+  const summary = archive.historySummary({
+    owner: ctx.account,
+    thread: ctx.thread,
+    branch: ctx.branch,
+  });
+  assert.equal(summary.version, 2);
+  assert.equal(summary.parentVersion, 1);
+  assert.deepEqual(summary.target, {
+    id: target.id,
+    provider: target.provider,
+    model: target.model,
+  });
+  assert.equal(summary.originalItems, 4);
+  assert.equal(summary.viewItems, 4);
+  assert.equal(summary.branch.parent_version, null);
+  archive.readEventStream = readEventStream;
 });
 
 test("opening a v2 archive keeps a recovery backup and writes future versions incrementally", async (t) => {

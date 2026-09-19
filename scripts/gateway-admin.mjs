@@ -11,6 +11,7 @@ import {
   importRollout,
   planRolloutRecovery,
   readRollout,
+  verifyRolloutRecoverySources,
 } from "../src/rollout.mjs";
 import { loadCodexAuth } from "../src/local-identity.mjs";
 import { configDiff, createConfig, rawConfig, writeConfigTransaction } from "../src/config-store.mjs";
@@ -36,6 +37,7 @@ import {
   encryptHistoryPayload,
   historyResumePrompt,
 } from "../src/history-package.mjs";
+import { checkpointTargetStatus } from "../src/history.mjs";
 import { atomicJSON, atomicWrite, withFileLock } from "../src/files.mjs";
 import { codexHome, PACKAGE_VERSION, PRODUCT_NAME, runtimePaths } from "../src/product.mjs";
 import { credential } from "../src/providers.mjs";
@@ -180,6 +182,17 @@ function requestedResponsesLite() {
   if (flag("responses-lite")) return true;
   if (flag("no-responses-lite")) return false;
   return undefined;
+}
+
+function requestedNativeMigrationSummary() {
+  const enabled = flag("native-migration-summary");
+  const disabled = flag("no-native-migration-summary");
+  if (enabled && disabled)
+    throw Object.assign(
+      Error("native migration summary flags conflict"),
+      { code: "usage_error" },
+    );
+  return enabled ? true : disabled ? false : undefined;
 }
 
 function requestedFreeformTools() {
@@ -919,6 +932,8 @@ async function modelCommand() {
       id: target.id, provider: target.provider, model: target.model,
       protocol: target.wireApi, contextWindow: target.contextWindow,
       modalities: target.inputModalities, compression: target.compression.mode,
+      nativeMigrationSummary:
+        target.compression?.nativeMigrationSummary === true,
       reasoningLevels: target.app?.reasoningLevels ?? [],
       modelFamily: target.modelFamily ?? null,
       pluginToolPolicy: resolvePluginToolPolicy(config, target),
@@ -948,6 +963,8 @@ async function modelCommand() {
       provider: target.provider,
       protocol: target.wireApi,
       capabilities: target.capabilities,
+      nativeMigrationSummary:
+        target.compression?.nativeMigrationSummary === true,
       modelFamily: target.modelFamily ?? null,
       pluginToolPolicy: resolvePluginToolPolicy(config, target),
       toolSourceRecognition: toolSourceStatus(registry),
@@ -1045,6 +1062,7 @@ async function modelCommand() {
     throw Object.assign(Error("model add|edit|remove requires --id"), { code: "usage_error" });
   const requestedProfile = requestedAppProfile();
   const requestedLite = requestedResponsesLite();
+  const nativeMigrationSummary = requestedNativeMigrationSummary();
   const subscriptionSearch = requestedSubscriptionSearch();
   const freeformTools = requestedFreeformTools();
   const shellType = requestedShellType();
@@ -1179,6 +1197,12 @@ async function modelCommand() {
       }
       if (effectiveTemplate === "legacy")
         config.targets[id] = applyThirdPartyTemplate(config.targets[id], "legacy");
+      config.targets[id].compression = {
+        ...config.targets[id].compression,
+        ...(nativeMigrationSummary != null
+          ? { nativeMigrationSummary }
+          : {}),
+      };
       setToolMode(config.targets[id], toolMode);
       const priorMultiAgent = config.targets[id].app?.multiAgent;
       if (value("multi-agent-from") != null) delete config.targets[id].app?.multiAgent;
@@ -1228,7 +1252,13 @@ async function modelCommand() {
       contextWindow: Number(value("context-window") ?? current.contextWindow),
       maxContextWindow: Number(value("max-context-window") ?? value("context-window") ?? current.maxContextWindow ?? current.contextWindow),
       inputModalities: (value("input-modalities") ?? current.inputModalities?.join(",") ?? "text").split(","),
-      compression: { mode: value("compression") ?? current.compression?.mode ?? "unsupported" },
+      compression: {
+        ...current.compression,
+        mode: value("compression") ?? current.compression?.mode ?? "unsupported",
+        ...(nativeMigrationSummary != null
+          ? { nativeMigrationSummary }
+          : {}),
+      },
       modelFamily,
       pluginToolPolicy: requestedPluginPolicy(current.pluginToolPolicy),
       capabilities: {
@@ -1590,11 +1620,58 @@ async function historyCommand() {
     if (!thread && command !== "import") throw Object.assign(Error(`history ${command} requires --thread ID`), { code: "usage_error" });
     const branch = value("branch") ?? thread;
     if (command === "inspect") {
-      const latest = archive.history({ owner, thread, branch });
-      return emit({ found: !!latest, latest: latest ? { ...latest, original: undefined, view: undefined, originalItems: latest.original.length, viewItems: latest.view.length } : null, versions: archive.listHistory({ owner, thread, branch }), checkpoints: archive.checkpointStats({ owner, thread, branch }), archive: archive.stats() },
-        (x) => x.found ? `History ${thread}: ${x.versions.length} version(s), latest ${x.latest.originalItems} original / ${x.latest.viewItems} view items.` : `History not found: ${thread}`);
+      const latest = archive.historySummary({ owner, thread, branch });
+      const targetId = value("target");
+      let targetProjection = null;
+      if (targetId) {
+        const target = config.targets[targetId];
+        if (!target)
+          throw Object.assign(Error(`model does not exist: ${targetId}`), {
+            code: "model_not_found",
+          });
+        const statuses = [];
+        for (const { value } of archive.checkpoints({ owner, thread, branch })) {
+          let checkpoint = value;
+          if (value.historyKind === "checkpoint" && value.historyRef) {
+            const history = archive.history(value.historyRef);
+            if (!history) throw Object.assign(Error("history checkpoint is missing"), {
+              code: "history_corrupt",
+            });
+            checkpoint = {
+              ...value,
+              original: history.original,
+              view: value.checkpointView ?? history.view,
+            };
+          }
+          statuses.push(checkpointTargetStatus(checkpoint, target));
+        }
+        const reasons = {};
+        for (const status of statuses)
+          reasons[status.reason] = (reasons[status.reason] ?? 0) + 1;
+        targetProjection = {
+          target: targetId,
+          checkpoints: statuses.length,
+          compatible: statuses.filter((status) => status.compatible).length,
+          needsSummary: statuses.filter((status) => status.needsSummary).length,
+          blocked: statuses.filter(
+            (status) => !status.compatible && !status.needsSummary,
+          ).length,
+          reasons,
+        };
+      }
+      return emit({
+        found: !!latest,
+        latest,
+        versions: archive.listHistory({ owner, thread, branch }),
+        checkpoints: archive.checkpointStats({ owner, thread, branch }),
+        targetProjection,
+        archive: archive.stats(),
+      }, (x) => x.found
+        ? `History ${thread}: ${x.versions.length} version(s), latest ${x.latest.originalItems} original / ${x.latest.viewItems} view items${x.targetProjection ? `; target ${x.targetProjection.target}: ${x.targetProjection.compatible} compatible, ${x.targetProjection.needsSummary} need summary, ${x.targetProjection.blocked} blocked` : ""}.`
+        : `History not found: ${thread}`);
     }
     if (command === "recover") {
+      let restartService = false;
       try {
         const apply = flag("yes");
         if (apply) {
@@ -1604,19 +1681,22 @@ async function historyCommand() {
             });
           const service = await serviceStatus(configPath, env);
           if (
-            (service.running && !service.health) ||
+            (service.loaded && !service.health) ||
             (service.health?.activeTurns ?? 0) !== 0 ||
             (service.health?.websocketConnections ?? 0) !== 0
           )
             throw Object.assign(Error("Gateway must be idle before recovering rollout checkpoints"), {
               code: "history_recovery_busy",
             });
+          restartService = service.loaded;
+          if (restartService) await stopService({ env });
         }
         const plan = await planRolloutRecovery({
           thread,
           source: value("source"),
           sessionsRoot: join(codexHome(env), "sessions"),
         });
+        if (apply) await verifyRolloutRecoverySources(plan);
         const result = applyRolloutRecovery(archive, plan, { account: owner, apply });
         return emit(result, (x) => x.applied
           ? `Recovered ${x.written} checkpoint(s) for ${thread}.`
@@ -1625,6 +1705,8 @@ async function historyCommand() {
         if (error.type?.startsWith("rollout_") || error.code?.startsWith("rollout_"))
           error.event = "rollout_recovery_incomplete";
         throw error;
+      } finally {
+        if (restartService) await installService(configPath, { env });
       }
     }
     if (command === "export") {

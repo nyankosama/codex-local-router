@@ -6,6 +6,12 @@
 
 初始化、克隆、切换、回滚、drift、pending 事务和救援流程见[配置空间指南](configuration-spaces.zh-CN.md)。
 
+## 请求超时
+
+`timeoutMs` 缺省为 180,000 毫秒，可由 target 覆盖。HTTP 建连上限为 15 秒与此值中的较小值；收到响应头之前及非 SSE 响应仍使用请求总时限。上游声明 `text/event-stream` 后改为无数据超时，每次收到字节（包括心跳）重新计时，因此持续传输的生成可以超过三分钟。下游背压暂停读取时暂停该计时，用户取消仍会关闭上游。原生官方 WebSocket Relay 不受这个 HTTP 时限约束。
+
+这不会增加自动重试，也不代表无限等待无响应：连续一个超时间隔没有上游字节仍会失败。心跳即使没有可见文字也能延长请求，用户可主动取消。不需要迁移配置空间。
+
 ## 第三方默认模板
 
 新建 App-enabled 第三方模型在声明 Responses、工具调用和 freeform 工具能力且其 preset 已通过 Provider 准出时，默认使用 `codex-general-v1`，物化通用指令、标准 Responses、Code mode、多代理 v2、关闭的独立搜索和标准 Plugin 策略。`thirdPartyDefaults.template` 只允许 `codex-general-v1` 或 `legacy`，且只影响后续创建；已有 target 仅通过 `model apply-template` 改变。当前 OpenCode Go DeepSeek preset 虽有静态能力声明，仍只允许 `legacy`。详见[第三方模型模板](third-party-templates.zh-CN.md)。
@@ -147,6 +153,8 @@ Provider 模式只接受显式声明：target 必须是 App-enabled Responses，
 别名归一化后，同一项不能同时增加和排除。Codex 核心工具、`codex_app`、`cua_repl`、Router 搜索工具、用户自行配置的 MCP、Skills、Hooks 与提示正文不受裁剪。来源未知或冲突时放行并记录结构化诊断。
 
 `history.observationWaitMs` 可设置紧接着跨 Provider 切换时等待官方历史旁路提交的上限，默认 2,000 ms。普通官方响应不会等待观察解析或写盘完成才结束。
+
+`compression.nativeMigrationSummary` 是缺省关闭的 target 级开关，只能与 `compression.mode: "summary"` 同时使用。它允许对可信官方 opaque 压缩窗口生成一次受控、有损、关闭工具的原模型摘要；不放宽谱系、来源缺口、必要尾部或容量校验，也不产生自动重试和渠道回退。CLI 使用 `--native-migration-summary` / `--no-native-migration-summary`，详见 [Fork 与压缩历史恢复](compaction-recovery.zh-CN.md)。
 
 `model list --json` 和非 live 的 `model probe --json` 会显示最终 Plugin/搜索策略、App 能力画像、选择原因、工具面、是否向 App 广告、Provider endpoint 和凭证就绪状态；`status` 与 `doctor` 也输出画像摘要。CLI 相关参数包括 `--model-family`、`--plugin-policy`、`--allowed-plugins`、`--app-profile`、`--search-source` 和兼容旧参数。
 

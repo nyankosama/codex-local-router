@@ -114,8 +114,13 @@ test("Gateway falls back after an upstream timeout", async (t) => {
   let calls = 0;
   const upstream = http.createServer((req, res) => {
     calls++;
-    if (calls === 1)
-      return setTimeout(() => json(res, { error: "late" }, 200), 150);
+    if (calls === 1) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+      const timer = setTimeout(() => res.end(JSON.stringify({ error: "late" })), 1500);
+      res.on("close", () => clearTimeout(timer));
+      return;
+    }
     json(res, {
       choices: [{ message: { role: "assistant", content: "recovered" } }],
     });
@@ -134,7 +139,7 @@ test("Gateway falls back after an upstream timeout", async (t) => {
         provider: "mock",
         model: "primary",
         wireApi: "chat_completions",
-        timeoutMs: 20,
+        timeoutMs: 500,
         capabilities: { toolCalling: true },
       },
       fallback: {

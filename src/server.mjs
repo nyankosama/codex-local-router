@@ -120,6 +120,33 @@ export function createGateway(config, options = {}) {
         res.once("close", closed);
       });
   };
+  const runOfficialSummary = async (
+    headers,
+    summary,
+    signal,
+    existingSession,
+  ) => {
+    const session = existingSession ?? new OfficialWebSocketSession(headers, {
+      createSocket: options.createOfficialWebSocket,
+      maxPayload: engine.config.maxBodyBytes ?? 20 * 1024 * 1024,
+      log,
+    });
+    try {
+      return await session.run(
+        Buffer.from(
+          JSON.stringify({
+            type: "response.create",
+            ...summary,
+            store: false,
+          }),
+        ),
+        false,
+        { signal, forward: async () => {} },
+      );
+    } finally {
+      if (!existingSession) session.close();
+    }
+  };
   const server = http.createServer(async (req, res) => {
     if (!allowedOrigin(req))
       return json(res, 403, publicError(fail("origin_rejected", 403)));
@@ -295,6 +322,8 @@ export function createGateway(config, options = {}) {
           transport: "http",
           responsesLite:
             req.headers["x-openai-internal-codex-responses-lite"] === "true",
+          officialSummary: (summary, summarySignal) =>
+            runOfficialSummary(req.headers, summary, summarySignal),
         },
       )) {
         if (["response.completed", "response.incomplete"].includes(event.type))
@@ -521,12 +550,10 @@ export function createGateway(config, options = {}) {
               await officialSession.run(data, isBinary, {
                 signal: active.signal,
                 forward: sendRaw,
-                observe: message.generate === false
-                  ? undefined
-                  : (event) => engine.queueOfficialObservation(
-                      officialClassification,
-                      () => engine.observeOfficialEvent(headers, body, event),
-                    ),
+                observe: (event) => engine.queueOfficialObservation(
+                  officialClassification,
+                  () => engine.observeOfficialEvent(headers, body, event),
+                ),
               });
               return;
             }
@@ -584,6 +611,13 @@ export function createGateway(config, options = {}) {
                     message.client_metadata
                       ?.ws_request_header_x_openai_internal_codex_responses_lite ===
                     "true",
+                  officialSummary: (summary, summarySignal) =>
+                    runOfficialSummary(
+                      headers,
+                      summary,
+                      summarySignal,
+                      officialSession,
+                    ),
                 },
               )) {
                 await send({ ...event, sequence_number: seq++ });
