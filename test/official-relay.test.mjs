@@ -1131,9 +1131,10 @@ test("A6 official WebSocket exposes only allowlisted TLS error codes", async () 
   }]);
 });
 
-test("A6 official WebSocket archives prewarm lineage without rewriting relay payloads", async (t) => {
+test("A6 official WebSocket replays a stale continuation once from observed history", async (t) => {
   const upstreamSockets = [];
   const received = [];
+  const logs = [];
   class FakeUpstream extends EventEmitter {
     constructor(url, options) {
       super();
@@ -1148,6 +1149,19 @@ test("A6 official WebSocket archives prewarm lineage without rewriting relay pay
     send(data, options, callback) {
       received.push({ data: Buffer.from(data), options });
       callback();
+      const requestBody = JSON.parse(Buffer.from(data).toString());
+      if (received.length === 2 || requestBody.previous_response_id === "resp_missing") {
+        const error = Buffer.from(JSON.stringify({
+          type: "error",
+          status: 400,
+          error: {
+            type: "invalid_request_error",
+            message: "Invalid `previous_response_id`.",
+          },
+        }));
+        queueMicrotask(() => this.emit("message", error, false));
+        return;
+      }
       const responseId = `resp_ws_${received.length}`;
       const first = Buffer.from(JSON.stringify({
         type: "response.created",
@@ -1157,7 +1171,13 @@ test("A6 official WebSocket archives prewarm lineage without rewriting relay pay
       const terminal = Buffer.from(JSON.stringify({
         type: "response.completed",
         sequence_number: 92,
-        response: { id: responseId, status: "completed", output: [] },
+        response: {
+          id: responseId,
+          status: "completed",
+          output: received.length === 1
+            ? [{ type: "message", role: "assistant", content: [] }]
+            : [],
+        },
       }));
       queueMicrotask(() => {
         this.emit("message", first, false);
@@ -1169,6 +1189,7 @@ test("A6 official WebSocket archives prewarm lineage without rewriting relay pay
   }
   const gateway = createGateway(config(), {
     resolveIdentity: async () => "chatgpt:fixture",
+    log: (event) => logs.push(event),
     createOfficialWebSocket: (url, options) => {
       const socket = new FakeUpstream(url, options);
       upstreamSockets.push(socket);
@@ -1199,14 +1220,14 @@ test("A6 official WebSocket archives prewarm lineage without rewriting relay pay
   }));
   const messages = [];
   socket.on("message", (data) => messages.push(Buffer.from(data)));
-  const nextCompleted = () => new Promise((resolve, reject) => {
+  const nextEvent = (type) => new Promise((resolve, reject) => {
     const onError = (error) => {
       cleanup();
       reject(error);
     };
     const onMessage = (data) => {
       const event = JSON.parse(data.toString());
-      if (event.type !== "response.completed") return;
+      if (event.type !== type) return;
       cleanup();
       resolve(event);
     };
@@ -1217,7 +1238,7 @@ test("A6 official WebSocket archives prewarm lineage without rewriting relay pay
     socket.on("message", onMessage);
     socket.on("error", onError);
   });
-  const done = nextCompleted();
+  const done = nextEvent("response.completed");
   socket.send(request);
   await done;
   await gateway.engine.requireObservedHistory(
@@ -1236,7 +1257,7 @@ test("A6 official WebSocket archives prewarm lineage without rewriting relay pay
     input: [{ role: "user", content: "continue" }],
     stream: true,
   }));
-  const continued = nextCompleted();
+  const continued = nextEvent("response.completed");
   socket.send(continuation);
   await continued;
   assert.equal(upstreamSockets[0].url, "wss://chatgpt.com/backend-api/codex/responses");
@@ -1244,10 +1265,31 @@ test("A6 official WebSocket archives prewarm lineage without rewriting relay pay
   assert.equal(upstreamSockets[0].options.headers.authorization, "Bearer subscription");
   assert.equal(Buffer.compare(received[0].data, request), 0);
   assert.equal(Buffer.compare(received[1].data, continuation), 0);
+  const replay = JSON.parse(received[2].data.toString());
+  assert.equal(replay.previous_response_id, undefined);
+  assert.deepEqual(replay.input, [
+    { role: "user", content: "fixture" },
+    { type: "message", role: "assistant", content: [] },
+    { role: "user", content: "continue" },
+  ]);
   assert.deepEqual(
     messages.map((message) => JSON.parse(message).sequence_number),
     [91, 92, 91, 92],
   );
+  assert.equal(
+    logs.filter((event) => event.event === "official_previous_response_replayed").length,
+    1,
+  );
+  const missingError = nextEvent("error");
+  socket.send(JSON.stringify({
+    type: "response.create",
+    model: "gpt-future-ws",
+    previous_response_id: "resp_missing",
+    input: [{ role: "user", content: "unknown history" }],
+    stream: true,
+  }));
+  assert.equal((await missingError).error.message, "Invalid `previous_response_id`.");
+  assert.equal(received.length, 4);
   socket.close();
 });
 

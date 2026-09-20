@@ -1,13 +1,36 @@
-const jsonBytes = (value) => Buffer.byteLength(JSON.stringify(value));
+const TOKEN_BYTES = 3.2;
+const EMBEDDED_IMAGE_TOKENS = 8192;
+
+const requestBytes = (body) => {
+  let embeddedImages = 0;
+  const json = JSON.stringify(
+    {
+      instructions: body.instructions,
+      input: body.input,
+      tools: body.tools,
+    },
+    (key, value) => {
+      if (
+        (key === "image_url" || key === "url") &&
+        typeof value === "string" &&
+        /^data:image\//i.test(value)
+      ) {
+        embeddedImages++;
+        return "[embedded image]";
+      }
+      return value;
+    },
+  );
+  return { bytes: Buffer.byteLength(json), embeddedImages };
+};
 
 // This deliberately reports an estimate. Borderline context decisions remain
 // upstream-owned; the Engine only blocks requests above a wide safety margin.
 export function estimateRequestTokens(body) {
-  return Math.ceil(jsonBytes({
-    instructions: body.instructions,
-    input: body.input,
-    tools: body.tools,
-  }) / 3.2);
+  const { bytes, embeddedImages } = requestBytes(body);
+  return (
+    Math.ceil(bytes / TOKEN_BYTES) + embeddedImages * EMBEDDED_IMAGE_TOKENS
+  );
 }
 
 export function inputBudget(target, body = {}) {

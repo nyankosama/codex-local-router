@@ -7,7 +7,10 @@ import { createServer } from "node:http";
 import { loadConfig, validate } from "../src/config.mjs";
 import { buildModelCatalog } from "../src/model-catalog.mjs";
 import { providerEndpoint } from "../src/providers.mjs";
-import { isExplicitContextError } from "../src/context.mjs";
+import {
+  estimateRequestTokens,
+  isExplicitContextError,
+} from "../src/context.mjs";
 import { configDiff, createConfig, rawConfig, writeConfigTransaction } from "../src/config-store.mjs";
 import {
   drainService,
@@ -155,6 +158,28 @@ test("generic request size errors do not trigger lossy context fallback", () => 
   assert.equal(isExplicitContextError(413, { error: { code: "request_too_large" } }), false);
   assert.equal(isExplicitContextError(400, { error: { code: "context_length_exceeded" } }), true);
   assert.equal(isExplicitContextError(400, { error: { code: "vendor_context" } }, { contextErrorCodes: ["vendor_context"] }), true);
+});
+
+test("embedded images use a bounded vision-token estimate", () => {
+  const base64 = "a".repeat(900_000);
+  const estimated = estimateRequestTokens({
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_image", image_url: `data:image/png;base64,${base64}` },
+          {
+            type: "image_url",
+            image_url: { url: `data:image/jpeg;base64,${base64}` },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.ok(estimated >= 16_384);
+  assert.ok(estimated < 17_000);
 });
 
 test("config transactions preview, back up, apply, and reject stale writes", async (t) => {
