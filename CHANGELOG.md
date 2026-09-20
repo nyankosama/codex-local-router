@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.21 - 2026-09-20
+
+- Retry an official WebSocket continuation once with the trusted local parent history when OpenAI rejects the first upstream event with the exact ``Invalid `previous_response_id`.`` error. The stale error stays hidden from Codex, replay remains bounded by the existing request limit, and unmatched errors remain byte-transparent.
+- Include image inputs in request-size estimation so multimodal histories reach the existing context-budget safeguards before an oversized upstream call.
+
 ## 0.5.20 - 2026-09-19
 
 - Recover a trusted legacy official checkpoint before the cross-provider observation gate runs, including forks whose encrypted source window remains on another thread in the same authenticated account. App model switches after a Router restart can now reach the existing one-time migration summary instead of returning `history_observation_incomplete` locally.

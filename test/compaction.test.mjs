@@ -1053,8 +1053,9 @@ test("opaque official compaction creates one reusable native migration summary o
 
 test("migration summary budget excludes the history window already covered by compaction", async () => {
   const next = config();
-  next.targets.go.contextWindow = 10000;
+  next.targets.go.contextWindow = 20000;
   next.targets.go.outputReserveTokens = 1024;
+  next.targets.go.inputModalities = ["text", "image"];
   next.targets.go.compression.nativeMigrationSummary = true;
   const seen = [];
   const logs = [];
@@ -1068,9 +1069,19 @@ test("migration summary budget excludes the history window already covered by co
     },
   });
   const old = msg("user", `OLD_WINDOW_990 ${"padding ".repeat(5000)}`);
+  const screenshot = {
+    type: "message",
+    role: "user",
+    content: [
+      {
+        type: "input_image",
+        image_url: `data:image/png;base64,${"a".repeat(900_000)}`,
+      },
+    ],
+  };
   const latest = msg("user", "LATEST_TAIL_992");
   const ctx = identity("subscription", headers, {
-    input: [old, opaque, latest],
+    input: [old, opaque, screenshot, latest],
     client_metadata: metadata("tail-budget"),
   });
   saveCheckpoint(e.state, ctx, opaque, {
@@ -1083,7 +1094,7 @@ test("migration summary budget excludes the history window already covered by co
     virtual: false,
   });
 
-  await call(e, DS, "tail-budget", [old, opaque, latest]);
+  await call(e, DS, "tail-budget", [old, opaque, screenshot, latest]);
 
   assert.equal(seen.filter((body) => body.instructions).length, 1);
   assert.equal(logs.filter((event) => event.event === "native_migration_summary_completed").length, 1);
@@ -1092,6 +1103,11 @@ test("migration summary budget excludes the history window already covered by co
   assert.ok(budget.fixed_tokens < budget.input_budget);
   assert.ok(budget.input_budget < budget.projected_tokens);
   assert.match(JSON.stringify(seen.at(-1).input), /MIGRATED_WINDOW_991/);
+  assert.ok(
+    seen.at(-1).input.some((item) =>
+      item.content?.some((part) => part.type === "input_image"),
+    ),
+  );
   assert.match(JSON.stringify(seen.at(-1).input), /LATEST_TAIL_992/);
   assert.doesNotMatch(JSON.stringify(seen.at(-1).input), /OLD_WINDOW_990/);
   assert.doesNotMatch(JSON.stringify(seen.at(-1).input), /official-opaque-test-only/);

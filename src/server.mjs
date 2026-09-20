@@ -27,6 +27,13 @@ import {
 } from "./official-relay.mjs";
 import { OfficialWebSocketSession } from "./official-websocket.mjs";
 import { relayProviderSearchHttp } from "./provider-search-relay.mjs";
+
+const invalidOfficialPreviousResponse = (event) =>
+  event?.type === "error" &&
+  event.status === 400 &&
+  event.error?.type === "invalid_request_error" &&
+  event.error?.message === "Invalid `previous_response_id`.";
+
 export function createGateway(config, options = {}) {
   const log =
     options.log ??
@@ -547,14 +554,59 @@ export function createGateway(config, options = {}) {
                 request_setup_ms: Date.now() - startedAt,
                 route_policy_ms: Date.now() - routePolicyStartedAt,
               });
+              let replay, upstreamEvents = 0;
+              const observe = (request) => (event) =>
+                invalidOfficialPreviousResponse(event) && officialClassification.previous
+                  ? undefined
+                  : engine.queueOfficialObservation(
+                      officialClassification,
+                      () => engine.observeOfficialEvent(headers, request, event),
+                    );
               await officialSession.run(data, isBinary, {
                 signal: active.signal,
-                forward: sendRaw,
-                observe: (event) => engine.queueOfficialObservation(
-                  officialClassification,
-                  () => engine.observeOfficialEvent(headers, body, event),
-                ),
+                forward: async (chunk, binary) => {
+                  let event;
+                  try { if (!binary) event = parseJSON(chunk); } catch {}
+                  const first = upstreamEvents++ === 0;
+                  if (
+                    first &&
+                    officialClassification.previous &&
+                    invalidOfficialPreviousResponse(event)
+                  ) {
+                    try {
+                      const replayBody = engine.state.replay(
+                        officialClassification.ctx,
+                        body,
+                      ).body;
+                      const wire = Buffer.from(JSON.stringify({
+                        type: "response.create",
+                        ...replayBody,
+                      }));
+                      if (wire.byteLength <= (engine.config.maxBodyBytes ?? 20 * 1024 * 1024)) {
+                        replay = { body: replayBody, wire };
+                        return;
+                      }
+                    } catch {}
+                  }
+                  await sendRaw(chunk, binary);
+                },
+                observe: observe(body),
               });
+              if (replay) {
+                log({
+                  event: "official_previous_response_replayed",
+                  transport: "websocket",
+                  request_id: requestId,
+                  model: body.model,
+                  replay_bytes: replay.wire.byteLength,
+                  replay_items: replay.body.input.length,
+                });
+                await officialSession.run(replay.wire, false, {
+                  signal: active.signal,
+                  forward: sendRaw,
+                  observe: observe(replay.body),
+                });
+              }
               return;
             }
             delete body.generate;
