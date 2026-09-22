@@ -43,7 +43,7 @@ codex-local-router model edit --id vendor-sol --instructions-from none
 
 快照随不可变配置空间版本保存。catalog 更新只提示可同步；用户显式同步后才生成版本，正文相同时保持幂等。激活历史版本使用当时保存的快照。批量 target 全部解析成功后才提交一次。上游模型变化会使旧映射失效；不覆盖非受管自定义指令，正文与来源元数据不一致时校验失败。
 
-`model list/probe`、`status`、`doctor` 显示来源、交付模式、哈希、状态和更新提示，不打印指令正文；空间查看和 diff 只展示字段名、字节数和哈希。实际本地配置包含正文，仍需保持私密。Gateway／配置空间／integration Schema 保持 3／1／4。
+`model list/probe`、`status`、`doctor` 显示来源、交付模式、哈希、状态和更新提示，不打印指令正文；空间查看和 diff 只展示字段名、字节数和哈希。实际本地配置包含正文，仍需保持私密。Gateway／配置空间／integration Schema 为 4／1／4。
 
 开启 `gateway-lite` 时，如果当前受管 Codex 配置或选中 profile 可观察到 `model_instructions_file`，则拒绝启用。`AGENTS.md`、用户提示和附加 developer 指令不属于冲突。不会到达 Router 的临时命令行覆盖无法检测；此类场景应使用 `client` 交付。
 

@@ -8,6 +8,8 @@ If the fork arrives while the official compaction observer is still committing, 
 
 Official observation writes are committed in verified-account order because current Codex runtimes may change thread metadata between adjacent turns. This ordering applies only to the local sidecar archive; official responses remain transparent and are not delayed by archive I/O.
 
+HTTP SSE and WebSocket observation both rebuild the archive copy from completed `response.output_item.done` events when the terminal response omits `output`; a non-empty terminal `output` remains authoritative. If an HTTP response omits `Content-Type`, only a bounded observation-copy prefix may identify an unambiguous JSON object or SSE frame; an explicit unsupported media type or unknown body still fails closed. Unfinished or conflicting items, a missing terminal, cancellation, parse failure, or an incomplete response cannot install a successful compaction checkpoint. The relayed bytes and event order are never rewritten. A 409 asks the client to wait only while the same-account observation is actually still running; an observation failure or missing trusted checkpoint instead requires the explicit rollout recovery below (or continued use of the official model).
+
 Official WebSocket prewarm responses are observed as lineage state as well: current Codex clients can use a `generate: false` response as the next request's `previous_response_id`. The original prewarm request and response still pass through unchanged.
 
 Official response IDs are also resolved by exact ID within the same verified account when Codex changes or omits thread metadata between turns. The ID remains scoped to the account; Gateway-generated response IDs are not promoted to this official lineage.
@@ -40,6 +42,12 @@ Recovery stops without writes when an ancestor is missing (`rollout_history_base
 
 ## Controlled native migration summary
 
-`compression.nativeMigrationSummary` is off by default and is valid only with `compression.mode: "summary"`. Enable it explicitly for one target with `model edit --id TARGET --native-migration-summary`; use `--no-native-migration-summary` to disable it.
+`compression.nativeMigrationSummary` is off by default and is independent from same-target `compression.mode`. Enable it explicitly for a destination with `model edit --id TARGET --native-migration-summary`; use `--no-native-migration-summary` to disable it. It authorizes migration only, never a same-target fallback from `native` to Gateway `summary`.
 
 When a trusted official opaque window cannot be projected directly, the Router asks the original official model once, with tools disabled, to summarize that saved active window. The result is persisted by source-window hash and target, reused after reconnect or restart, and combined with the unsummarized latest user input and necessary tail. The opaque item and subscription credential never go to the third-party Provider. A missing lineage, source gap, uncertain result, or tail that already exceeds the target budget fails before destination generation; there is no automatic retry, fallback, recursive chunking, or claim of lossless recovery.
+
+Same-target native checkpoints and already completed, still-authorized migration views are recognized before any new migration-size estimate. Reusing a persisted migration view makes no summary call. If the destination then reports a real context overflow, the Router returns `context_after_summary_exceeded` and does not generate a second summary for the same checkpoint-to-target migration.
+
+Current Responses Lite tool declarations are request configuration, not history: they are excluded from migration summaries and covered-tail fingerprints. Incremental requests may inherit declarations from a trusted same-account, same-target prewarm response; explicit current declarations take precedence. Codex-initiated compaction retains current tools and its `compaction_trigger`.
+
+`native_migration_reuse_rejected` / `covered_history_mismatch` means the summary completed but the supplied history does not match the saved coverage fingerprint. Waiting or reopening the App does not repair it. Do not rewrite the fingerprint, clear protective state, or silently summarize again. A recovery option is to return to the checkpoint's native source model, let Codex successfully compact there, then verify the destination switch. This requires separate acceptance, not merely a successful configuration change.

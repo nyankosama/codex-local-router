@@ -1,6 +1,6 @@
 # 配置说明
 
-默认配置位于 `~/Library/Application Support/Codex Local Router/config.json`，也可用 `CODEX_LOCAL_ROUTER_CONFIG` 或 `--config` 指定。运行时 Schema 保持 3；空间存储为 Schema 1，集成状态升为 Schema 4。
+默认配置位于 `~/Library/Application Support/Codex Local Router/config.json`，也可用 `CODEX_LOCAL_ROUTER_CONFIG` 或 `--config` 指定。运行时配置为 Schema 4；空间存储为 Schema 1，集成状态为 Schema 4。
 
 字段所有权分为两层：`listen`、`access`、`history`、请求/连接/超时限制和官方 catalog 源路径属于机器全局；路由模式与 target 选择、`providers`、`targets`、`rules`、`pluginTools`、`webSearch`、`standaloneSearch`、订阅接入、可用模型及默认 Codex 模型属于配置空间。`config.json` 是全局字段权威加活动 Router 空间物化结果；手工改动空间字段会形成 drift，切换不会静默覆盖。
 
@@ -154,7 +154,7 @@ Provider 模式只接受显式声明：target 必须是 App-enabled Responses，
 
 `history.observationWaitMs` 可设置紧接着跨 Provider 切换时等待官方历史旁路提交的上限，默认 2,000 ms。普通官方响应不会等待观察解析或写盘完成才结束。
 
-`compression.nativeMigrationSummary` 是缺省关闭的 target 级开关，只能与 `compression.mode: "summary"` 同时使用。它允许对可信官方 opaque 压缩窗口生成一次受控、有损、关闭工具的原模型摘要；不放宽谱系、来源缺口、必要尾部或容量校验，也不产生自动重试和渠道回退。CLI 使用 `--native-migration-summary` / `--no-native-migration-summary`，详见 [Fork 与压缩历史恢复](compaction-recovery.zh-CN.md)。
+`compression.mode` 表示同 target 压缩归属：`native` 透传渠道 opaque checkpoint，默认只兼容同账户当前 target；`summary` 是用户显式授权的一次有损 Gateway 摘要；`unsupported` 明确报告不可用。原生失败不会自动回退到 `summary`。`compression.nativeMigrationSummary` 是独立、缺省关闭的跨 target 迁移授权，允许在精确历史无法适配目标时生成一次受控、关闭工具的原模型摘要；它不放宽谱系、来源缺口、必要尾部或容量校验，也不产生自动重试和渠道回退。CLI 使用 `--native-migration-summary` / `--no-native-migration-summary`，详见 [Fork 与压缩历史恢复](compaction-recovery.zh-CN.md)。
 
 `model list --json` 和非 live 的 `model probe --json` 会显示最终 Plugin/搜索策略、App 能力画像、选择原因、工具面、是否向 App 广告、Provider endpoint 和凭证就绪状态；`status` 与 `doctor` 也输出画像摘要。CLI 相关参数包括 `--model-family`、`--plugin-policy`、`--allowed-plugins`、`--app-profile`、`--search-source` 和兼容旧参数。
 

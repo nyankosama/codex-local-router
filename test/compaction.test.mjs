@@ -517,8 +517,9 @@ test("fork inheritance fails closed without a portable parent and keeps official
 });
 
 test("summary-mode compaction makes exactly one source-model call with tools disabled", async () => {
-  const seen = [];
+  const seen = [], logs = [];
   const e = new Engine(config(), {
+    log: (entry) => logs.push(entry),
     send: async (u, o) => {
       seen.push(o.body);
       return json(
@@ -547,6 +548,9 @@ test("summary-mode compaction makes exactly one source-model call with tools dis
   assert.equal(seen[0].model, DS);
   assert.deepEqual(seen[0].tools, []);
   assert.ok(!JSON.stringify(seen[0].input).includes("CURRENT_903"));
+  const completed = logs.find((entry) => entry.event === "compaction_completed");
+  assert.equal(completed.upstream_calls, 1);
+  assert.equal(completed.summary_calls, 1);
   await call(e, GPT, "one", c.output);
   assert.ok(JSON.stringify(seen.at(-1).input).includes("FACT_902"));
   assert.ok(JSON.stringify(seen.at(-1).input).includes("CURRENT_903"));
@@ -654,14 +658,16 @@ test("model-downshift compaction stores a lossless prepared checkpoint and does 
 });
 
 test("explicit target overflow triggers one persisted source summary; estimates and other errors do not", async () => {
+  const next = config();
+  next.targets.go.compression.nativeMigrationSummary = true;
   const seen = [];
-  let gptAttempts = 0;
-  const e = new Engine(config(), {
+  let targetAttempts = 0;
+  const e = new Engine(next, {
     send: async (_, options) => {
       seen.push(options.body);
-      if (options.body.model === DS && options.body.instructions)
+      if (options.body.model === GPT && options.body.instructions)
         return json(result([msg("assistant", "Keep OVERFLOW_314 and completed tools.")]));
-      if (options.body.model === GPT && ++gptAttempts === 1)
+      if (options.body.model === DS && ++targetAttempts === 1)
         return upstreamError(
           400,
           "context_length_exceeded",
@@ -670,17 +676,17 @@ test("explicit target overflow triggers one persisted source summary; estimates 
       return json(result([msg("assistant", "done") ]));
     },
   });
-  await call(e, DS, "source", [msg("user", "OVERFLOW_314")]);
-  await call(e, GPT, "target", [
+  await call(e, GPT, "source", [msg("user", "OVERFLOW_314")]);
+  await call(e, DS, "target", [
     msg("user", "OVERFLOW_314"),
     msg("user", "continue"),
   ]);
   const summaries = seen.filter(
-    (body) => body.model === DS && body.instructions?.startsWith("Create one factual"),
+    (body) => body.model === GPT && body.instructions?.startsWith("Create one factual"),
   );
   assert.equal(summaries.length, 1);
   assert.deepEqual(summaries[0].tools, []);
-  assert.equal(gptAttempts, 2);
+  assert.equal(targetAttempts, 2);
   assert.match(JSON.stringify(seen.at(-1).input), /Keep OVERFLOW_314/);
 
   let calls = 0;
@@ -692,10 +698,36 @@ test("explicit target overflow triggers one persisted source summary; estimates 
   });
   await assert.rejects(call(other, GPT, "auth", [msg("user", "x")]), /provider_error/);
   assert.equal(calls, 1);
+
+  const blockedSeen = [];
+  const blocked = new Engine(config(), {
+    send: async (_, options) => {
+      blockedSeen.push(options.body);
+      if (options.body.model === DS)
+        return upstreamError(
+          400,
+          "context_length_exceeded",
+          "maximum context length exceeded",
+        );
+      return json(result([msg("assistant", "source") ]));
+    },
+  });
+  await call(blocked, GPT, "blocked-source", [msg("user", "NO_SUMMARY_315")]);
+  await assert.rejects(
+    call(blocked, DS, "blocked-target", [msg("user", "continue")]),
+    (error) => error.type === "context_length_exceeded",
+  );
+  assert.equal(
+    blockedSeen.filter((body) =>
+      body.instructions?.startsWith("Create one factual"),
+    ).length,
+    0,
+  );
 });
 
 test("obvious local overflow summarizes before send and rejects an unsummarizable tail without network", async () => {
   const c = config();
+  c.targets.go.compression.nativeMigrationSummary = true;
   c.targets.go.contextWindow = 10000;
   c.targets.go.effectiveContextWindowPercent = 95;
   c.targets.go.outputReserveTokens = 1000;
@@ -776,7 +808,9 @@ test("obvious local overflow summarizes before send and rejects an unsummarizabl
     seen.filter((body) => body.instructions?.startsWith("Create one factual")).length,
     0,
   );
-  assert.ok(logs.some((entry) => entry.event === "context_budget_preflight_blocked"));
+  assert.ok(logs.some((entry) =>
+    entry.event === "native_migration_summary_budget" &&
+    entry.decision === "summary_required"));
 
   let blockedCalls = 0;
   const blocked = new Engine(c, {
@@ -817,14 +851,16 @@ test("official access_programs denial is classified separately from history fail
 });
 
 test("a migration summary is generated once and a second explicit overflow fails without recursive compression", async () => {
+  const next = config();
+  next.targets.go.compression.nativeMigrationSummary = true;
   let summaries = 0;
-  const e = new Engine(config(), {
+  const e = new Engine(next, {
     send: async (_, options) => {
-      if (options.body.model === DS && options.body.instructions) {
+      if (options.body.model === GPT && options.body.instructions) {
         summaries++;
         return json(result([msg("assistant", "single summary") ]));
       }
-      if (options.body.model === GPT)
+      if (options.body.model === DS)
         return upstreamError(
           400,
           "context_length_exceeded",
@@ -833,12 +869,56 @@ test("a migration summary is generated once and a second explicit overflow fails
       return json(result([msg("assistant", "source") ]));
     },
   });
-  await call(e, DS, "source", [msg("user", "too large")]);
+  await call(e, GPT, "source", [msg("user", "too large")]);
   await assert.rejects(
-    call(e, GPT, "target", [msg("user", "too large"), msg("user", "go")]),
+    call(e, DS, "target", [msg("user", "too large"), msg("user", "go")]),
     /one persisted migration summary/,
   );
   assert.equal(summaries, 1);
+});
+
+test("legacy virtual checkpoints use their trusted active view on a native target", () => {
+  const next = config();
+  next.targets.go.compression = { mode: "native" };
+  const e = new Engine(next);
+  const ctx = identity("subscription", headers, {
+    client_metadata: metadata("legacy-native"),
+  });
+  const item = {
+    type: "compaction",
+    encrypted_content: "gateway-checkpoint-v1:legacy-native",
+  };
+  saveCheckpoint(e.state, ctx, item, {
+    provider: "go",
+    model: DS,
+    targetId: "go",
+    virtual: true,
+    original: [msg("user", "FULL_OLD_HISTORY")],
+    view: [msg("assistant", "TRUSTED_ACTIVE_VIEW")],
+    completeness: "complete_original",
+  });
+  const diagnostics = [];
+  const active = expandCheckpoints(
+    e.state,
+    ctx,
+    [item, msg("user", "NEW_TAIL")],
+    next.targets.go,
+    { diagnostics: (entry) => diagnostics.push(entry) },
+  );
+  assert.match(JSON.stringify(active.input), /TRUSTED_ACTIVE_VIEW/);
+  assert.match(JSON.stringify(active.input), /NEW_TAIL/);
+  assert.doesNotMatch(JSON.stringify(active.input), /FULL_OLD_HISTORY/);
+  assert.deepEqual(diagnostics, [{ event: "legacy_checkpoint_view_restored" }]);
+  assert.match(
+    JSON.stringify(expandCheckpoints(
+      e.state,
+      ctx,
+      [item],
+      next.targets.go,
+      { portable: true },
+    ).input),
+    /FULL_OLD_HISTORY/,
+  );
 });
 
 test("a failed migration summary can be retried but an uncertain result stays blocked", async () => {
@@ -899,6 +979,39 @@ test("a failed migration summary can be retried but an uncertain result stays bl
     (error) => error.type === "compaction_result_uncertain",
   );
   assert.equal(uncertainAttempts, 1);
+});
+
+test("an orphaned running summary is retried after restart", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-summary-restart-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const archive = new Archive(join(dir, "history.sqlite"), Buffer.alloc(32, 4));
+  t.after(() => archive.close());
+  const first = new Engine(config(), { archive });
+  const source = first.officialTarget(GPT);
+  const input = [msg("user", "SUMMARY_RESTART_883")];
+  const ctx = identity("subscription", headers, {
+    input: [],
+    client_metadata: metadata("summary-restart"),
+  });
+  const key = first.summaryKey(ctx, input, "restartable");
+  first.state.set(key, { status: "running", started: Date.now() }, ctx);
+
+  const logs = [];
+  const restarted = new Engine(config(), {
+    archive,
+    log: (entry) => logs.push(entry),
+  });
+  const view = await restarted.singleSummary(
+    config(), source, input, ctx, new AbortController().signal, {},
+    "restartable", 1000,
+    async () => ({
+      type: "response.completed",
+      response: result([msg("assistant", "SUMMARY_RESTART_OK")]),
+    }),
+  );
+
+  assert.match(JSON.stringify(view), /SUMMARY_RESTART_OK/);
+  assert.equal(logs.filter((entry) => entry.event === "orphaned_summary_retried").length, 1);
 });
 
 test("official summary terminal logs only safe structured diagnostics", async () => {
@@ -983,6 +1096,11 @@ test("opaque official compaction creates one reusable native migration summary o
     name: "shell",
     input: "POST_COMPACTION_CALL_770",
   };
+  const originalContext = {
+    instructions: "ORIGINAL_CODEX_INSTRUCTIONS_769",
+    tools: [{ type: "function", name: "shell", parameters: {} }],
+    reasoning: { effort: "high", summary: "detailed" },
+  };
   await e.commitOfficialObservation(
     headers,
     { model: GPT, input: [] },
@@ -997,36 +1115,34 @@ test("opaque official compaction creates one reusable native migration summary o
     client_metadata: metadata("migration-summary"),
   });
 
-  await call(
-    e,
-    DS,
-    "migration-summary",
-    [opaque, msg("user", "LATEST_772")],
-    "turn",
-    headers,
-    undefined,
-    undefined,
-    { officialSummary },
-  );
+  const migrate = async (engine) => {
+    const events = [];
+    for await (const event of engine.generate(
+      "subscription",
+      headers,
+      {
+        model: DS,
+        input: [opaque, msg("user", "LATEST_772")],
+        client_metadata: metadata("migration-summary"),
+        ...originalContext,
+      },
+      new AbortController().signal,
+      { officialSummary },
+    )) events.push(event);
+    return events.at(-1).response;
+  };
+  await migrate(e);
   const restarted = new Engine(structuredClone(next), options);
-  await call(
-    restarted,
-    DS,
-    "migration-summary",
-    [opaque, msg("user", "LATEST_772")],
-    "turn",
-    headers,
-    undefined,
-    undefined,
-    { officialSummary },
-  );
+  await migrate(restarted);
 
   assert.equal(summaries.length, 1);
   assert.equal(summaries[0].model, GPT);
   assert.equal(summaries[0].previous_response_id, undefined);
-  assert.deepEqual(summaries[0].tools, []);
+  assert.deepEqual(summaries[0].reasoning, originalContext.reasoning);
+  assert.deepEqual(summaries[0].tools, originalContext.tools);
+  assert.equal(summaries[0].instructions, originalContext.instructions);
   assert.match(JSON.stringify(summaries[0].input), /official-opaque-test-only/);
-  assert.match(JSON.stringify(summaries[0].input), /Produce the factual continuation summary/);
+  assert.match(JSON.stringify(summaries[0].input), /Create one factual continuation summary/);
   assert.doesNotMatch(JSON.stringify(summaries[0].input), /POST_COMPACTION_CALL_770/);
   const generations = seen.filter((body) => body.model === DS);
   assert.equal(generations.length, 2);
@@ -1049,6 +1165,217 @@ test("opaque official compaction creates one reusable native migration summary o
     call(blocked, DS, "migration-summary", [opaque]),
     (error) => error.type === "compaction_history_unavailable",
   );
+});
+
+test("cross-provider pre-turn compaction migrates before target-native compaction", async () => {
+  const next = config();
+  next.targets.go.contextWindow = 4000;
+  next.targets.go.maxContextWindow = 4000;
+  next.targets.go.outputReserveTokens = 100;
+  next.targets.go.compression = {
+    mode: "native",
+    nativeMigrationSummary: true,
+  };
+  const seen = [], logs = [];
+  const engine = new Engine(next, {
+    log: (event) => logs.push(event),
+    send: async (_, request) => {
+      seen.push(request.body);
+      return json(result([{ type: "compaction", encrypted_content: "target-native" }]));
+    },
+  });
+  await engine.commitOfficialObservation(
+    headers,
+    {
+      model: GPT,
+      input: [msg("user", "SOURCE_ONLY_413 " + "x".repeat(20_000))],
+      client_metadata: metadata("source"),
+    },
+    { id: "resp_pre_turn_migration", status: "completed", output: [opaque] },
+  );
+  const summaries = [];
+  const compacted = await call(
+    engine,
+    DS,
+    "target",
+    [
+      opaque,
+      msg("user", "LATEST_TAIL " + "y".repeat(20_000)),
+      { type: "compaction_trigger" },
+    ],
+    "compaction",
+    headers,
+    undefined,
+    undefined,
+    {
+      officialSummary: async (body) => {
+        summaries.push(body);
+        return {
+          type: "response.completed",
+          response: result([msg("assistant", "MIGRATED_BEFORE_COMPACT")]),
+        };
+      },
+    },
+  );
+
+  assert.equal(summaries.length, 1);
+  assert.equal(seen.length, 1);
+  assert.match(JSON.stringify(summaries[0].input), /LATEST_TAIL/);
+  const requestedSummaryTokens = Number(
+    summaries[0].input.at(-1).content.match(/within (\d+) tokens/)[1],
+  );
+  assert.ok(requestedSummaryTokens > 256);
+  assert.match(JSON.stringify(seen[0].input), /MIGRATED_BEFORE_COMPACT/);
+  assert.doesNotMatch(JSON.stringify(seen[0].input), /LATEST_TAIL/);
+  assert.ok(seen[0].input.some((item) => item.type === "compaction_trigger"));
+  assert.doesNotMatch(JSON.stringify(seen[0].input), /SOURCE_ONLY_413/);
+  assert.doesNotMatch(JSON.stringify(seen[0].input), /official-opaque-test-only/);
+  assert.equal(compacted.output[0].encrypted_content, "target-native");
+  assert.ok(logs.some((event) =>
+    event.event === "native_migration_summary_budget" &&
+    event.decision === "upstream_owned_native" &&
+    event.fixed_tokens >= event.input_budget));
+});
+
+test("cross-provider turn summarizes completed tail but preserves the current user request", async () => {
+  const next = config();
+  next.targets.go.contextWindow = 4000;
+  next.targets.go.maxContextWindow = 4000;
+  next.targets.go.outputReserveTokens = 100;
+  next.targets.go.compression.nativeMigrationSummary = true;
+  const seen = [], summaries = [];
+  const engine = new Engine(next, {
+    send: async (_, request) => {
+      seen.push(request.body);
+      return json(result([msg("assistant", "continued") ]));
+    },
+  });
+  await engine.commitOfficialObservation(
+    headers,
+    { model: GPT, input: [] },
+    { id: "resp_turn_tail", status: "completed", output: [opaque] },
+  );
+
+  await call(
+    engine,
+    DS,
+    "turn-tail",
+    [
+      opaque,
+      msg("user", "COMPLETED_TAIL " + "x".repeat(20_000)),
+      msg("assistant", "COMPLETED_TAIL_RESULT"),
+      msg("user", "CURRENT_REQUEST_VERBATIM"),
+    ],
+    "turn",
+    headers,
+    undefined,
+    undefined,
+    {
+      officialSummary: async (body) => {
+        summaries.push(body);
+        return {
+          type: "response.completed",
+          response: result([msg("assistant", "MIGRATED_TAIL_SUMMARY")]),
+        };
+      },
+    },
+  );
+
+  assert.equal(summaries.length, 1);
+  assert.match(JSON.stringify(summaries[0].input), /COMPLETED_TAIL_RESULT/);
+  assert.doesNotMatch(JSON.stringify(summaries[0].input), /CURRENT_REQUEST_VERBATIM/);
+  assert.equal(seen.length, 1);
+  assert.match(JSON.stringify(seen[0].input), /MIGRATED_TAIL_SUMMARY/);
+  assert.match(JSON.stringify(seen[0].input), /CURRENT_REQUEST_VERBATIM/);
+  assert.doesNotMatch(JSON.stringify(seen[0].input), /COMPLETED_TAIL_RESULT/);
+
+  await call(
+    engine,
+    DS,
+    "turn-tail-next",
+    [
+      opaque,
+      msg("user", "COMPLETED_TAIL " + "x".repeat(20_000)),
+      msg("assistant", "COMPLETED_TAIL_RESULT"),
+      msg("user", "CURRENT_REQUEST_VERBATIM"),
+      msg("assistant", "continued"),
+      msg("user", "NEXT_REQUEST_VERBATIM"),
+    ],
+    "turn",
+    headers,
+    undefined,
+    undefined,
+    {
+      officialSummary: async (body) => {
+        summaries.push(body);
+        return {
+          type: "response.completed",
+          response: result([msg("assistant", "MUST_NOT_RUN")]),
+        };
+      },
+    },
+  );
+  assert.equal(summaries.length, 1);
+  assert.equal(seen.length, 2);
+  assert.match(JSON.stringify(seen[1].input), /MIGRATED_TAIL_SUMMARY/);
+  assert.match(JSON.stringify(seen[1].input), /CURRENT_REQUEST_VERBATIM/);
+  assert.match(JSON.stringify(seen[1].input), /NEXT_REQUEST_VERBATIM/);
+  assert.doesNotMatch(JSON.stringify(seen[1].input), /COMPLETED_TAIL_RESULT/);
+});
+
+test("Lite migration reuse keeps current tool declarations outside the covered history", async () => {
+  const next = config();
+  Object.assign(next.targets.go, {
+    contextWindow: 4000,
+    maxContextWindow: 4000,
+    outputReserveTokens: 100,
+    app: { useResponsesLite: true },
+    compression: { mode: "native", nativeMigrationSummary: true },
+  });
+  const sent = [];
+  const engine = new Engine(next, { send: async (_, request) => {
+    sent.push(request.body);
+    return json(result([msg("assistant", "continued")]));
+  } });
+  const ctx = identity("subscription", headers, {
+    client_metadata: metadata("tools-tail"),
+  });
+  saveCheckpoint(engine.state, ctx, opaque, {
+    provider: "chatgpt-subscription", model: GPT, targetId: `official:${GPT}`,
+    original: [], view: [opaque], completeness: "complete_original",
+  });
+  const oldTail = [msg("user", "x".repeat(20000)), msg("assistant", "done")];
+  const tools = (name) => ({ type: "additional_tools", tools: [
+    { type: "function", name, parameters: { type: "object", properties: {} } },
+  ] });
+  let calls = 0;
+  const prepare = (body, context = ctx) => engine.prepareNativeMigrationSummaries(
+    next, next.targets.go, body, context, new AbortController().signal, {},
+    async (summaryBody) => {
+      calls++;
+      assert.ok(!summaryBody.input.some(x => x.type === "additional_tools"));
+      return { type: "response.completed", response: result([msg("assistant", "SUMMARY")]) };
+    }, body.input.filter(x => x.type === "additional_tools"),
+  );
+  await prepare({ input: [tools("old_tool"), opaque, ...oldTail, msg("user", "request") ] });
+  const summary = checkpointFor(engine.state, ctx, opaque).checkpoint.migration.view;
+  for (const name of ["get_goal", "exec_command"]) {
+    const declaration = tools(name);
+    const body = { input: [declaration, opaque, ...oldTail, msg("user", "request"), msg("user", "next")] };
+    assert.deepEqual(await prepare(body), { generated: 0, reused: 1 });
+    assert.deepEqual(body.input, [declaration, ...summary, msg("user", "request"), msg("user", "next")]);
+  }
+  const trigger = { type: "compaction_trigger" };
+  const body = { input: [tools("get_goal"), opaque, ...oldTail, msg("user", "request"), trigger] };
+  await prepare(body, { ...ctx, requestKind: "compaction" });
+  assert.deepEqual(body.input, [tools("get_goal"), trigger, ...summary, msg("user", "request")]);
+  await assert.rejects(prepare({ input: [opaque, msg("user", "CHANGED"), oldTail[1], msg("user", "request")] }),
+    error => error.type === "compaction_result_uncertain");
+  assert.equal(calls, 1);
+  engine.state.save(ctx, { id: "prewarm-tools", output: [] }, [tools("get_goal")], next.targets.go);
+  await call(engine, DS, "prewarm-migration", [opaque, ...oldTail, msg("user", "request")],
+    "turn", headers, "prewarm-tools");
+  assert.deepEqual(sent[0].input.filter(x => x.type === "additional_tools"), [tools("get_goal")]);
 });
 
 test("migration summary budget excludes the history window already covered by compaction", async () => {
@@ -1079,9 +1406,14 @@ test("migration summary budget excludes the history window already covered by co
       },
     ],
   };
+  const privateReasoning = {
+    type: "reasoning",
+    summary: [],
+    encrypted_content: "r".repeat(50_000),
+  };
   const latest = msg("user", "LATEST_TAIL_992");
   const ctx = identity("subscription", headers, {
-    input: [old, opaque, screenshot, latest],
+    input: [old, opaque, privateReasoning, screenshot, latest],
     client_metadata: metadata("tail-budget"),
   });
   saveCheckpoint(e.state, ctx, opaque, {
@@ -1094,7 +1426,13 @@ test("migration summary budget excludes the history window already covered by co
     virtual: false,
   });
 
-  await call(e, DS, "tail-budget", [old, opaque, screenshot, latest]);
+  await call(e, DS, "tail-budget", [
+    old,
+    opaque,
+    privateReasoning,
+    screenshot,
+    latest,
+  ]);
 
   assert.equal(seen.filter((body) => body.instructions).length, 1);
   assert.equal(logs.filter((event) => event.event === "native_migration_summary_completed").length, 1);
@@ -1109,6 +1447,7 @@ test("migration summary budget excludes the history window already covered by co
     ),
   );
   assert.match(JSON.stringify(seen.at(-1).input), /LATEST_TAIL_992/);
+  assert.doesNotMatch(JSON.stringify(seen.at(-1).input), /"encrypted_content"/);
   assert.doesNotMatch(JSON.stringify(seen.at(-1).input), /OLD_WINDOW_990/);
   assert.doesNotMatch(JSON.stringify(seen.at(-1).input), /official-opaque-test-only/);
 });
@@ -1741,6 +2080,7 @@ test("cross-provider Responses Lite keeps only current tools and closes a core t
 
 test("migration summary restores the current Responses Lite tool carrier", async () => {
   const c = config();
+  c.targets.go.compression.nativeMigrationSummary = true;
   c.targets.go.modelFamily = "openai-gpt";
   c.targets.go.app = { enabled: true, useResponsesLite: true };
   const seen = [];
@@ -1786,7 +2126,10 @@ test("migration summary restores the current Responses Lite tool carrier", async
 
 test("custom prewarm retains Lite tool definitions for incremental first inference without calling upstream", async (t) => {
   const seen = [];
-  const gw = createGateway(config(), {
+  const c = config();
+  c.targets.go.compression.nativeMigrationSummary = true;
+  c.targets.go.app = { enabled: true, useResponsesLite: true };
+  const gw = createGateway(c, {
     log: () => {},
     send: async (u, o) => {
       seen.push(o.body);
@@ -1834,6 +2177,27 @@ test("custom prewarm retains Lite tool definitions for incremental first inferen
     msg("system", "PREFIX"),
     msg("user", "read"),
   ]);
+  // Exercise the actual prewarm entrypoint before checkpoint migration, not a
+  // synthetic state.save that already supplies the missing target identity.
+  const ctx = await gw.engine.identify("subscription", headers, {
+    client_metadata: metadata("migrated"),
+  });
+  saveCheckpoint(gw.engine.state, ctx, opaque, {
+    provider: "chatgpt-subscription", model: GPT, targetId: `official:${GPT}`,
+    completeness: "complete_original", original: [msg("user", "source")],
+    view: [opaque],
+    migration: { targetId: "go", status: "completed", view: [msg("assistant", "summary")] },
+  });
+  const warmMigration = await request({ generate: false, input: [prefix] });
+  assert.equal(seen.length, 1);
+  assert.equal(gw.engine.state.response(ctx, warmMigration.id).target?.id, "go");
+  await request({
+    previous_response_id: warmMigration.id,
+    input: [opaque, msg("user", "read after migration")],
+    client_metadata: metadata("migrated"),
+  });
+  assert.deepEqual(seen[1].input.filter(item => item.type === "additional_tools"), [prefix]);
+  assert.equal(seen.length, 2);
   ws.close();
 });
 
@@ -1962,6 +2326,176 @@ test("large native compaction calls the official backend once, resumes after res
   assert.equal(seen.length, 4);
   await assert.rejects(call(restarted, DS, "switch", again.output), /no portable source/);
   await assert.rejects(call(restarted, GPT, "virtual", [{type: "compaction", encrypted_content: "gateway-checkpoint-v1:missing"}]), /Compacted history/);
+});
+
+test("custom native compaction owns oversized context and metadata-only continuation", async () => {
+  const next = config();
+  next.targets.go.contextWindow = 100;
+  next.targets.go.maxContextWindow = 100;
+  next.targets.go.outputReserveTokens = 10;
+  next.targets.go.compression = { mode: "native" };
+  const seen = [], logs = [];
+  const send = async (_, options) => {
+    seen.push(options.body);
+    return json(result(
+      options.body.input.some((item) => item.type === "compaction_trigger")
+        ? [{ type: "compaction", encrypted_content: "custom-native-opaque" }]
+        : [msg("assistant", "continued")],
+    ));
+  };
+  const engine = new Engine(next, { send, log: (entry) => logs.push(entry) });
+  const compacted = await call(
+    engine,
+    DS,
+    "custom-native-compact",
+    [msg("user", "NATIVE_CONTEXT_" + "x".repeat(20000)), { type: "compaction_trigger" }],
+    "compaction",
+  );
+  assert.equal(seen.length, 1);
+  assert.ok(logs.some((entry) =>
+    entry.event === "context_budget_preflight_observed" &&
+    entry.decision === "upstream_owned_native"));
+  assert.equal(
+    logs.find((entry) => entry.event === "compaction_completed")?.summary_calls,
+    0,
+  );
+
+  const restarted = new Engine(structuredClone(next), { send });
+  const request = {
+    model: DS,
+    input: [...compacted.output, msg("user", "continue")],
+    client_metadata: metadata("custom-native-resume"),
+  };
+  const ctx = identity("subscription", headers, request);
+  saveCheckpoint(restarted.state, ctx, compacted.output[0], {
+    provider: "go",
+    model: DS,
+    targetId: "go",
+    virtual: false,
+    completeness: "metadata_only",
+  });
+  await restarted.requireObservedHistory(headers, request, "go");
+  await call(restarted, DS, "custom-native-resume", request.input);
+  assert.deepEqual(seen.at(-1).input[0], compacted.output[0]);
+
+  await assert.rejects(
+    restarted.requireObservedHistory(headers, {
+      ...request,
+      input: [{ type: "compaction", encrypted_content: "unknown-native" }],
+    }, "go"),
+    (error) => error.type === "history_observation_incomplete",
+  );
+});
+
+test("native-compatible and completed migration checkpoints bypass migration tail estimates", async () => {
+  const next = config();
+  next.targets.go.contextWindow = 4000;
+  next.targets.go.maxContextWindow = 4000;
+  next.targets.go.outputReserveTokens = 100;
+  next.targets.go.compression = {
+    mode: "native",
+    nativeMigrationSummary: true,
+  };
+  const seen = [], logs = [];
+  const engine = new Engine(next, {
+    log: (event) => logs.push(event),
+    send: async (_, request) => {
+      seen.push(request.body);
+      return json(result([msg("assistant", "continued")]));
+    },
+  });
+  const native = { type: "compaction", encrypted_content: "native-large-tail" };
+  const nativeCtx = identity("subscription", headers, {
+    input: [native], client_metadata: metadata("native-large-tail"),
+  });
+  saveCheckpoint(engine.state, nativeCtx, native, {
+    provider: "go",
+    model: DS,
+    targetId: "go",
+    virtual: false,
+    completeness: "metadata_only",
+  });
+  const tail = msg("user", "x".repeat(6000));
+  await call(engine, DS, "native-large-tail", [native, tail]);
+  assert.deepEqual(seen.at(-1).input[0], native);
+
+  const migrated = { type: "compaction", encrypted_content: "migrated-large-tail" };
+  const migratedCtx = identity("subscription", headers, {
+    input: [migrated], client_metadata: metadata("migrated-large-tail"),
+  });
+  saveCheckpoint(engine.state, migratedCtx, migrated, {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    view: [migrated],
+    completeness: "opaque_source_only",
+    virtual: false,
+    migration: {
+      targetId: "go",
+      provider: "go",
+      model: DS,
+      status: "completed",
+      sourceHash: "fixture",
+      view: [msg("assistant", "MIGRATED_FACT")],
+    },
+  });
+  await call(engine, DS, "migrated-large-tail", [migrated, tail]);
+  assert.match(JSON.stringify(seen.at(-1).input), /MIGRATED_FACT/);
+  assert.equal(logs.filter((event) => event.event === "native_migration_summary_completed").length, 0);
+  assert.equal(logs.filter((event) => event.event === "native_migration_summary_reused").length, 1);
+});
+
+test("a reused migration summary is not regenerated after upstream context rejection", async () => {
+  const next = config();
+  next.targets.go.compression.nativeMigrationSummary = true;
+  let targetCalls = 0, officialSummaries = 0;
+  const engine = new Engine(next, {
+    send: async () => {
+      targetCalls++;
+      return upstreamError(413, "context_length_exceeded", "maximum context length exceeded");
+    },
+  });
+  const migrated = { type: "compaction", encrypted_content: "migrated-upstream-limit" };
+  const ctx = identity("subscription", headers, {
+    input: [migrated], client_metadata: metadata("migrated-upstream-limit"),
+  });
+  saveCheckpoint(engine.state, ctx, migrated, {
+    provider: "chatgpt-subscription",
+    model: GPT,
+    targetId: `official:${GPT}`,
+    view: [migrated],
+    completeness: "opaque_source_only",
+    virtual: false,
+    migration: {
+      targetId: "go",
+      provider: "go",
+      model: DS,
+      status: "completed",
+      sourceHash: "fixture",
+      view: [msg("assistant", "MIGRATED_FACT")],
+    },
+  });
+  await assert.rejects(
+    call(
+      engine,
+      DS,
+      "migrated-upstream-limit",
+      [migrated, msg("user", "continue")],
+      "turn",
+      headers,
+      undefined,
+      undefined,
+      {
+        officialSummary: async () => {
+          officialSummaries++;
+          return { type: "response.completed", response: result([]) };
+        },
+      },
+    ),
+    (error) => error.type === "context_after_summary_exceeded",
+  );
+  assert.equal(targetCalls, 1);
+  assert.equal(officialSummaries, 0);
 });
 
 test("native compaction does not fail when portable cache is too small", async () => {

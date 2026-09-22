@@ -4,7 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.mjs";
 import { buildModelCatalog } from "./model-catalog.mjs";
-import { rawConfig, writeConfigTransaction } from "./config-store.mjs";
+import { configDiff, rawConfig, writeConfigTransaction } from "./config-store.mjs";
 import {
   OFFICIAL_SPACE,
   captureOfficialSpace,
@@ -48,6 +48,12 @@ import {
 
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const ref = (value) => `${value.space}@${value.revision}`;
+
+function isCatalogToolModeOnlyChange(before, after) {
+  const diff = configDiff(before, after);
+  return diff.length > 0 && diff.every(({ path }) =>
+    /^targets\.[^.]+\.app\.toolMode$/.test(path));
+}
 
 async function fileHash(path) {
   try {
@@ -394,6 +400,9 @@ export async function beginSpaceSwitch(targetInput, options = {}) {
       sourceRevisionHash: sourceRevision.contentHash,
       targetRevisionHash: target.contentHash,
       targetRuntimeHash: candidate.hash,
+      catalogToolModeOnly:
+        sourceRevision.kind === "router" && target.kind === "router" &&
+        isCatalogToolModeOnlyChange(sourceConfig, candidate.config),
       ...(preservedCodexModel ? { preservedCodexModel } : {}),
       sourceFiles: {
         gatewayConfigPath: configPath,
@@ -484,7 +493,10 @@ async function rollback(transaction, options, operations, paths, error) {
       await fileHash(codexPath) === transaction.sourceFiles.codexConfigHash &&
       await fileHash(catalogPath) === transaction.sourceFiles.catalogHash;
     if (!transaction.appliedFiles && sourceFilesUnchanged) {
-      if (transaction.sourceDrainCompleted && transaction.sourceServiceWasRunning)
+      if (
+        !transaction.serviceRestartSkipped &&
+        transaction.sourceDrainCompleted && transaction.sourceServiceWasRunning
+      )
         await operations.resumeService(transaction.sourceServicePid);
       transaction.stage = "failed";
       transaction.recovered = true;
@@ -579,7 +591,10 @@ async function rollback(transaction, options, operations, paths, error) {
     );
     if (source.kind === "official" || transaction.sourceServiceWasRunning === false)
       await operations.stopService();
-    else await operations.installService();
+    else if (
+      !transaction.serviceRestartSkipped ||
+      !(await operations.serviceStatus()).running
+    ) await operations.installService();
     transaction.sourceFiles.gatewayConfigHash = await fileHash(configPath);
     transaction.sourceFiles.codexConfigHash = await fileHash(codexPath);
     transaction.sourceFiles.catalogHash = await fileHash(catalogPath);
@@ -675,7 +690,12 @@ export async function resumeSpaceSwitch(options = {}) {
       throw Object.assign(Error("the previous switch could not be recovered safely"), {
         code: "space_switch_recovery_required",
       });
-    if (await checkedAppState(operations.appRunning))
+    const appState = await operations.appRunning();
+    if (appState == null && options.coordinator !== true)
+      throw Object.assign(Error("Codex App state could not be determined"), {
+        code: "app_state_unknown",
+      });
+    if (appState !== false)
       return {
         changed: false,
         pending: true,
@@ -684,9 +704,9 @@ export async function resumeSpaceSwitch(options = {}) {
       };
     if (transaction.stage === "applying") {
       const recoverySource = await resolveSpace(ref(transaction.source), env);
-      const drained = recoverySource.kind === "router"
+      const drained = recoverySource.kind === "router" && !transaction.serviceRestartSkipped
         ? await operations.drain()
-        : { drained: true, wasRunning: false };
+        : { drained: true, wasRunning: transaction.serviceRestartSkipped === true };
       transaction.sourceServiceWasRunning ??= drained.wasRunning;
       transaction.sourceServicePid ??= drained.before?.health?.pid;
       transaction.sourceDrainCompleted = drained.drained;
@@ -738,9 +758,22 @@ export async function resumeSpaceSwitch(options = {}) {
       const targetConfig = await candidateConfigFor(target, currentConfig);
       if (digestJSON(targetConfig) !== transaction.targetRuntimeHash)
         throw Object.assign(Error("target runtime config changed"), { code: "space_target_changed" });
-      const drained = source.kind === "router"
+      transaction.catalogToolModeOnly ??=
+        source.kind === "router" && target.kind === "router" &&
+        isCatalogToolModeOnlyChange(currentConfig, targetConfig);
+      const service = transaction.catalogToolModeOnly
+        ? await operations.serviceStatus()
+        : null;
+      transaction.serviceRestartSkipped = Boolean(
+        transaction.catalogToolModeOnly && service?.running,
+      );
+      const drained = source.kind === "router" && !transaction.serviceRestartSkipped
         ? await operations.drain()
-        : { drained: true, wasRunning: false };
+        : {
+            drained: true,
+            wasRunning: transaction.serviceRestartSkipped === true,
+            ...(service ? { before: service } : {}),
+          };
       transaction.sourceServiceWasRunning = drained.wasRunning;
       transaction.sourceServicePid = drained.before?.health?.pid;
       transaction.sourceDrainCompleted = drained.drained;
@@ -812,7 +845,7 @@ export async function resumeSpaceSwitch(options = {}) {
       transaction.appliedFiles.catalogHash = transaction.expectedFiles.catalogHash;
       await writeTransaction(paths, transaction);
       if (target.kind === "official") await operations.stopService();
-      else await operations.installService();
+      else if (!transaction.serviceRestartSkipped) await operations.installService();
       const verification = await verifyApplied(target, integrationConfig, operations, env);
       await assertAppliedFiles(transaction);
       transaction.stage = "verified";
@@ -848,7 +881,7 @@ export async function resumeSpaceSwitch(options = {}) {
   }
   const appRunning = options.appRunning ?? (() => appIsRunning(env));
   const deadline = Date.now() + (options.coordinatorWaitMs ?? 24 * 60 * 60 * 1000);
-  while (await checkedAppState(appRunning)) {
+  while (await appRunning() !== false) {
     if (Date.now() >= deadline) {
       const { waitForApp, ...pending } = outcome;
       return pending;

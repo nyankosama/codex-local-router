@@ -38,7 +38,7 @@ codex-local-router provider add --space work --id my-provider \
 codex-local-router model add --space work --id my-model \
   --provider my-provider --upstream-model upstream-model \
   --protocol responses --context-window 200000 \
-  --input-modalities text --compression summary --yes
+  --input-modalities text --compression unsupported --yes
 codex-local-router space set-default-model my-model --space work --yes
 codex-local-router space diff default work
 ```

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "listen": { "host": "127.0.0.1", "port": 8788 },
   "access": { "required": true, "tokenEnv": "CODEX_LOCAL_ROUTER_TOKEN" },
   "mode": "rules",
@@ -21,7 +21,7 @@
       "contextWindow": 128000,
       "maxContextWindow": 128000,
       "inputModalities": ["text"],
-      "compression": { "mode": "summary" },
+      "compression": { "mode": "unsupported" },
       "capabilities": {
         "responses": true,
         "toolCalling": true,

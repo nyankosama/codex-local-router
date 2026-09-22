@@ -5,7 +5,12 @@ import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { composeRuntimeConfig, resolveSpace } from "../src/config-spaces.mjs";
+import { upgradeConfig, validate } from "../src/config.mjs";
+import {
+  composeRuntimeConfig,
+  initializeSpaces,
+  resolveSpace,
+} from "../src/config-spaces.mjs";
 
 const exec = promisify(execFile);
 const testCli = resolve("test/support/gateway-admin-test-driver.mjs");
@@ -14,6 +19,48 @@ test("CLI reports the public command and package version", async () => {
   const manifest = JSON.parse(await readFile(resolve("package.json"), "utf8"));
   assert.equal((await exec(process.execPath, [testCli, "--version"])).stdout.trim(), `Codex Local Router ${manifest.version}`);
   assert.match((await exec(process.execPath, [testCli, "--help"])).stdout, /^Usage: codex-local-router /);
+});
+
+test("configuration-space upgrade persists the global schema version", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "router-cli-upgrade-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const home = join(root, "codex"), data = join(root, "router");
+  const configPath = join(data, "config.json");
+  await mkdir(home, { recursive: true });
+  await mkdir(data, { recursive: true });
+  await writeFile(join(home, "config.toml"), 'model = "gpt-5.5"\n');
+  const config = structuredClone(validate(upgradeConfig(
+    JSON.parse(await readFile(resolve("config/gateway.example.json"), "utf8")),
+  ).config));
+  config.schemaVersion = 3;
+  config.subscription = { enabled: false };
+  await writeFile(configPath, JSON.stringify(config));
+  const environment = {
+    ...process.env,
+    CODEX_HOME: home,
+    CODEX_LOCAL_ROUTER_HOME: data,
+    CODEX_LOCAL_ROUTER_CONFIG: configPath,
+    CODEX_LOCAL_ROUTER_TEST_DRIVER_APP_STATE: "stopped",
+    EXAMPLE_PROVIDER_API_KEY: "test",
+  };
+  await initializeSpaces({
+    env: environment,
+    config,
+    configPath,
+    codexHome: home,
+    integrationState: {
+      schemaVersion: 4,
+      status: "applied",
+      managed: { model: "provider-model-id" },
+      baseline: { model: 'model = "gpt-5.5"' },
+    },
+  });
+
+  const upgraded = JSON.parse((await exec(process.execPath, [
+    testCli, "config", "upgrade", "--apply", "--yes", "--json",
+  ], { env: environment })).stdout);
+  assert.equal(upgraded.applied, true);
+  assert.equal(JSON.parse(await readFile(configPath, "utf8")).schemaVersion, 4);
 });
 
 test("CLI distinguishes an app-absent legacy target from an explicitly disabled App target", async (t) => {
@@ -130,7 +177,7 @@ test("setup reports pending App integration and core query commands are JSON-saf
   assert.equal(setup.applied, true);
   assert.equal(setup.integration.pending, true);
   const installedConfig = JSON.parse(await readFile(config, "utf8"));
-  assert.equal(installedConfig.schemaVersion, 3);
+  assert.equal(installedConfig.schemaVersion, 4);
   assert.equal(installedConfig.thirdPartyDefaults.template, "codex-general-v1");
   assert.equal(installedConfig.targets.deepseek.app.toolMode, undefined);
   assert.equal(installedConfig.targets.deepseek.app.multiAgent, undefined);
@@ -157,9 +204,20 @@ test("setup reports pending App integration and core query commands are JSON-saf
     "--yes", "--json",
   ], { env: stoppedEnvironment });
   await exec(process.execPath, [
-    testCli, "model", "add", "--id", "feei-sol", "--provider", "feei",
-    "--preset", "feei/gpt-5.6-sol", "--yes", "--json",
+    testCli, "provider", "edit", "--id", "feei", "--base-url", "http://provider.example/v1",
+    "--allow-insecure-http", "--yes", "--json",
   ], { env: stoppedEnvironment });
+  await exec(process.execPath, [
+    testCli, "model", "add", "--id", "feei-sol", "--provider", "feei",
+    "--preset", "feei/gpt-5.6-sol", "--compression", "native", "--yes", "--json",
+  ], { env: stoppedEnvironment });
+  const configured = JSON.parse(await readFile(config, "utf8"));
+  assert.equal(configured.providers.feei.baseUrl, "http://provider.example/v1");
+  assert.equal(configured.providers.feei.allowInsecureHttp, true);
+  assert.deepEqual(configured.targets["feei-sol"].compression, {
+    mode: "native",
+    compatibility: { accountScope: "same", targets: ["feei-sol"] },
+  });
   const modelList = JSON.parse((await exec(
     process.execPath,
     [testCli, "model", "list", "--json"],

@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.5.22 - 2026-09-22
+
+- Make same-target compression native-first: channel-owned opaque checkpoints pass through HTTP and App WebSocket without Gateway summary fallback or token-estimate blocking, and trusted native continuation survives restart without a portable original.
+- Separate cross-target migration-summary authorization from same-target compression, migrate schema-v3 implicit summaries to `unsupported`, and require any Gateway `summary` mode to be selected explicitly under schema 4.
+- Add bounded FEEI Sol/Astra native-compaction qualification covering two compactions, a read-only tool closure, continuation, restart, checkpoint fingerprint reuse, credential isolation, and zero Gateway summary calls.
+- Mark the FEEI Sol and Astra presets native only after both bounded live lifecycle cases pass; schema-v3 FEEI summary defaults upgrade to same-target native compatibility.
+- Keep remote plaintext HTTP providers blocked by default and add an explicit, reversible CLI authorization for endpoints that cannot yet offer HTTPS.
+- Preserve official HTTP and WebSocket compaction observation when the terminal response omits `output` by rebuilding completed output items, while still refusing incomplete, conflicting, cancelled, or untrusted observations.
+- Check native continuation and completed migration reuse before migration-capacity estimation so restarts and long histories reach the provider instead of returning a premature local 413.
+- Keep current WebSocket prewarm tool declarations across Responses Lite incremental inference and cross-provider migration, restoring Goal tools after a native compaction.
+- Defer native compaction capacity to the owning provider and omit unsupported official summary reasoning.
+- Retry configuration-space coordinator startup cleanly and permit catalog-only space switches while turns remain active.
 
 ## 0.5.21 - 2026-09-20
 

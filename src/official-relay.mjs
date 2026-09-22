@@ -123,6 +123,75 @@ async function write(res, chunk, signal) {
   });
 }
 
+const observationFailure = (stage, details = {}) => {
+  const error = fail("history_observation_incomplete", 409);
+  error.observation = { stage, ...details };
+  return error;
+};
+
+export function recordOfficialOutputItem(items, event) {
+  if (!["response.output_item.added", "response.output_item.done"].includes(event?.type))
+    return;
+  const index = event.output_index;
+  if (!Number.isInteger(index) || index < 0 || !event.item)
+    throw observationFailure("invalid_output_item", { item_count: items.size });
+  const current = items.get(index);
+  if (event.type === "response.output_item.added") {
+    if (current)
+      throw observationFailure("conflicting_output_item", { item_count: items.size });
+    items.set(index, { done: false, item: event.item });
+    return;
+  }
+  if (current?.done)
+    throw observationFailure("conflicting_output_item", { item_count: items.size });
+  items.set(index, { done: true, item: event.item });
+}
+
+export function officialTerminalWithOutput(event, items) {
+  if (!event?.response || !["response.completed", "response.incomplete"].includes(event.type))
+    throw observationFailure("missing_terminal", { item_count: items.size });
+  if ([...items.values()].some((item) => !item.done))
+    throw observationFailure("unfinished_output_item", {
+      terminal_type: event.type,
+      item_count: items.size,
+    });
+  if (Array.isArray(event.response.output) && event.response.output.length)
+    return event;
+  if (!items.size) {
+    if (!Array.isArray(event.response.output))
+      throw observationFailure("missing_output", {
+        terminal_type: event.type,
+        item_count: 0,
+      });
+    return event;
+  }
+  return {
+    ...event,
+    response: {
+      ...event.response,
+      output: [...items.entries()]
+        .sort((left, right) => left[0] - right[0])
+        .map(([, item]) => item.item),
+    },
+  };
+}
+
+export function officialObservationFailureLog(error, transport) {
+  const details = error?.observation ?? {};
+  return {
+    event: "official_history_observation_failed",
+    transport: details.transport ?? transport,
+    type: error?.type ?? "observation_error",
+    ...(details.request_id ? { request_id: details.request_id } : {}),
+    ...(details.stage ? { observation_stage: details.stage } : {}),
+    ...(details.content_type ? { content_type: details.content_type } : {}),
+    ...(details.encoding ? { encoding: details.encoding } : {}),
+    ...(Number.isInteger(details.bytes) ? { response_bytes: details.bytes } : {}),
+    ...(details.terminal_type ? { terminal_type: details.terminal_type } : {}),
+    ...(Number.isInteger(details.item_count) ? { item_count: details.item_count } : {}),
+  };
+}
+
 function injectedModels(value, config) {
   if (Array.isArray(value?.models) && value.models.length)
     return buildModelCatalog(value, config);
@@ -202,12 +271,12 @@ export async function relayOfficialHttp({
         complete: observationComplete,
       });
     } catch (error) {
-      log({ event: "official_history_observation_failed", type: error.type ?? "observation_error" });
+      log(officialObservationFailureLog(error, "http"));
     }
   }
   res.end();
   Promise.resolve(observationTask).catch((error) => {
-    log({ event: "official_history_observation_failed", type: error.type ?? "observation_error" });
+    log(officialObservationFailureLog(error, "http"));
   });
   return { status: upstream.status, bytes, injected: false };
 }
@@ -218,23 +287,94 @@ const decompressors = {
   zstd: zlib.zstdDecompress ? promisify(zlib.zstdDecompress) : null,
 };
 
-export async function observedOfficialResponse(observation, limit = 20 * 1024 * 1024) {
-  if (!observation.complete) throw fail("history_observation_incomplete", 409);
-  let body = observation.body;
-  const encoding = observation.headers.get("content-encoding")?.toLowerCase() ?? "identity";
-  if (encoding !== "identity") {
-    const decode = decompressors[encoding];
-    if (!decode) throw fail("history_observation_incomplete", 409);
-    try { body = await decode(body, { maxOutputLength: limit }); }
-    catch { throw fail("history_observation_incomplete", 409); }
+function observedContentType(headers, body) {
+  const declared = headers.get("content-type")?.toLowerCase() ?? "";
+  if (declared) return { type: declared, source: "header" };
+  const prefix = body.subarray(0, 4096).toString("utf8").trimStart();
+  if (prefix.startsWith("{")) return { type: "application/json", source: "sniffed" };
+  if (["data:", "event:", "id:", "retry:", ":"].some((item) => prefix.startsWith(item)))
+    return { type: "text/event-stream", source: "sniffed" };
+  return { type: "", source: "missing" };
+}
+
+export async function observedOfficialResponse(
+  observation,
+  limit = 20 * 1024 * 1024,
+  diagnostics = {},
+) {
+  const rawEncoding = observation.headers.get("content-encoding")?.toLowerCase() ?? "identity";
+  const encoding = ["identity", "gzip", "deflate", "zstd"].includes(rawEncoding)
+    ? rawEncoding
+    : "unsupported";
+  const base = {
+    encoding,
+    bytes: observation.body?.byteLength ?? 0,
+  };
+  try {
+    if (!observation.complete) throw observationFailure("body_truncated");
+    let body = observation.body;
+    if (encoding !== "identity") {
+      const decode = decompressors[encoding];
+      if (!decode) throw observationFailure("unsupported_encoding");
+      try { body = await decode(body, { maxOutputLength: limit }); }
+      catch { throw observationFailure("decompression_failed"); }
+    }
+    const { type, source: contentTypeSource } = observedContentType(observation.headers, body);
+    if (type.includes("application/json")) {
+      const response = JSON.parse(body.toString("utf8"));
+      if (!response || typeof response !== "object") throw observationFailure("invalid_json");
+      Object.assign(diagnostics, {
+        encoding,
+        bytes: base.bytes,
+        content_type: "application/json",
+        content_type_source: contentTypeSource,
+        terminal_type: response.status ? `response.${response.status}` : null,
+        item_count: Array.isArray(response.output) ? response.output.length : 0,
+        output_source: "terminal",
+      });
+      return response;
+    }
+    if (type.includes("text/event-stream")) {
+      let terminal;
+      const items = new Map();
+      for await (const event of sseEvents(Readable.from([body]))) {
+        if (terminal)
+          throw observationFailure("event_after_terminal", {
+            terminal_type: terminal.type,
+            item_count: items.size,
+          });
+        recordOfficialOutputItem(items, event);
+        if (["response.completed", "response.incomplete"].includes(event.type)) {
+          if (terminal)
+            throw observationFailure("conflicting_terminal", {
+              terminal_type: event.type,
+              item_count: items.size,
+            });
+          const terminalOutput = Array.isArray(event.response?.output) && event.response.output.length;
+          terminal = officialTerminalWithOutput(event, items);
+          Object.assign(diagnostics, {
+            encoding,
+            bytes: base.bytes,
+            content_type: "text/event-stream",
+            content_type_source: contentTypeSource,
+            terminal_type: event.type,
+            item_count: items.size,
+            output_source: terminalOutput ? "terminal" : items.size ? "done-items" : "terminal",
+          });
+        }
+      }
+      if (!terminal)
+        throw observationFailure("missing_terminal", { item_count: items.size });
+      return terminal.response;
+    }
+    throw observationFailure("unsupported_content_type", {
+      content_type: type.split(";", 1)[0].trim().slice(0, 64) || "missing",
+    });
+  } catch (error) {
+    const observed = error?.type === "history_observation_incomplete"
+      ? error
+      : observationFailure("parse_failed");
+    observed.observation = { ...base, ...(observed.observation ?? {}) };
+    throw observed;
   }
-  const type = observation.headers.get("content-type") ?? "";
-  if (type.includes("application/json")) return JSON.parse(body.toString("utf8"));
-  if (type.includes("text/event-stream")) {
-    let terminal;
-    for await (const event of sseEvents(Readable.from([body])))
-      if (["response.completed", "response.incomplete"].includes(event.type)) terminal = event.response;
-    if (terminal) return terminal;
-  }
-  throw fail("history_observation_incomplete", 409);
 }

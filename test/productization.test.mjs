@@ -19,6 +19,7 @@ import {
   renderLaunchAgent,
   renderSpaceSwitcherLaunchAgent,
   serviceStatus,
+  uninstallSpaceSwitcher,
 } from "../src/service-manager.mjs";
 import { PACKAGE_VERSION, runtimePaths } from "../src/product.mjs";
 import { callProvider } from "../src/providers.mjs";
@@ -62,7 +63,7 @@ test("versioned presets fill defaults while explicit model-channel settings win"
 
 test("ai.feei presets use distinct App IDs, conservative windows and standalone search only", () => {
   const input = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     mode: "rules",
     defaultTarget: "sol",
     providers: { feei: {} },
@@ -83,7 +84,11 @@ test("ai.feei presets use distinct App IDs, conservative windows and standalone 
     assert.equal(target.modelFamily, "openai-gpt");
     assert.equal(target.contextWindow, 272000);
     assert.equal(target.maxContextWindow, 272000);
-    assert.equal(target.compression.mode, "summary");
+    assert.equal(target.compression.mode, "native");
+    assert.deepEqual(target.compression.compatibility, {
+      accountScope: "same",
+      targets: [target.id],
+    });
     assert.equal(target.capabilities.nativeWebSearch, false);
     assert.equal(target.app.supportsSearchTool, undefined);
     assert.equal(target.app.useResponsesLite, true);
@@ -123,6 +128,24 @@ test("legacy configuration is runtime-compatible without enabling new persistenc
   assert.deepEqual(loaded.targets.deepseek.inputModalities, ["text", "image"]);
   assert.equal(loaded.targets.deepseek.capabilities.freeformTools, true);
   assert.equal(loaded.history.persistent.enabled, false);
+});
+
+test("legacy runtime loading disables implicit Gateway summaries", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "router-legacy-summary-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "config.json");
+  const legacyConfig = config();
+  legacyConfig.schemaVersion = 3;
+  legacyConfig.targets.deepseek.compression = {
+    mode: "summary",
+    nativeMigrationSummary: true,
+  };
+  await writeFile(path, JSON.stringify(legacyConfig));
+  const loaded = await loadConfig(path);
+  assert.deepEqual(loaded.targets.deepseek.compression, {
+    mode: "unsupported",
+    nativeMigrationSummary: true,
+  });
 });
 
 test("custom catalog keeps official entries intact and does not copy private GPT instructions", () => {
@@ -362,6 +385,36 @@ test("reinstalling an unchanged space switcher never terminates a running coordi
   assert.equal(calls.some((args) => args[0] === "bootstrap"), false);
   assert.equal(calls.some((args) => args.includes("-k")), false);
   assert.deepEqual(calls.map((args) => args[0]), ["print", "kickstart"]);
+});
+
+test("a stale loaded space switcher is removed by label when its plist is missing", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "router-switcher-stale-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let loaded = true;
+  const calls = [];
+  const control = async (args) => {
+    calls.push(args);
+    if (args[0] === "print") {
+      if (!loaded) throw Error("not loaded");
+      return;
+    }
+    if (args[0] === "bootout") loaded = false;
+    if (args[0] === "bootstrap") loaded = true;
+  };
+  const options = {
+    env: {
+      ...process.env,
+      CODEX_LOCAL_ROUTER_HOME: root,
+      CODEX_LOCAL_ROUTER_SPACE_SWITCHER_LAUNCH_AGENT: join(root, "missing.plist"),
+    },
+    adminPath: join(root, "gateway-admin.mjs"),
+    launchctl: control,
+  };
+  await installSpaceSwitcher(options);
+  assert.equal(calls.find((args) => args[0] === "bootout").length, 2);
+  await rm(options.env.CODEX_LOCAL_ROUTER_SPACE_SWITCHER_LAUNCH_AGENT);
+  await uninstallSpaceSwitcher(options);
+  assert.equal(loaded, false);
 });
 
 test("concurrent space switcher installers serialize before replacing an old definition", async (t) => {

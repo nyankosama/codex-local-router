@@ -10,8 +10,8 @@
 | Linux / Windows | 不支持 | 无 | 无 | 无 |
 | ChatGPT 订阅 HTTP/WS 与辅助接口 | 内置 | 固定目的地 Relay、身份、历史和搜索 | v0.5.6 官方 cached/live 有界验收 | 每个已安装 App 单独确认 |
 | OpenCode Go DeepSeek preset | 内置 preset；legacy 路径 | legacy Responses 适配 | 当前 Release 无真实用例 | 不声明 |
-| ai.feei GPT 5.6 Sol | 内置 preset | Responses、GPT 策略、搜索／缓存／指令路径 | v0.5.6 订阅桥接与客户端 MCP 用例 | 每个已安装 App 单独确认 |
-| ai.feei GPT 6 Astra | 内置 preset | 同一声明协议族 | 当前 Release 无真实用例 | 当前 Release 不声明 |
+| ai.feei GPT 5.6 Sol | 内置 preset；同 target 原生压缩 | Responses、GPT 策略、搜索／缓存／指令与原生历史路径 | 候选版本有界原生压缩／工具／重启生命周期；尚未发布 | 每个已安装 App 单独确认 |
+| ai.feei GPT 6 Astra | 内置 preset；同 target 原生压缩 | 同一声明协议族与原生历史路径 | 候选版本有界原生压缩／工具／重启生命周期；尚未发布 | 尚未 UI 确认 |
 | BigModel GLM 5.3 Flash | 支持公开配置 | 标准 Responses、工具、续接与桥接 | v0.5.6 订阅搜索桥接 | 每个已安装 App 单独确认 |
 | BigModel GLM 5.3 main | 支持公开配置 | 通用标准 Responses 覆盖 | 当前无模型专项真实用例 | 不声明 |
 | 通用 OpenAI-compatible Responses | 支持公开配置 | 通用适配器与协议夹具 | 需要 Provider 专项 probe | 按 Provider 单独确认 |
@@ -31,7 +31,7 @@
 
 ## 稳定兼容边界
 
-- 运行时配置保持 Schema 3。
+- 运行时配置为 Schema 4；升级会关闭旧版隐式 Gateway 摘要，并保留显式迁移摘要授权。
 - 配置空间保持 Schema 1。
 - 集成状态保持 Schema 4。
 - 官方订阅走固定目的地透明 Relay；本地 `/v1` 永远不能借用订阅身份。

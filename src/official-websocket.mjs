@@ -3,13 +3,47 @@ import { ProxyAgent } from "proxy-agent";
 import { getProxyForUrl } from "proxy-from-env";
 import * as tls from "node:tls";
 import { fail } from "./errors.mjs";
-import { relayRequestHeaders } from "./official-relay.mjs";
+import {
+  officialObservationFailureLog,
+  officialTerminalWithOutput,
+  recordOfficialOutputItem,
+  relayRequestHeaders,
+} from "./official-relay.mjs";
 
 export const OFFICIAL_RESPONSES_WEBSOCKET =
   "wss://chatgpt.com/backend-api/codex/responses";
 
 const terminal = (event) =>
   ["response.completed", "response.incomplete", "error"].includes(event?.type);
+
+const observedFailure = (error, active, event) => {
+  error.observation = {
+    ...(error.observation ?? {}),
+    transport: "websocket",
+    encoding: "identity",
+    bytes: active.observedBytes,
+    terminal_type: terminal(event) ? event.type : error.observation?.terminal_type,
+    item_count: active.outputItems.size,
+  };
+  return error;
+};
+
+const notifyObservationFailure = (active, stage, log) => {
+  if (!active?.observe || active.observationNotified) return;
+  active.observationNotified = true;
+  const error = active.observationError ?? fail("history_observation_incomplete", 409);
+  error.observation = { stage, ...(error.observation ?? {}) };
+  const observed = observedFailure(error, active);
+  let task;
+  try { task = active.observe({ observationError: observed }); }
+  catch (cause) {
+    log(officialObservationFailureLog(observedFailure(cause, active), "websocket"));
+    return;
+  }
+  Promise.resolve(task).catch((cause) => {
+    log(officialObservationFailureLog(observedFailure(cause, active), "websocket"));
+  });
+};
 
 const TLS_FAILURE_CODES = new Set([
   "CERT_HAS_EXPIRED",
@@ -192,40 +226,56 @@ export class OfficialWebSocketSession {
       return;
     }
     active.chain = active.chain.then(async () => {
+      active.observedBytes += Buffer.byteLength(data);
       let event;
       if (!isBinary) {
-        try { event = JSON.parse(Buffer.from(data).toString("utf8")); } catch {}
+        try { event = JSON.parse(Buffer.from(data).toString("utf8")); }
+        catch {
+          if (!active.observationError) {
+            const error = fail("history_observation_incomplete", 409);
+            error.observation = { stage: "parse_failed" };
+            active.observationError = observedFailure(error, active);
+          }
+        }
       }
-      if (event?.type === "response.output_item.done" && event.item)
-        active.outputItems.set(event.output_index ?? active.outputItems.size, event.item);
-      if (terminal(event) && event?.response && !event.response.output?.length && active.outputItems.size)
-        event = {
-          ...event,
-          response: {
-            ...event.response,
-            output: [...active.outputItems.entries()]
-              .sort((left, right) => left[0] - right[0])
-              .map((entry) => entry[1]),
-          },
-        };
+      if (!active.observationError) {
+        try {
+          recordOfficialOutputItem(active.outputItems, event);
+          if (["response.completed", "response.incomplete"].includes(event?.type)) {
+            const terminalOutput = Array.isArray(event.response?.output) && event.response.output.length;
+            event = {
+              ...officialTerminalWithOutput(event, active.outputItems),
+              observationOutputSource:
+                terminalOutput ? "terminal" : active.outputItems.size ? "done-items" : "terminal",
+            };
+          }
+        } catch (error) {
+          active.observationError = observedFailure(error, active, event);
+        }
+      }
       let observationTask;
       if (terminal(event) && active.observe) {
-        try { observationTask = active.observe(event); }
+        active.observationNotified = true;
+        try {
+          observationTask = active.observe(
+            active.observationError
+              ? { ...event, observationError: active.observationError }
+              : event,
+          );
+        }
         catch (error) {
-          this.log({
-            event: "official_history_observation_failed",
-            transport: "websocket",
-            type: error.type ?? "observation_error",
-          });
+          this.log(officialObservationFailureLog(
+            observedFailure(error, active, event),
+            "websocket",
+          ));
         }
       }
       await active.forward(data, isBinary);
       Promise.resolve(observationTask).catch((error) => {
-        this.log({
-          event: "official_history_observation_failed",
-          transport: "websocket",
-          type: error.type ?? "observation_error",
-        });
+        this.log(officialObservationFailureLog(
+          observedFailure(error, active, event),
+          "websocket",
+        ));
       });
       if (terminal(event)) {
         this.active = null;
@@ -242,6 +292,7 @@ export class OfficialWebSocketSession {
     if (this.active) {
       const active = this.active;
       this.active = null;
+      notifyObservationFailure(active, "missing_terminal", this.log);
       active.reject(fail("upstream_connection_error", 502));
     }
   }
@@ -250,6 +301,7 @@ export class OfficialWebSocketSession {
     if (this.active) {
       const active = this.active;
       this.active = null;
+      notifyObservationFailure(active, "transport_failed", this.log);
       active.reject(connectionFailure(error));
     }
   }
@@ -273,11 +325,15 @@ export class OfficialWebSocketSession {
         forward,
         observe,
         outputItems: new Map(),
+        observedBytes: 0,
+        observationError: null,
+        observationNotified: false,
         chain: Promise.resolve(),
       };
       this.active = active;
       const abort = () => {
         if (this.active === active) this.active = null;
+        notifyObservationFailure(active, "cancelled", this.log);
         socket.terminate?.();
         rejectTurn(fail("cancelled", 499));
       };
@@ -288,6 +344,7 @@ export class OfficialWebSocketSession {
         if (!error) return;
         signal?.removeEventListener("abort", abort);
         if (this.active === active) this.active = null;
+        notifyObservationFailure(active, "send_failed", this.log);
         rejectTurn(connectionFailure(error));
       };
       socket.send(data, { binary: !!isBinary }, done);

@@ -56,6 +56,7 @@ function receipts() {
       },
       cases: cases(RELEASE_QUALIFICATION.cases.historyMigration),
       lifecycle: {
+        officialHttpObservationPassed: true,
         legacyCheckpointRecoveryPassed: true,
         summaryReusePassed: true,
         gatewayErrorFree: true,
@@ -90,7 +91,7 @@ test("release qualification covers the bounded equivalence classes", () => {
   officialOverBudget.officialSearch.budget.generations = 10;
   assert.equal(qualifyReleaseReceipts(officialOverBudget, commit).verdict, "FAIL");
   const historyOverBudget = receipts();
-  historyOverBudget.historyMigration.budget.generations = 19;
+  historyOverBudget.historyMigration.budget.generations = 37;
   assert.equal(qualifyReleaseReceipts(historyOverBudget, commit).verdict, "FAIL");
   const missingLifecycle = receipts();
   missingLifecycle.historyMigration.lifecycle.summaryReusePassed = false;
@@ -134,16 +135,67 @@ test("release qualification includes bounded compaction, fork and restart migrat
   assert.match(harness, /thread\/compact\/start/);
   assert.match(harness, /thread\/fork/);
   assert.match(harness, /thread\/resume/);
-  assert.match(harness, /maxTurns[^\n]+14/);
-  assert.match(harness, /maxGenerations[^\n]+18/);
+  assert.match(harness, /maxTurns[^\n]+20/);
+  assert.match(harness, /maxGenerations[^\n]+36/);
   assert.match(harness, /nativeMigrationSummary: true/);
-  assert.match(harness, /appWebSocketObserved/);
+  assert.doesNotMatch(harness, /mode: "summary", nativeMigrationSummary/);
+  assert.match(harness, /appTransportObserved/);
+  assert.match(harness, /officialCompactionObserved/);
   assert.match(harness, /legacyCheckpointRecovered/);
   assert.match(harness, /summaryReusePassed/);
   assert.match(harness, /gatewayErrorFree/);
   assert.match(harness, /noReconnectRetries/);
-  assert.doesNotMatch(harness, /httpTransportObserved/);
-  assert.doesNotMatch(harness, /responses_websockets/);
+  assert.match(harness, /configureHome\(home, gateway, officialModel, "http"\)/);
+  assert.match(harness, /transport: "websocket"/);
+  assert.match(harness, /runHttpObservation/);
+  assert.match(harness, /officialHttpObservationPassed/);
+  assert.match(harness, /hydrate: true/);
+  assert.match(harness, /persistedCheckpoints > 0/);
+  assert.match(harness, /failures: failures\.map/);
+  assert.match(harness, /targetId: "glm-flash",[\s\S]+legacyCheckpoint: false,[\s\S]+transport: "websocket"/);
+  assert.match(harness, /targetId: "feei-sol",[\s\S]+legacyCheckpoint: true,[\s\S]+transport: "websocket"/);
+  assert.match(harness, /supportsWebsockets/);
+  assert.match(harness, /gateway_http/);
   const releaseHarness = await readFile(resolve("scripts/e2e/release-qualification.mjs"), "utf8");
   assert.match(releaseHarness, /history-migration-acceptance\.mjs/);
+});
+
+test("native compaction qualification is bounded and rejects Gateway summaries", async () => {
+  const harness = await readFile(resolve("scripts/e2e/native-compaction-acceptance.mjs"), "utf8");
+  assert.match(harness, /maxGenerations[^\n]+64/);
+  assert.match(harness, /maxTurns[^\n]+40/);
+  assert.match(harness, /mode: "native"/);
+  assert.match(harness, /thread\/compact\/start/);
+  assert.match(harness, /thread\/resume/);
+  assert.match(harness, /model_auto_compact_token_limit = 10000/);
+  assert.match(harness, /automaticCompactionObserved/);
+  assert.match(harness, /automaticCompactionReachedProvider/);
+  assert.match(harness, /automaticFactPreserved/);
+  assert.match(harness, /gatewaySummaryCallsZero/);
+  assert.match(harness, /compactionFingerprints/);
+  assert.match(harness, /source-lite/);
+  assert.match(harness, /standard/);
+  assert.doesNotMatch(harness, /mode: "summary"/);
+});
+
+test("reported fault-history gate uses only isolated rollout and archive copies", async () => {
+  const harness = await readFile(resolve("scripts/e2e/native-continuation-fault-acceptance.mjs"), "utf8");
+  assert.match(harness, /snapshotArchiveScope/);
+  assert.match(harness, /DatabaseSync\(sourcePath, \{ readOnly: true \}\)/);
+  assert.match(harness, /sourceArchive\.exec\("BEGIN"\)/);
+  assert.match(harness, /referencedHistory/);
+  assert.match(harness, /version<=\?/);
+  assert.match(harness, /copyRollouts/);
+  assert.match(harness, /archived_sessions/);
+  assert.match(harness, /rollout_source_outside_history_roots/);
+  assert.match(harness, /applyRolloutRecovery/);
+  assert.match(harness, /history_observation_incomplete/);
+  assert.match(harness, /native_migration_summary_reused/);
+  assert.match(harness, /thread-first-migration/);
+  assert.match(harness, /native_migration_summary_completed/);
+  assert.match(harness, /portableBudgetApplied/);
+  assert.match(harness, /completedMigrationPersisted/);
+  assert.match(harness, /sourceWriteOperations: 0/);
+  assert.match(harness, /sourceArchiveAccess: "sqlite-read-only-scope-snapshot"/);
+  assert.doesNotMatch(harness, /mode: "summary"/);
 });

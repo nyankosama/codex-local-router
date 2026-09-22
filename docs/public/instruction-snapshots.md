@@ -43,7 +43,7 @@ Official snapshots are optional. New eligible targets use the generic template u
 
 Snapshots live in immutable configuration-space revisions. Catalog updates only report an available refresh; explicit synchronization creates a revision, while identical content remains idempotent. Historical activation uses the saved snapshot. Batch synchronization resolves every target before one atomic commit. Changing the upstream model invalidates the old mapping. Unmanaged custom instructions are never overwritten, and a snapshot content/metadata mismatch fails validation.
 
-`model list/probe`, `status` and `doctor` show source, delivery mode, hashes, status and update availability without printing instruction text. CLI revision views and diffs show instruction field names, byte counts and hashes. Local configuration still contains the snapshot text and must remain private. Gateway/configuration-space/integration schema versions remain 3/1/4.
+`model list/probe`, `status` and `doctor` show source, delivery mode, hashes, status and update availability without printing instruction text. CLI revision views and diffs show instruction field names, byte counts and hashes. Local configuration still contains the snapshot text and must remain private. Gateway/configuration-space/integration schema versions are 4/1/4.
 
 Enabling `gateway-lite` fails when the current managed Codex configuration or selected profile has an observable `model_instructions_file` override. `AGENTS.md`, user prompts and additional developer messages are not conflicts. A temporary command-line override that never reaches the Router cannot be detected; use `client` delivery for that case.
 

@@ -10,8 +10,8 @@ This matrix separates configuration availability from evidence. A preset or conf
 | Linux / Windows | Not supported | None | None | None |
 | ChatGPT subscription HTTP/WS and auxiliary APIs | Built in | Fixed-origin relay, identity, history and search | v0.5.6 bounded official cached/live search | Manual per installed App |
 | OpenCode Go DeepSeek preset | Preset available; legacy path | Legacy Responses adapter | No current release case | Not claimed |
-| ai.feei GPT 5.6 Sol | Preset available | Responses, GPT policy, search/cache/instruction paths | v0.5.6 subscription bridge and client-owned MCP cases | Manual per installed App |
-| ai.feei GPT 6 Astra | Preset available | Same declared protocol family | No current release case | Not claimed by current release |
+| ai.feei GPT 5.6 Sol | Preset available; native same-target compaction | Responses, GPT policy, search/cache/instruction and native-history paths | Bounded candidate native compaction/tool/restart lifecycle; not yet released | Manual per installed App |
+| ai.feei GPT 6 Astra | Preset available; native same-target compaction | Same declared protocol family and native-history paths | Bounded candidate native compaction/tool/restart lifecycle; not yet released | Not yet UI-confirmed |
 | BigModel GLM 5.3 Flash | Configuration supported | Standard Responses, tools, continuation and bridge | v0.5.6 subscription-search bridge | Manual per installed App |
 | BigModel GLM 5.3 main | Configuration supported | Generic Standard Responses coverage | No model-specific current release case | Not claimed |
 | Generic OpenAI-compatible Responses | Configuration supported | Generic adapter and protocol fixtures | Provider-specific probe required | Provider-specific |
@@ -31,7 +31,7 @@ These states do not imply each other. Channel health is also separate from Gatew
 
 ## Stable compatibility boundaries
 
-- Runtime configuration remains schema 3.
+- Runtime configuration is schema 4; upgrading disables legacy implicit Gateway summaries while preserving explicit migration-summary authorization.
 - Configuration-space storage remains schema 1.
 - Integration state remains schema 4.
 - Official subscription traffic uses a fixed-destination transparent relay; local `/v1` access never borrows subscription identity.

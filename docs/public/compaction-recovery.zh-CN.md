@@ -8,6 +8,8 @@ Codex 可能用官方不透明 compaction 表示老会话。第三方 Provider �
 
 由于当前 Codex 运行时可能在相邻 turn 间改变线程元数据，官方观察记录会按已验证账号顺序提交。该顺序只约束本地旁路归档，不会让官方响应等待归档 I/O。
 
+HTTP SSE 与 WebSocket 的旁路观察遵循同一规则：若终态响应省略 `output`，则从已完成的 `response.output_item.done` 重建归档副本；非空的终态 `output` 仍是权威结果。HTTP 响应缺少 `Content-Type` 时，只允许从有界观测副本前缀识别明确的 JSON 对象或 SSE frame；显式声明为不支持的媒体类型或正文无法识别时仍然关闭失败。item 已声明但未完成、结果冲突、缺少终态、取消、解析失败或 incomplete 响应都不能安装成功的 compaction checkpoint；转发给 Codex 的原始字节与事件顺序不变。只有同账号观察确实仍在执行时，409 才提示等待；观察失败或可信 checkpoint 缺失时，应使用下文的显式 rollout 恢复流程，或继续使用官方模型。
+
 官方 WebSocket 预热响应也会作为谱系状态被观察：当前 Codex 客户端可能把 `generate: false` 响应作为下一请求的 `previous_response_id`。原始预热请求和响应仍保持透明转发。
 
 若 Codex 在不同 turn 间改变或省略线程元数据，官方 response ID 也只会在同一已验证账号内按精确 ID 恢复。该 ID 不会跨账号，Gateway 生成的虚拟 response ID 也不会被提升为官方谱系。
@@ -40,6 +42,12 @@ codex-local-router history recover --thread THREAD_ID --yes --json
 
 ## 受控原生迁移摘要
 
-`compression.nativeMigrationSummary` 缺省关闭，只能与 `compression.mode: "summary"` 同时使用。通过 `model edit --id TARGET --native-migration-summary` 为单个目标显式开启，使用 `--no-native-migration-summary` 关闭。
+`compression.nativeMigrationSummary` 缺省关闭，并与同 target 的 `compression.mode` 相互独立。通过 `model edit --id TARGET --native-migration-summary` 为迁移目标显式开启，使用 `--no-native-migration-summary` 关闭。它只授权跨 target 迁移，不允许 `native` 失败后回退为 Gateway `summary`。
 
 当可信的官方 opaque 窗口无法直接投影时，Router 会让原官方模型在关闭工具的情况下，对保存的有效窗口最多生成一次摘要。摘要按来源窗口哈希和目标持久化，重连或重启后复用，并与未摘要的最新用户输入和必要尾部组合。opaque item 与订阅凭证不会发送第三方。谱系缺失、来源缺口、结果不确定或必要尾部已超过目标预算时，会在目标生成前明确失败；不会自动重试、渠道回退、递归分块，也不会把有损摘要宣称为无损恢复。
+
+同 target 原生 checkpoint，以及当前目标下已完成且仍获授权的迁移视图，会在任何新迁移容量估算之前识别。复用持久迁移视图不会新增摘要调用；若目标随后真实返回上下文超限，Router 返回 `context_after_summary_exceeded`，不会为同一 checkpoint→目标迁移再次生成摘要。
+
+Responses Lite 当前工具声明不属于历史，不进入迁移摘要或已覆盖尾部的哈希。增量请求可以从同账户、同 target 的可信预热响应继承声明；重新声明时以本次声明为准。Codex 发起压缩时仍保留当前工具和 `compaction_trigger`。
+
+`native_migration_reuse_rejected` / `covered_history_mismatch` 表示摘要已完成，但本次历史与保存的覆盖指纹不符。等待或反复重开 App 不会修复它。不能直接改哈希、清除保护状态或静默重做摘要。恢复候选是切回 checkpoint 的原生来源模型，由 Codex 成功发起一次原生压缩，再验证目标切换；需要单独验收，不能仅凭配置生效宣告恢复。

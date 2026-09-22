@@ -43,6 +43,6 @@ Relay 保留 query、HTTP 方法、响应状态、实体字节、压缩、错误
 
 官方原生压缩触发项和 opaque 压缩项继续透明转发，不因出现压缩历史就进入 Engine。压缩响应会替换活动上下文窗口，而不是追加到压缩前历史；归档分别保存不可变原始记录、有效替换窗口和面向目标的可迁移视图。Gateway 自有检查点、Engine 留存的 response ID 和跨 Provider 迁移仍必须恢复历史。观察提交按分支串行；即使客户端未携带 `previous_response_id`，后续跨渠道切换也会有界等待所依赖的压缩提交。缺失或冲突谱系不阻断普通官方续聊，但不能授权跨 Provider 回放。参见 [OpenAI 压缩契约](https://developers.openai.com/api/docs/guides/compaction)。
 
-Router 继续按 target 声明执行 `native`、`summary` 或 `unsupported`，优先使用可精确迁移的历史。`compression.mode: "summary"` 的 target 可额外显式开启 `nativeMigrationSummary`：只有可信官方 opaque 替换窗口无法被目标直接使用时，才允许原模型生成一次关闭工具的有损迁移摘要，并把来源窗口哈希一起保存。它不会修补谱系缺口、吞掉必要尾部、递归摘要、自动重试、换模型或换渠道。fork 恢复沿已验证的 `history_base` 边界、在有限深度内展开；未知工具执行结果保留为明确历史不确定性；多个 checkpoint 共享事件前缀，不重复复制完整历史。HTTP Relay 与 Engine 的 SSE 共用[无数据超时](configuration.zh-CN.md#请求超时)，不再用总生成时长截断持续传输。
+Router 继续按 target 声明执行 `native`、`summary` 或 `unsupported`。同账户、同 target 的 `native` 压缩由渠道负责：Router 原样转发 Codex 压缩请求及后续 opaque checkpoint，不选择摘要窗口，也不因 token 估算阻断。`summary` 是用户显式选择的、有损的 Gateway 压缩模式，原生压缩失败或尚未验证时不会自动回退到它。跨 target 迁移独立受 `nativeMigrationSummary` 授权：只有目标无法使用精确可迁移历史时，才允许原模型生成一次关闭工具的迁移摘要并保存来源窗口哈希。它不会修补谱系缺口、吞掉必要尾部、递归摘要、自动重试、换模型或换渠道。fork 恢复沿已验证的 `history_base` 边界、在有限深度内展开；未知工具执行结果保留为明确历史不确定性；多个 checkpoint 共享事件前缀，不重复复制完整历史。HTTP Relay 与 Engine 的 SSE 共用[无数据超时](configuration.zh-CN.md#请求超时)，不再用总生成时长截断持续传输。
 
 英文完整架构见 [architecture.md](architecture.md)。

@@ -9,7 +9,7 @@ const packageJson = JSON.parse(
 export const PRODUCT_NAME = "Codex Local Router";
 export const PRODUCT_ID = "codex-local-router";
 export const PACKAGE_VERSION = packageJson.version;
-export const CONFIG_SCHEMA_VERSION = 3;
+export const CONFIG_SCHEMA_VERSION = 4;
 export const INTEGRATION_SCHEMA_VERSION = 4;
 export const SPACE_SCHEMA_VERSION = 1;
 
