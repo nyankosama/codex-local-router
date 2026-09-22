@@ -35,11 +35,11 @@ test("legacy upgrade makes DeepSeek 400K, derives App mapping and leaves unknown
     wireApi: "chat_completions",
   };
   const { config, changes } = upgradeConfig(old);
-  assert.equal(config.schemaVersion, 3);
+  assert.equal(config.schemaVersion, 4);
   assert.equal(config.targets.deepseek.preset, "opencode-go/deepseek-v4.1-flash");
   assert.equal(config.targets.deepseek.contextWindow, 400000);
   assert.equal(config.targets.deepseek.maxContextWindow, 400000);
-  assert.equal(config.targets.deepseek.compression.mode, "summary");
+  assert.equal(config.targets.deepseek.compression.mode, "unsupported");
   assert.deepEqual(config.targets.deepseek.inputModalities, ["text", "image"]);
   assert.equal(
     config.providers["opencode-go"].responsesMessagePhasePolicy,
@@ -80,6 +80,16 @@ test("schema v2 requires every model-channel target to declare a context window"
     () => validate(input),
     /target another requires an explicit context window/,
   );
+});
+
+test("remote plaintext providers require explicit authorization", () => {
+  const input = upgradeConfig(legacy()).config;
+  input.providers.generic.baseUrl = "http://provider.example/v1";
+  assert.throws(() => validate(input), /invalid provider address/);
+  input.providers.generic.allowInsecureHttp = true;
+  assert.equal(validate(input).providers.generic.allowInsecureHttp, true);
+  input.providers.generic.allowInsecureHttp = "yes";
+  assert.throws(() => validate(input), /invalid insecure HTTP setting/);
 });
 
 test("adding a model on existing adapters only changes config and generated catalog", () => {
@@ -151,18 +161,21 @@ test("App reasoning levels reject invalid, duplicate and unsupported defaults", 
   assert.equal(validate(input).targets.deepseek.app.defaultReasoningLevel, "max");
 });
 
-test("custom native compression requires an explicit same-account compatibility set", () => {
+test("native compression defaults to the same target and validates explicit compatibility", () => {
   const input = upgradeConfig(legacy()).config;
   input.targets.deepseek.compression = { mode: "native" };
-  assert.throws(() => validate(input), /explicit same-account compatibility/);
-  input.targets.deepseek.compression.compatibility = {
+  assert.deepEqual(validate(input).targets.deepseek.compression.compatibility, {
     accountScope: "same",
     targets: ["deepseek"],
+  });
+  input.targets.deepseek.compression.compatibility = {
+    accountScope: "same",
+    targets: ["other"],
   };
-  assert.equal(validate(input).targets.deepseek.compression.mode, "native");
+  assert.throws(() => validate(input), /explicit same-account compatibility/);
 });
 
-test("native migration summaries are explicit and require summary compression", () => {
+test("native migration summaries are independent from same-target compression", () => {
   const input = upgradeConfig(legacy()).config;
   input.targets.deepseek.compression.nativeMigrationSummary = true;
   assert.equal(
@@ -170,15 +183,55 @@ test("native migration summaries are explicit and require summary compression", 
     true,
   );
   input.targets.deepseek.compression.mode = "unsupported";
-  assert.throws(
-    () => validate(input),
-    /native migration summary .* requires summary compression/,
+  assert.equal(
+    validate(input).targets.deepseek.compression.nativeMigrationSummary,
+    true,
   );
   input.targets.deepseek.compression = {
     mode: "summary",
     nativeMigrationSummary: "yes",
   };
   assert.throws(() => validate(input), /invalid native migration summary setting/);
+});
+
+test("v3 summary configuration upgrades once to unsupported without losing migration authorization", () => {
+  const input = upgradeConfig(legacy()).config;
+  input.schemaVersion = 3;
+  input.targets.deepseek.compression = {
+    mode: "summary",
+    nativeMigrationSummary: true,
+  };
+  const first = upgradeConfig(input);
+  assert.equal(first.config.schemaVersion, 4);
+  assert.deepEqual(first.config.targets.deepseek.compression, {
+    mode: "unsupported",
+    nativeMigrationSummary: true,
+  });
+  assert.match(first.changes.join("\n"), /legacy summary default removed/);
+  assert.deepEqual(upgradeConfig(first.config).changes, []);
+});
+
+test("v3 FEEI summaries upgrade to the accepted same-target native preset", () => {
+  const input = {
+    schemaVersion: 3,
+    defaultTarget: "sol",
+    providers: { feei: { baseUrl: "https://ai.feei.cn/v1" } },
+    targets: {
+      sol: {
+        provider: "feei",
+        preset: "feei/gpt-5.6-sol",
+        compression: { mode: "summary", nativeMigrationSummary: true },
+      },
+    },
+    subscription: { enabled: true, models: ["gpt-official"] },
+  };
+  const upgraded = upgradeConfig(input).config;
+  assert.deepEqual(upgraded.targets.sol.compression, {
+    mode: "native",
+    compatibility: { accountScope: "same", targets: ["sol"] },
+    nativeMigrationSummary: true,
+  });
+  assert.equal(validate(upgraded).targets.sol.compression.mode, "native");
 });
 
 test("Responses message phase policy is provider-scoped and validated", () => {

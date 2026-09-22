@@ -234,6 +234,7 @@ export async function planRolloutRecovery({
   thread,
   source,
   sessionsRoot,
+  checkpointTargets = {},
   maxDepth = 16,
 }) {
   const chain = await rolloutChain({ thread, source, sessionsRoot, maxDepth });
@@ -300,15 +301,26 @@ export async function planRolloutRecovery({
           "Compacted rollout history cannot be reconstructed losslessly",
         );
       const checkpointModel = model ?? entry.meta.model;
+      const mappedTarget = checkpointTargets[checkpointModel];
+      if (
+        mappedTarget &&
+        (!["provider", "model", "targetId"].every((key) =>
+          typeof mappedTarget[key] === "string" && mappedTarget[key]))
+      )
+        throw recoveryError(
+          "rollout_target_mapping_invalid",
+          "Rollout checkpoint target mapping is invalid",
+        );
       checkpoints.push({
         thread,
         branch: thread,
         item: compacted[0],
         sourceHash: sourceHash.copy().digest("hex"),
         checkpoint: {
-          provider: "chatgpt-subscription",
-          model: checkpointModel ?? null,
-          targetId: checkpointModel ? `official:${checkpointModel}` : null,
+          provider: mappedTarget?.provider ?? "chatgpt-subscription",
+          model: mappedTarget?.model ?? checkpointModel ?? null,
+          targetId: mappedTarget?.targetId ??
+            (checkpointModel ? `official:${checkpointModel}` : null),
           original: original.slice(),
           view: replacement.slice(),
           completeness: "complete_original",

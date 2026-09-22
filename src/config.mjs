@@ -1,5 +1,9 @@
 import { readFile } from "node:fs/promises";
-import { applyPreset, presetSupportsThirdPartyTemplate } from "./presets.mjs";
+import {
+  applyPreset,
+  preset,
+  presetSupportsThirdPartyTemplate,
+} from "./presets.mjs";
 import { CONFIG_SCHEMA_VERSION, runtimePaths } from "./product.mjs";
 import {
   effectiveThirdPartyGptAllowlist,
@@ -80,7 +84,8 @@ function runtimeCompatibleConfig(input) {
   const next = structuredClone(input);
   const sourceSchema = next.schemaVersion ?? 1;
   if (sourceSchema >= CONFIG_SCHEMA_VERSION) return next;
-  for (const target of Object.values(next.targets ?? {})) {
+  for (const [id, target] of Object.entries(next.targets ?? {})) {
+    migrateLegacyCompression(target, id, sourceSchema);
     const provider = next.providers?.[target.provider];
     if (
       target.model !== "deepseek-v4.1-flash" ||
@@ -101,6 +106,24 @@ function runtimeCompatibleConfig(input) {
     ) delete target.inputModalities;
   }
   return next;
+}
+
+function migrateLegacyCompression(target, id, sourceSchema, changes) {
+  if (sourceSchema >= 4 || target.compression?.mode !== "summary") return;
+  const nativeMigrationSummary =
+    target.compression.nativeMigrationSummary === true;
+  const acceptedNative =
+    target.preset && preset(target.preset).target.compression.mode === "native";
+  target.compression = {
+    mode: acceptedNative ? "native" : "unsupported",
+    ...(acceptedNative
+      ? { compatibility: { accountScope: "same", targets: [id] } }
+      : {}),
+    ...(nativeMigrationSummary ? { nativeMigrationSummary: true } : {}),
+  };
+  changes?.push(
+    `targets.${id}.compression.mode=${target.compression.mode} (legacy summary default removed)`,
+  );
 }
 export function validate(input) {
   const c = structuredClone(input);
@@ -178,13 +201,15 @@ export function validate(input) {
         `invalid Responses message phase policy ${p.responsesMessagePhasePolicy}`,
       );
     const u = new URL(p.baseUrl);
+    if (p.allowInsecureHttp != null && typeof p.allowInsecureHttp !== "boolean")
+      throw Error(`invalid insecure HTTP setting for provider ${name}`);
     if (
       u.username ||
       u.password ||
       u.search ||
       u.hash ||
       !["http:", "https:"].includes(u.protocol) ||
-      (u.protocol === "http:" && !loopback(u.hostname))
+      (u.protocol === "http:" && !loopback(u.hostname) && p.allowInsecureHttp !== true)
     )
       throw Error("invalid provider address");
     if (p.apiKey || p.token || p.authorization)
@@ -249,20 +274,20 @@ export function validate(input) {
       throw Error(
         `invalid native migration summary setting for target ${name}`,
       );
-    if (
-      t.compression.nativeMigrationSummary === true &&
-      t.compression.mode !== "summary"
-    )
-      throw Error(
-        `native migration summary for target ${name} requires summary compression`,
-      );
     if (t.compression.mode === "native") {
+      t.compression.compatibility ??= {
+        accountScope: "same",
+        targets: [name],
+      };
       const compatibility = t.compression.compatibility;
       if (
         !compatibility ||
         compatibility.accountScope !== "same" ||
         !Array.isArray(compatibility.targets) ||
-        !compatibility.targets.includes(name)
+        !compatibility.targets.includes(name) ||
+        compatibility.targets.some(
+          (targetId) => typeof targetId !== "string" || !targetId,
+        )
       )
         throw Error(
           `native compression for target ${name} requires an explicit same-account compatibility target set`,
@@ -610,6 +635,7 @@ export function upgradeConfig(input) {
     changes.push(`schemaVersion=${CONFIG_SCHEMA_VERSION}`);
   }
   for (const [id, target] of Object.entries(next.targets ?? {})) {
+    migrateLegacyCompression(target, id, sourceSchema, changes);
     const provider = next.providers?.[target.provider];
     if (
       !target.preset &&

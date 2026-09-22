@@ -171,6 +171,51 @@ test("rollout recovery previews, writes, expands and repeats idempotently", asyn
   assert.ok(!JSON.stringify(expanded.input).includes("official-checkpoint"));
 });
 
+test("rollout recovery assigns configured custom model checkpoints to their target", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "gateway-rollout-targets-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const sessions = join(dir, "sessions");
+  const thread = "thread-target-switch";
+  const source = await rolloutPath(sessions, thread, [
+    record(0, "session_meta", { id: thread, model_provider: "openai" }),
+    record(1, "turn_context", { model: "gpt-official" }),
+    record(2, "response_item", { type: "message", role: "user", content: [] }),
+    record(3, "response_item", { type: "message", role: "assistant", content: [] }),
+    record(4, "compacted", compacted("official-checkpoint")),
+    record(5, "turn_context", { model: "feei-app-model" }),
+    record(6, "response_item", { type: "message", role: "user", content: [] }),
+    record(7, "response_item", { type: "message", role: "assistant", content: [] }),
+    record(8, "compacted", compacted("feei-checkpoint")),
+  ]);
+  const plan = await planRolloutRecovery({
+    thread,
+    source,
+    sessionsRoot: sessions,
+    checkpointTargets: {
+      "feei-app-model": {
+        provider: "feei",
+        model: "gpt-5.6-sol",
+        targetId: "feei-sol",
+      },
+    },
+  });
+  assert.deepEqual(
+    plan.checkpoints.map(({ checkpoint }) => ({
+      provider: checkpoint.provider,
+      model: checkpoint.model,
+      targetId: checkpoint.targetId,
+    })),
+    [
+      {
+        provider: "chatgpt-subscription",
+        model: "gpt-official",
+        targetId: "official:gpt-official",
+      },
+      { provider: "feei", model: "gpt-5.6-sol", targetId: "feei-sol" },
+    ],
+  );
+});
+
 test("rollout recovery follows one exact parent chain and preserves fork boundaries", async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "gateway-rollout-chain-"));
   t.after(() => rm(dir, { recursive: true, force: true }));

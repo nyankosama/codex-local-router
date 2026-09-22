@@ -585,7 +585,7 @@ function baseConfig(discovery) {
     concurrency: Number(value("concurrency") ?? 4),
   };
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     listen: { host: "127.0.0.1", port: Number(value("port") ?? 8788) },
     access: { required: true, tokenFile: paths.accessToken },
     mode: "rules",
@@ -852,6 +852,8 @@ async function providerCommand() {
   const suppliedCredential = await requestedCredential();
   if (flag("no-standalone-search-endpoint") && value("standalone-search-endpoint") != null)
     throw Object.assign(Error("standalone search endpoint flags conflict"), { code: "usage_error" });
+  if (flag("allow-insecure-http") && flag("no-allow-insecure-http"))
+    throw Object.assign(Error("insecure HTTP flags conflict"), { code: "usage_error" });
   const promptCacheAffinity = value("prompt-cache-affinity");
   if (
     promptCacheAffinity != null &&
@@ -885,6 +887,8 @@ async function providerCommand() {
       apiKeyEnv: value("api-key-env") ?? current.apiKeyEnv,
       concurrency: Number(value("concurrency") ?? current.concurrency ?? 4),
     };
+    if (flag("allow-insecure-http")) config.providers[id].allowInsecureHttp = true;
+    if (flag("no-allow-insecure-http")) delete config.providers[id].allowInsecureHttp;
     if (!config.providers[id].baseUrl) throw Object.assign(Error("--base-url is required"), { code: "usage_error" });
     if (value("responses-endpoint")) (config.providers[id].endpoints ??= {}).responses = value("responses-endpoint");
     if (value("chat-endpoint")) (config.providers[id].endpoints ??= {}).chatCompletions = value("chat-endpoint");
@@ -1199,6 +1203,9 @@ async function modelCommand() {
         config.targets[id] = applyThirdPartyTemplate(config.targets[id], "legacy");
       config.targets[id].compression = {
         ...config.targets[id].compression,
+        ...(value("compression") != null
+          ? { mode: value("compression") }
+          : {}),
         ...(nativeMigrationSummary != null
           ? { nativeMigrationSummary }
           : {}),
@@ -1695,6 +1702,14 @@ async function historyCommand() {
           thread,
           source: value("source"),
           sessionsRoot: join(codexHome(env), "sessions"),
+          checkpointTargets: Object.fromEntries(
+            Object.entries(config.targets)
+              .filter(([, target]) => target.app?.modelId)
+              .map(([targetId, target]) => [
+                target.app.modelId,
+                { provider: target.provider, model: target.model, targetId },
+              ]),
+          ),
         });
         if (apply) await verifyRolloutRecoverySources(plan);
         const result = applyRolloutRecovery(archive, plan, { account: owner, apply });
@@ -1936,25 +1951,7 @@ async function main() {
   }
   if (group === "history") return historyCommand();
   if (group === "config" && command === "upgrade") {
-    if (await readSpaceIndex(env)) {
-      if (!flag("apply")) {
-        const context = await routerSpaceContext();
-        const upgraded = upgradeConfig(context.config);
-        return emit({
-          applied: false,
-          changes: upgraded.changes,
-          diff: configDiff(context.config, upgraded.config),
-          space: context.name,
-        }, () => upgraded.changes.length
-          ? "Configuration space upgrade preview only; add --apply --yes to apply."
-          : "Configuration space is already current.");
-      }
-      return mutateSpaceConfig((config) => {
-        const upgraded = upgradeConfig(config);
-        for (const key of Object.keys(config)) delete config[key];
-        Object.assign(config, upgraded.config);
-      }, "upgrade configuration space", { source: "config-upgrade" });
-    }
+    if (await readSpaceIndex(env)) return upgradeSpaceConfig();
     const before = await rawConfig(configPath), upgraded = upgradeConfig(before);
     if (!upgraded.changes.length) return emit({ applied: false, changes: [] }, () => "Configuration is already current.");
     const apply = flag("apply") && await confirm(`Upgrade configuration:\n${upgraded.changes.join("\n")}`);

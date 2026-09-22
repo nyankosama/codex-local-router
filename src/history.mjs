@@ -283,6 +283,14 @@ export function expandCheckpoints(
           (checkpoint.virtual && checkpoint.targetId === target.id
             ? view
             : original);
+    if (
+      !portable &&
+      !omitCompactedHistory &&
+      checkpoint.virtual &&
+      checkpoint.targetId === target.id &&
+      replacement === view
+    )
+      diagnostics?.({ event: "legacy_checkpoint_view_restored" });
     if (!replacement)
       throw fail("compaction_history_unavailable", 409, "Compacted history has no portable source; restore full history before switching providers");
     // Remove only the exact positional prefix already captured by the

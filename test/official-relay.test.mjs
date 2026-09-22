@@ -9,7 +9,9 @@ import { createGateway } from "../src/server.mjs";
 import { Engine } from "../src/engine.mjs";
 import {
   OFFICIAL_CODEX_ORIGIN,
+  officialObservationFailureLog,
   officialRelayUrl,
+  observedOfficialResponse,
   relayOfficialHttp,
   relayRequestHeaders,
   validateOfficialRelayPath,
@@ -432,11 +434,12 @@ test("A8 native official compaction stays transparent and records a portable che
     })).needsEngine, true, "malformed checkpoints still require validation");
   }
 
-  await gateway.engine.commitOfficialObservation(headers, request, {
+  const committed = await gateway.engine.commitOfficialObservation(headers, request, {
     id: "resp_native_compaction",
     status: "completed",
     output: [item],
   });
+  assert.equal(committed.checkpoint_count, 1);
   const prepared = await gateway.engine.officialRelayContext(headers, request);
   const portable = expandCheckpoints(
     gateway.engine.state,
@@ -770,6 +773,243 @@ test("A5 official Responses classifies a compressed copy but forwards the origin
   await response.arrayBuffer();
   assert.equal(Buffer.compare(captured.body, wire), 0);
   assert.equal(captured.headers["content-encoding"], "gzip");
+});
+
+test("A8 HTTP observation rebuilds ordered output from compressed done-item events", async () => {
+  const items = [
+    { type: "message", id: "item_first", role: "assistant", content: [] },
+    { type: "compaction", id: "item_second", encrypted_content: "opaque-http" },
+  ];
+  const events = [
+    { type: "response.output_item.done", output_index: 1, item: items[1] },
+    { type: "response.output_item.added", output_index: 0, item: { ...items[0], content: [] } },
+    { type: "response.output_item.done", output_index: 0, item: items[0] },
+    { type: "response.completed", response: { id: "resp_done_items", status: "completed" } },
+  ];
+  const wire = Buffer.from(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+  const diagnostics = {};
+  const response = await observedOfficialResponse({
+    complete: true,
+    headers: new Headers({
+      "content-type": "text/event-stream",
+      "content-encoding": "gzip",
+    }),
+    body: zlib.gzipSync(wire),
+  }, undefined, diagnostics);
+  assert.deepEqual(response.output, items);
+  assert.equal(diagnostics.output_source, "done-items");
+
+  for (const invalid of [
+    [
+      { type: "response.output_item.added", output_index: 0, item: items[0] },
+      events.at(-1),
+    ],
+    [
+      { type: "response.output_item.done", output_index: 0, item: items[0] },
+      { type: "response.output_item.done", output_index: 0, item: items[1] },
+      events.at(-1),
+    ],
+  ]) {
+    const body = Buffer.from(invalid.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+    await assert.rejects(
+      observedOfficialResponse({
+        complete: true,
+        headers: new Headers({ "content-type": "text/event-stream" }),
+        body,
+      }),
+      (error) => error.type === "history_observation_incomplete",
+    );
+  }
+});
+
+test("A8 HTTP observation failure stays transparent and logs bounded diagnostics", async (t) => {
+  const logs = [];
+  const item = { type: "compaction", encrypted_content: "opaque-unfinished" };
+  const wire = Buffer.from([
+    { type: "response.output_item.added", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_unfinished", status: "completed" } },
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+  const gateway = createGateway(config(), {
+    resolveIdentity: async () => "chatgpt:fixture",
+    officialRequest: async () =>
+      upstream(200, { "content-type": "text/event-stream" }, wire),
+    log: (event) => logs.push(event),
+  });
+  const port = await listen(gateway.server);
+  t.after(() => gateway.close());
+  const response = await fetch(`http://127.0.0.1:${port}/subscription/v1/responses`, {
+    method: "POST",
+    headers: { authorization: "Bearer subscription", "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-future", input: "fixture", stream: true }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(Buffer.compare(Buffer.from(await response.arrayBuffer()), wire), 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  const started = logs.find((event) => event.event === "official_relay_started");
+  const failed = logs.find((event) => event.event === "official_history_observation_failed");
+  assert.deepEqual({
+    request_id: failed.request_id,
+    transport: failed.transport,
+    encoding: failed.encoding,
+    response_bytes: failed.response_bytes,
+    terminal_type: failed.terminal_type,
+    item_count: failed.item_count,
+    observation_stage: failed.observation_stage,
+  }, {
+    request_id: started.request_id,
+    transport: "http",
+    encoding: "identity",
+    response_bytes: wire.byteLength,
+    terminal_type: "response.completed",
+    item_count: 1,
+    observation_stage: "unfinished_output_item",
+  });
+});
+
+test("A8 unsupported official content types log only a normalized media type", async () => {
+  await assert.rejects(
+    observedOfficialResponse({
+      complete: true,
+      headers: new Headers({ "content-type": "Application/Octet-Stream; private=value" }),
+      body: Buffer.from("opaque"),
+    }),
+    (error) => {
+      assert.equal(error.observation.stage, "unsupported_content_type");
+      assert.equal(error.observation.content_type, "application/octet-stream");
+      const event = officialObservationFailureLog(error, "http");
+      assert.equal(event.content_type, "application/octet-stream");
+      assert.equal(JSON.stringify(event).includes("private=value"), false);
+      return true;
+    },
+  );
+});
+
+test("A8 missing official content type is inferred only for JSON and SSE", async () => {
+  const item = { type: "compaction", encrypted_content: "opaque-sniffed" };
+  const events = [
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.completed", response: { id: "resp_sniffed", status: "completed" } },
+  ];
+  const sseDiagnostics = {};
+  const sse = await observedOfficialResponse({
+    complete: true,
+    headers: new Headers(),
+    body: Buffer.from(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")),
+  }, undefined, sseDiagnostics);
+  assert.deepEqual(sse.output, [item]);
+  assert.equal(sseDiagnostics.content_type, "text/event-stream");
+  assert.equal(sseDiagnostics.content_type_source, "sniffed");
+
+  const jsonDiagnostics = {};
+  const json = await observedOfficialResponse({
+    complete: true,
+    headers: new Headers(),
+    body: Buffer.from(JSON.stringify({ id: "resp_json", status: "completed", output: [] })),
+  }, undefined, jsonDiagnostics);
+  assert.equal(json.id, "resp_json");
+  assert.equal(jsonDiagnostics.content_type, "application/json");
+  assert.equal(jsonDiagnostics.content_type_source, "sniffed");
+
+  await assert.rejects(
+    observedOfficialResponse({
+      complete: true,
+      headers: new Headers(),
+      body: Buffer.from("opaque"),
+    }),
+    (error) => error.observation.stage === "unsupported_content_type" &&
+      error.observation.content_type === "missing",
+  );
+});
+
+test("A8 WebSocket observation uses the same done-item result", async () => {
+  class FixtureSocket extends EventEmitter {
+    constructor() {
+      super();
+      this.readyState = 0;
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.emit("open");
+      });
+    }
+    send(_data, _options, callback) { callback(); }
+    close() { this.readyState = 3; this.emit("close"); }
+    terminate() { this.close(); }
+  }
+  let socket, observed;
+  const item = { type: "compaction", encrypted_content: "opaque-ws" };
+  const session = new OfficialWebSocketSession(
+    { authorization: "Bearer subscription" },
+    { createSocket: () => (socket = new FixtureSocket()) },
+  );
+  const turn = session.run(Buffer.from('{"type":"response.create"}'), false, {
+    forward: async () => {},
+    observe: (event) => { observed = event; },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.emit("message", Buffer.from(JSON.stringify({
+    type: "response.output_item.done", output_index: 0, item,
+  })), false);
+  socket.emit("message", Buffer.from(JSON.stringify({
+    type: "response.completed",
+    response: { id: "resp_ws_done_item", status: "completed" },
+  })), false);
+  await turn;
+  assert.deepEqual(observed.response.output, [item]);
+  session.close();
+
+  const logs = [], forwarded = [];
+  const broken = new OfficialWebSocketSession(
+    { authorization: "Bearer subscription" },
+    { createSocket: () => (socket = new FixtureSocket()), log: (event) => logs.push(event) },
+  );
+  const brokenTurn = broken.run(Buffer.from('{"type":"response.create"}'), false, {
+    forward: async (data) => forwarded.push(Buffer.from(data)),
+    observe: (event) => {
+      if (event.observationError) throw event.observationError;
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const event of [
+    { type: "response.output_item.done", output_index: 0, item },
+    { type: "response.output_item.done", output_index: 0, item: { ...item, encrypted_content: "conflict" } },
+    { type: "response.completed", response: { id: "resp_ws_conflict", status: "completed" } },
+  ])
+    socket.emit("message", Buffer.from(JSON.stringify(event)), false);
+  await brokenTurn;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(forwarded.length, 3);
+  assert.equal(logs.at(-1).observation_stage, "conflicting_output_item");
+  broken.close();
+});
+
+test("A8 incomplete official responses cannot install compaction checkpoints", async () => {
+  const gateway = createGateway(config(), {
+    resolveIdentity: async () => "chatgpt:fixture",
+  });
+  const headers = {
+    authorization: "Bearer subscription",
+    "thread-id": "thread-incomplete-compaction",
+  };
+  const item = { type: "compaction", encrypted_content: "opaque-incomplete" };
+  const request = {
+    model: "gpt-5.6-sol",
+    input: [{ role: "user", content: "fixture" }, { type: "compaction_trigger" }],
+  };
+  await assert.rejects(
+    gateway.engine.commitOfficialObservation(headers, request, {
+      id: "resp_incomplete_compaction",
+      status: "incomplete",
+      output: [item],
+    }),
+    (error) => error.type === "history_observation_incomplete",
+  );
+  await assert.rejects(
+    gateway.engine.requireObservedHistory(headers, { input: [item] }),
+    (error) =>
+      error.type === "history_observation_incomplete" &&
+      /checkpoint is unavailable/.test(error.message),
+  );
+  await gateway.close();
 });
 
 test("A8 missing observed history fails cross-provider migration explicitly", async (t) => {
@@ -1339,6 +1579,7 @@ test("A6 official WebSocket queues upstream messages while downstream forward is
 
 test("A6 cancelling an official WebSocket turn terminates and releases the upstream", async () => {
   let terminated = 0;
+  let observation;
   class HangingUpstream extends EventEmitter {
     constructor() {
       super();
@@ -1364,10 +1605,46 @@ test("A6 cancelling an official WebSocket turn terminates and releases the upstr
   const turn = session.run(Buffer.from('{"type":"response.create"}'), false, {
     signal: controller.signal,
     forward: async () => {},
+    observe: (event) => { observation = event; },
   });
   await new Promise((resolve) => setImmediate(resolve));
   controller.abort();
   await assert.rejects(turn, (error) => error.type === "cancelled");
   assert.equal(terminated, 1);
   assert.equal(session.active, null);
+  assert.equal(observation.observationError.observation.stage, "cancelled");
+});
+
+test("A8 a malformed WebSocket stream ending without a terminal fails observation", async () => {
+  class BrokenUpstream extends EventEmitter {
+    constructor() {
+      super();
+      this.readyState = 0;
+      queueMicrotask(() => {
+        this.readyState = 1;
+        this.emit("open");
+      });
+    }
+    send(_data, _options, callback) { callback(); }
+    close() { this.readyState = 3; this.emit("close"); }
+    terminate() { this.close(); }
+  }
+  let socket, observation;
+  const forwarded = [];
+  const session = new OfficialWebSocketSession(
+    { authorization: "Bearer subscription" },
+    { createSocket: () => (socket = new BrokenUpstream()) },
+  );
+  const turn = session.run(Buffer.from('{"type":"response.create"}'), false, {
+    forward: async (data) => forwarded.push(Buffer.from(data)),
+    observe: (event) => { observation = event; },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.emit("message", Buffer.from("not-json"), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  socket.close();
+  await assert.rejects(turn, (error) => error.type === "upstream_connection_error");
+  assert.equal(forwarded[0].toString(), "not-json");
+  assert.equal(observation.observationError.observation.stage, "parse_failed");
+  session.close();
 });

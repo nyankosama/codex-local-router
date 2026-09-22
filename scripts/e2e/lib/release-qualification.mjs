@@ -1,5 +1,5 @@
 export const RELEASE_QUALIFICATION = Object.freeze({
-  schemaVersion: 3,
+  schemaVersion: 4,
   type: "codex-local-router-release-qualification",
   cases: Object.freeze({
     profiles: Object.freeze([
@@ -27,8 +27,8 @@ export const RELEASE_QUALIFICATION = Object.freeze({
   budgets: Object.freeze({
     universalSearch: Object.freeze({ turns: 3, generations: 8, searches: 3 }),
     officialSearch: Object.freeze({ turns: 2, generations: 9, searches: 6 }),
-    historyMigration: Object.freeze({ turns: 14, generations: 18, searches: 0 }),
-    total: Object.freeze({ turns: 19, generations: 35, searches: 9 }),
+    historyMigration: Object.freeze({ turns: 20, generations: 36, searches: 0 }),
+    total: Object.freeze({ turns: 25, generations: 53, searches: 9 }),
   }),
 });
 
@@ -81,6 +81,7 @@ export function qualifyReleaseReceipts({ profiles, universalSearch, officialSear
       officialSearch.websocketProbe?.passed === true,
     historyMigrationPassed: historyMigration?.verdict === "PASS" &&
       exactCases(historyMigration.cases, RELEASE_QUALIFICATION.cases.historyMigration) &&
+      historyMigration.lifecycle?.officialHttpObservationPassed === true &&
       historyMigration.lifecycle?.legacyCheckpointRecoveryPassed === true &&
       historyMigration.lifecycle?.summaryReusePassed === true &&
       historyMigration.lifecycle?.gatewayErrorFree === true &&
@@ -121,7 +122,8 @@ export function qualifyReleaseReceipts({ profiles, universalSearch, officialSear
         verdict: historyMigration?.verdict ?? "NOT_RUN",
         cases: historyMigration?.cases ?? [],
         budget: historyBudget,
-        lifecyclePassed: historyMigration?.lifecycle?.legacyCheckpointRecoveryPassed === true &&
+        lifecyclePassed: historyMigration?.lifecycle?.officialHttpObservationPassed === true &&
+          historyMigration?.lifecycle?.legacyCheckpointRecoveryPassed === true &&
           historyMigration?.lifecycle?.summaryReusePassed === true &&
           historyMigration?.lifecycle?.gatewayErrorFree === true,
       },

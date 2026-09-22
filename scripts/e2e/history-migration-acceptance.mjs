@@ -27,7 +27,7 @@ const value = (name) => {
   return index < 0 ? undefined : argv[index + 1];
 };
 if (!flag("run")) {
-  console.error("History migration acceptance makes at most 18 real OpenAI, GLM and ai.feei model requests. Re-run with --run after reviewing docs/public/acceptance.md.");
+  console.error("History migration acceptance runs bounded HTTP and WebSocket lifecycle chains. Re-run with --run after reviewing docs/public/acceptance.md.");
   process.exit(2);
 }
 if (!process.env.ACCEPTANCE_COMMIT) throw Error("ACCEPTANCE_COMMIT is required");
@@ -38,22 +38,23 @@ const sourceCatalog = value("catalog") ?? join(homedir(), ".codex", "models_cach
 const sourceConfig = value("config") ?? join(homedir(), "Library", "Application Support", "Codex Local Router", "config.json");
 const officialModel = value("official-model") ?? "gpt-5.6-sol";
 const output = value("out") ? resolve(value("out")) : null;
-const maxGenerations = Number(value("max-generations") ?? 18);
-if (!Number.isInteger(maxGenerations) || maxGenerations < 1 || maxGenerations > 18)
-  throw Object.assign(Error("--max-generations must be an integer from 1 to 18"), {
+const maxGenerations = Number(value("max-generations") ?? 36);
+if (!Number.isSafeInteger(maxGenerations) || maxGenerations < 1)
+  throw Object.assign(Error("--max-generations must be a positive safe integer"), {
     code: "generation_budget_invalid",
   });
 
 const root = await mkdtemp(join(tmpdir(), "codex-router-history-migration-"));
 const workspace = join(root, "workspace");
 const configPath = join(root, "gateway.json");
-const budget = new FocusedAcceptanceBudget({ maxTurns: 14, maxGenerations });
+const budget = new FocusedAcceptanceBudget({ maxTurns: 20, maxGenerations });
 const cases = [];
 const gateways = [];
 let core;
 let source;
 let implementation = { commit: "working-tree" };
 let harnessError = null;
+let httpObservation = null;
 
 function normalizeTarget(target) {
   const next = structuredClone(target);
@@ -65,7 +66,7 @@ function normalizeTarget(target) {
   next.maxContextWindow = 270000;
   next.effectiveContextWindowPercent = 95;
   next.outputReserveTokens = 60000;
-  next.compression = { ...next.compression, mode: "summary", nativeMigrationSummary: true };
+  next.compression = { ...next.compression, nativeMigrationSummary: true };
   next.capabilities = {
     ...next.capabilities,
     responses: true,
@@ -125,18 +126,22 @@ async function startGateway(archivePath, seed, markerObservations) {
   return instance;
 }
 
-async function configureHome(home, gateway, model) {
+async function configureHome(home, gateway, model, transport) {
   const catalogPath = join(home, "models.json");
+  const modelProvider = transport === "http" ? "gateway_http" : "openai";
   await isolatedCodexHome({
     home,
     baseUrl: `${gateway.url}/subscription/v1`,
     catalogPath,
     authSource,
     model,
+    modelProvider,
+    supportsWebsockets: transport === "websocket",
     reasoningEffort: "low",
     webSearch: "disabled",
   });
   await writeCatalog({ sourceCatalogPath: sourceCatalog, config: gateway.config, targetPath: catalogPath });
+  return modelProvider;
 }
 
 async function waitForNotification(app, method, threadId, after, timeoutMs = 360000) {
@@ -183,6 +188,118 @@ async function turn(app, threadId, model, prompt) {
   } finally {
     budget.activeAbort = null;
   }
+}
+
+async function waitForHttpObservation(gateway, after, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = gateway.logs.slice(after).find((entry) =>
+      entry.transport === "http" && [
+        "official_history_observation_completed",
+        "official_history_observation_failed",
+        "official_history_observation_incomplete",
+      ].includes(entry.event));
+    if (found) return found;
+    await new Promise((done) => setTimeout(done, 25));
+  }
+  return null;
+}
+
+async function runHttpObservation() {
+  const home = join(root, "official-http-observation-home");
+  const archivePath = join(root, "official-http-observation.sqlite");
+  const instanceStart = gateways.length;
+  const gateway = await startGateway(archivePath, 0, []);
+  const modelProvider = await configureHome(home, gateway, officialModel, "http");
+  let app = startAppServer({ corePath: core.path, home, cwd: workspace });
+  let seedTurn;
+  let archiveBefore = null;
+  let archiveAfter = null;
+  let persistedCheckpoints = 0;
+  try {
+    await app.initialize("codex_local_router_official_http_observation");
+    const thread = await app.rpc("thread/start", {
+      model: officialModel,
+      modelProvider,
+      cwd: workspace,
+      ephemeral: false,
+      sandbox: "read-only",
+      approvalPolicy: "never",
+    });
+    const seedObservationStart = gateway.logs.length;
+    seedTurn = await turn(app, thread.thread.id, officialModel,
+      "Remember the exact synthetic fact HTTP_OBSERVATION_FACT. Reply only ACK. Do not call tools.");
+    await waitForHttpObservation(gateway, seedObservationStart);
+    archiveBefore = gateway.archive.stats();
+    const observationStart = gateway.logs.length;
+    await compact(app, thread.thread.id);
+    await waitForHttpObservation(gateway, observationStart);
+    archiveAfter = gateway.archive.stats();
+    persistedCheckpoints = gateway.archive.checkpoints({
+      owner: `chatgpt:${gateway.subscriptionAccountId}`,
+      thread: thread.thread.id,
+      branch: thread.thread.id,
+      hydrate: true,
+    }).length;
+  } finally {
+    await app?.close().catch(() => {});
+    await gateway.close().catch(() => {});
+  }
+  const instances = gateways.slice(instanceStart);
+  const logs = instances.flatMap((entry) => entry.logs);
+  const observations = logs.filter((entry) =>
+    entry.event === "official_history_observation_completed" && entry.transport === "http");
+  const failures = logs.filter((entry) => [
+    "official_history_observation_failed",
+    "official_history_observation_incomplete",
+  ].includes(entry.event));
+  const assertions = {
+    seedCompleted: seedTurn?.status === "completed",
+    completedObservation: observations.some((entry) =>
+      entry.terminal_type === "response.completed" && entry.item_count > 0),
+    nativeCompactionReturned: observations.some((entry) =>
+      entry.checkpoint_count > 0),
+    checkpointPersisted: persistedCheckpoints > 0,
+    noObservationFailure: failures.length === 0,
+  };
+  httpObservation = {
+    passed: Object.values(assertions).every(Boolean),
+    assertions,
+    counts: {
+      observations: observations.length,
+      recordDelta: archiveBefore == null || archiveAfter == null
+        ? 0
+        : archiveAfter.records - archiveBefore.records,
+      versionDelta: archiveBefore == null || archiveAfter == null
+        ? 0
+        : archiveAfter.versions - archiveBefore.versions,
+      persistedCheckpoints,
+    },
+    terminal: observations.map((entry) => ({
+      requestId: entry.request_id ?? null,
+      encoding: entry.encoding ?? null,
+      contentType: entry.content_type ?? null,
+      contentTypeSource: entry.content_type_source ?? null,
+      responseBytes: entry.response_bytes ?? null,
+      terminalType: entry.terminal_type ?? null,
+      itemCount: entry.item_count ?? null,
+      checkpointCount: entry.checkpoint_count ?? null,
+      itemTypes: entry.item_types ?? [],
+      outputSource: entry.output_source ?? null,
+    })),
+    failures: failures.map((entry) => ({
+      event: entry.event,
+      requestId: entry.request_id ?? null,
+      type: entry.type ?? null,
+      stage: entry.observation_stage ?? null,
+      contentType: entry.content_type ?? null,
+      reason: entry.reason ?? null,
+      encoding: entry.encoding ?? null,
+      responseBytes: entry.response_bytes ?? null,
+      terminalType: entry.terminal_type ?? null,
+      itemCount: entry.item_count ?? null,
+    })),
+  };
 }
 
 const normalized = (value) => String(value ?? "").replaceAll("_", "").toLowerCase();
@@ -243,7 +360,7 @@ function equalityLabels(values, prefix) {
   });
 }
 
-async function runChain({ name, targetId, legacyCheckpoint, seed }) {
+async function runChain({ name, targetId, legacyCheckpoint, seed, transport }) {
   const home = join(root, `${name}-home`);
   const archivePath = join(root, `${name}.sqlite`);
   const fixturePath = join(workspace, `${name}.txt`);
@@ -262,7 +379,7 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
   const target = gateway.config.targets[targetId];
   const targetModel = target.app.modelId;
   const providerHost = new URL(gateway.config.providers[target.provider].baseUrl).host;
-  await configureHome(home, gateway, officialModel);
+  const modelProvider = await configureHome(home, gateway, officialModel, transport);
   let app = startAppServer({ corePath: core.path, home, cwd: workspace });
   let targetTurn;
   let reuseTurn;
@@ -274,7 +391,7 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
     await app.initialize(`codex_local_router_${name}`);
     const parent = await app.rpc("thread/start", {
       model: officialModel,
-      modelProvider: "openai",
+      modelProvider,
       cwd: workspace,
       ephemeral: false,
       sandbox: "read-only",
@@ -292,7 +409,7 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
     const fork = await app.rpc("thread/fork", {
       threadId: parentId,
       model: officialModel,
-      modelProvider: "openai",
+      modelProvider,
       cwd: workspace,
       ephemeral: false,
       excludeTurns: true,
@@ -308,13 +425,13 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
       seedLegacyCheckpointFixture(gateway, parentId, childId);
       await gateway.close();
       gateway = await startGateway(archivePath, seed + 50, markerObservations);
-      await configureHome(home, gateway, officialModel);
+      await configureHome(home, gateway, officialModel, transport);
       app = startAppServer({ corePath: core.path, home, cwd: workspace });
       await app.initialize(`codex_local_router_${name}_legacy_restart`);
       await app.rpc("thread/resume", {
         threadId: childId,
         model: officialModel,
-        modelProvider: "openai",
+        modelProvider,
         cwd: workspace,
         excludeTurns: true,
         sandbox: "read-only",
@@ -340,13 +457,13 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
     app = null;
     await gateway.close();
     gateway = await startGateway(archivePath, seed + 100, markerObservations);
-    await configureHome(home, gateway, officialModel);
+    await configureHome(home, gateway, officialModel, transport);
     app = startAppServer({ corePath: core.path, home, cwd: workspace });
     await app.initialize(`codex_local_router_${name}_restart`);
     const resumed = await app.rpc("thread/resume", {
       threadId: childId,
       model: officialModel,
-      modelProvider: "openai",
+      modelProvider,
       cwd: workspace,
       excludeTurns: true,
       sandbox: "read-only",
@@ -383,7 +500,10 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
   const repeats = classifyTurnRepeats(logs);
   const recoveryIndex = logs.findIndex((entry) => entry.event === "checkpoint_view_recovered");
   const targetRouteIndex = logs.findIndex((entry) =>
-    entry.event === "route" && entry.provider === target.provider && entry.transport === "websocket");
+    entry.event === "route" && entry.provider === target.provider && entry.transport === transport);
+  const observationLogs = logs.filter((entry) =>
+    entry.event === "official_history_observation_completed" &&
+    entry.transport === transport);
   const assertions = {
     twoNativeCompactions: compacted === 2,
     targetCompleted: targetTurn.status === "completed",
@@ -407,13 +527,17 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
       ((!entry.subscriptionBearer && !entry.accountHeader) || entry.official) &&
       (!entry.providerCredential || !entry.official)),
     upstreamCompleted: outbound.length > 0 && outbound.every(successfulOutbound),
-    appWebSocketObserved: logs.some((entry) =>
+    appTransportObserved: logs.some((entry) =>
       entry.event === "route" && entry.provider === target.provider &&
-      entry.transport === "websocket"),
+      entry.transport === transport),
+    officialCompactionObserved: observationLogs.some((entry) =>
+      entry.terminal_type === "response.completed" && entry.item_count > 0),
     restartContinuationUsedSameFork: Boolean(parentId && childId && parentId !== childId),
   };
   cases.push({
     name,
+    compressionOwner: "chatgpt-subscription",
+    legacyCheckpoint,
     passed: Object.values(assertions).every(Boolean),
     assertions,
     counts: {
@@ -423,8 +547,15 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
       officialResponses: outbound.filter((entry) => entry.official && entry.path.endsWith("/responses")).length,
       toolExecutions: commands.length,
       gatewayInstances: instances.length,
+      officialObservations: observationLogs.length,
     },
     diagnostics: {
+      requestIds: [...new Set(logs.map((entry) => entry.request_id).filter(Boolean))],
+      timings: outbound.map((entry) => ({
+        firstSubstantiveMs: entry.firstSubstantiveMs ?? null,
+        firstTextMs: entry.firstTextMs ?? null,
+        totalMs: entry.totalMs ?? null,
+      })),
       targetStatus: targetTurn.status,
       targetFailure: targetTurn.turnFailure,
       officialReturnStatus: officialTurn.status,
@@ -488,8 +619,17 @@ async function runChain({ name, targetId, legacyCheckpoint, seed }) {
           thread: threadLabels[index],
           session: sessionLabels[index],
         })),
+      officialObservations: observationLogs.map((entry) => ({
+        requestId: entry.request_id ?? null,
+        transport: entry.transport,
+        encoding: entry.encoding ?? null,
+        responseBytes: entry.response_bytes ?? null,
+        terminalType: entry.terminal_type ?? null,
+        itemCount: entry.item_count ?? null,
+        outputSource: entry.output_source ?? null,
+      })),
     },
-    transport: "app-websocket",
+    transport: `app-${transport}`,
   });
   if (!cases.at(-1).passed)
     throw Object.assign(Error("history migration acceptance case failed"), { code: "acceptance_case_failed" });
@@ -510,8 +650,21 @@ try {
   await mkdir(join(root, "tool-registry"), { recursive: true, mode: 0o700 });
   await writeFile(configPath, `${JSON.stringify(base)}\n`, { mode: 0o600 });
   core = await resolveCore();
-  await runChain({ name: "official-fork-glm-flash", targetId: "glm-flash", legacyCheckpoint: true, seed: 1 });
-  await runChain({ name: "official-fork-third-party-gpt", targetId: "feei-sol", legacyCheckpoint: false, seed: 2 });
+  await runHttpObservation();
+  await runChain({
+    name: "official-fork-glm-flash",
+    targetId: "glm-flash",
+    legacyCheckpoint: false,
+    seed: 1,
+    transport: "websocket",
+  });
+  await runChain({
+    name: "official-fork-third-party-gpt",
+    targetId: "feei-sol",
+    legacyCheckpoint: true,
+    seed: 2,
+    transport: "websocket",
+  });
 } catch (error) {
   const diagnostics = gateways.flatMap((entry) => entry.logs)
     .filter((entry) => entry.event?.startsWith("checkpoint_") || [
@@ -538,19 +691,22 @@ try {
 }
 
 const summary = {
-  verdict: !harnessError && cases.length === 2 && cases.every((entry) => entry.passed) ? "PASS" : "FAIL",
+  verdict: !harnessError && httpObservation?.passed === true &&
+    cases.length === 2 && cases.every((entry) => entry.passed) ? "PASS" : "FAIL",
   implementation,
   driver: core ? { source: core.source, version: core.version, sha256: core.sha256 } : null,
   budget: budget.snapshot(),
   cases,
   lifecycle: {
+    officialHttpObservationPassed: httpObservation?.passed === true,
     legacyCheckpointRecoveryPassed: cases.some((entry) =>
-      entry.name === "official-fork-glm-flash" && entry.assertions.legacyCheckpointRecovered),
+      entry.legacyCheckpoint && entry.assertions.legacyCheckpointRecovered),
     summaryReusePassed: cases.length === 2 && cases.every((entry) =>
       entry.assertions.reuseCompleted && entry.assertions.summaryGeneratedExactlyOnce),
     gatewayErrorFree: cases.length === 2 && cases.every((entry) =>
       entry.assertions.gatewayErrorFree && entry.assertions.noReconnectRetries),
   },
+  httpObservation,
   harnessError,
   appUi: "not-tested",
 };

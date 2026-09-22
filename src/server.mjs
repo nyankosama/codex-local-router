@@ -260,7 +260,7 @@ export function createGateway(config, options = {}) {
         const custom = isResponses && engine.config.subscription.customModels?.[body.model];
         let managed = false, officialClassification;
         if (custom) {
-          await engine.requireObservedHistory(req.headers, body);
+          await engine.requireObservedHistory(req.headers, body, custom);
           managed = true;
         } else if (isResponses) {
           officialClassification = await engine.officialRequestNeedsEngine(req.headers, body);
@@ -297,7 +297,12 @@ export function createGateway(config, options = {}) {
             observe: isResponses
               ? (observation) => engine.queueOfficialObservation(
                   officialClassification,
-                  () => engine.observeOfficial(req.headers, body, observation),
+                  () => engine.observeOfficial(
+                    req.headers,
+                    body,
+                    observation,
+                    { request_id: requestId },
+                  ),
                 )
               : undefined,
           });
@@ -532,7 +537,7 @@ export function createGateway(config, options = {}) {
               engine.config.subscription.customModels?.[body.model];
             let managed = entry !== "subscription", officialClassification;
             if (custom) {
-              await engine.requireObservedHistory(headers, body);
+              await engine.requireObservedHistory(headers, body, custom);
               managed = true;
             } else if (entry === "subscription") {
               officialClassification = await engine.officialRequestNeedsEngine(headers, body);
@@ -560,7 +565,12 @@ export function createGateway(config, options = {}) {
                   ? undefined
                   : engine.queueOfficialObservation(
                       officialClassification,
-                      () => engine.observeOfficialEvent(headers, request, event),
+                      () => engine.observeOfficialEvent(
+                        headers,
+                        request,
+                        event,
+                        { request_id: requestId },
+                      ),
                     );
               await officialSession.run(data, isBinary, {
                 signal: active.signal,
@@ -638,7 +648,7 @@ export function createGateway(config, options = {}) {
                 ...body,
                 input: warmInput,
               });
-              engine.state.save(ctx, response, replay.body.input, null);
+              engine.state.save(ctx, response, replay.body.input, routed.target);
               await send({
                 type: "response.created",
                 response: { ...response, status: "in_progress" },

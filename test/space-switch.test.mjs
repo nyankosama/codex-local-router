@@ -205,6 +205,54 @@ test("same-space edits preserve the current Codex selection through apply and ro
   assert.equal(failed.recovered, true, JSON.stringify(failed));
 });
 
+test("catalog-only tool mode changes do not drain or restart active Router turns", async (t) => {
+  const f = await fixture(t);
+  await beginSpaceSwitch("default", f.operations);
+  const compatible = runtimeConfig(f.catalog);
+  compatible.targets.custom.modelFamily = "openai-gpt";
+  compatible.targets.custom.capabilities = {
+    responses: true,
+    streaming: true,
+    toolCalling: true,
+    freeformTools: true,
+    nativeWebSearch: false,
+  };
+  await appendSpaceRevision("default", {
+    kind: "router",
+    source: "tool-mode-compatible",
+    config: compatible,
+    defaultCodexModel: "custom-model",
+  }, { env: f.env, expectedLatestRevision: 1 });
+  await beginSpaceSwitch("default@2", f.operations);
+  const changed = structuredClone(compatible);
+  changed.targets.custom.app.toolMode = "code_mode_only";
+  await appendSpaceRevision("default", {
+    kind: "router",
+    source: "catalog-only-tool-mode",
+    config: changed,
+    defaultCodexModel: "custom-model",
+  }, { env: f.env, expectedLatestRevision: 2 });
+  let drains = 0, installs = 0;
+  const applied = await beginSpaceSwitch("default@3", {
+    ...f.operations,
+    drain: async () => {
+      drains++;
+      return { drained: false, wasRunning: true, reason: "active_turn_timeout" };
+    },
+    installService: async () => {
+      installs++;
+      throw Error("catalog-only switch must not restart the Router");
+    },
+  });
+  assert.deepEqual(applied.active, { space: "default", revision: 3 });
+  assert.equal(drains, 0);
+  assert.equal(installs, 0);
+  assert.equal(
+    JSON.parse(await readFile(f.configPath, "utf8")).targets.custom.app.toolMode,
+    "code_mode_only",
+  );
+});
+
 test("official captures a changed default before leaving and restores exact protected versions", async (t) => {
   const f = await fixture(t);
   await writeFile(join(f.home, "config.toml"), f.userConfig.replace("gpt-5.5", "gpt-6-astra"));
@@ -465,6 +513,22 @@ test("coordinator polling does not hold the transaction lock and a pending switc
   assert.equal((await cancelSpaceSwitch(f.operations)).changed, true);
   f.setAppRunning(false);
   assert.equal((await coordinator).changed, false);
+  assert.equal(await readSpaceTransaction(f.env), null);
+});
+
+test("coordinator ignores unknown initial and polled App states until it observes an explicit stop", async (t) => {
+  const f = await fixture(t);
+  f.setAppRunning(true);
+  await beginSpaceSwitch("default", f.operations);
+  const states = [null, true, null, false, false];
+  const applied = await resumeSpaceSwitch({
+    ...f.operations,
+    coordinator: true,
+    coordinatorWaitMs: 1000,
+    appPollMs: 1,
+    appRunning: async () => states.length ? states.shift() : false,
+  });
+  assert.deepEqual(applied.active, { space: "default", revision: 1 });
   assert.equal(await readSpaceTransaction(f.env), null);
 });
 

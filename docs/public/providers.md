@@ -51,8 +51,8 @@ The source currently includes these presets:
 | Preset | Provider path | Important boundary |
 |---|---|---|
 | `opencode-go/deepseek-v4.1-flash` | OpenCode Go Responses | Accepted legacy path; generic template, direct Code mode, and direct multi-agent metadata are not qualified |
-| `feei/gpt-5.6-sol` | ai.feei Responses | Distinct App model ID; GPT policies and optional features remain explicit |
-| `feei/gpt-6-astra` | ai.feei Responses | Distinct App model ID; GPT policies and optional features remain explicit |
+| `feei/gpt-5.6-sol` | ai.feei Responses | Same-target native compaction qualified; cross-target migration and optional GPT features remain explicit |
+| `feei/gpt-6-astra` | ai.feei Responses | Same-target native compaction qualified; no implicit compatibility with Sol |
 
 Fresh setup can assign neutral local IDs explicitly:
 
@@ -89,7 +89,7 @@ codex-local-router model add --id glm-flash \
   --protocol responses \
   --context-window 270000 \
   --input-modalities text \
-  --compression summary \
+  --compression unsupported \
   --template legacy \
   --display-name "GLM 5.3 Flash Coding Plan" \
   --reasoning-levels low,high,max \

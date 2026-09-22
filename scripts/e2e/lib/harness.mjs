@@ -273,6 +273,8 @@ export async function isolatedCodexHome({
   catalogPath,
   authSource,
   model,
+  modelProvider = "openai",
+  supportsWebsockets,
   reasoningEffort = "low",
   webSearch = "disabled",
   extra = "",
@@ -284,10 +286,16 @@ export async function isolatedCodexHome({
   // child write into the user's active login.
   const authBytes = await readFile(authSource);
   await writeFile(`${home}/auth.json`, authBytes, { mode: 0o600 });
+  const openaiBaseUrl = modelProvider === "openai"
+    ? `openai_base_url = "${baseUrl}"\n`
+    : "";
+  const customProvider = modelProvider === "openai"
+    ? ""
+    : `\n[model_providers.${modelProvider}]\nname = "Isolated Gateway"\nbase_url = "${baseUrl}"\nwire_api = "responses"\nrequires_openai_auth = true\nsupports_websockets = ${supportsWebsockets === true}\n`;
   const toml =
-    `model_provider = "openai"\nmodel = "${model}"\nmodel_reasoning_effort = "${reasoningEffort}"\n` +
+    `model_provider = "${modelProvider}"\nmodel = "${model}"\nmodel_reasoning_effort = "${reasoningEffort}"\n` +
     `${webSearch == null ? "" : `web_search = "${webSearch}"\n`}` +
-    `openai_base_url = "${baseUrl}"\nmodel_catalog_json = "${catalogPath}"\n${extra}`;
+    `${openaiBaseUrl}model_catalog_json = "${catalogPath}"\n${extra}${customProvider}`;
   await writeFile(`${home}/config.toml`, toml, { mode: 0o600 });
   return home;
 }
@@ -574,6 +582,12 @@ export async function startIsolatedGateway({
         ...input.map((x) => x.type ?? x.role),
         ...messages.map((x) => `${x.role}${x.tool_calls ? "+tool_calls" : ""}`),
       ],
+      compactionFingerprints: input
+        .filter((item) =>
+          item?.type === "compaction" &&
+          typeof item.encrypted_content === "string")
+        .map((item) =>
+          createHash("sha256").update(item.encrypted_content).digest("hex")),
       contentTypes: [
         ...input
           .filter((x) => Array.isArray(x.content))

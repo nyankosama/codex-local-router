@@ -150,8 +150,34 @@ test("A10 isolated official-search home can preserve the Codex default search mo
     authSource: auth,
     model: "gpt-fixture",
     webSearch: null,
+    extra: "[features]\nfixture = true\n",
   });
-  assert.doesNotMatch(await readFile(join(home, "config.toml"), "utf8"), /^web_search\s*=/m);
+  const config = await readFile(join(home, "config.toml"), "utf8");
+  assert.doesNotMatch(config, /^web_search\s*=/m);
+  assert.ok(config.indexOf("openai_base_url") < config.indexOf("[features]"));
+});
+
+test("A10 isolated custom provider can force Responses HTTP transport", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "router-http-provider-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const auth = join(root, "auth-source.json");
+  const home = join(root, "codex-home");
+  await writeFile(auth, "{}", { mode: 0o600 });
+  await isolatedCodexHome({
+    home,
+    baseUrl: "http://127.0.0.1:32123/subscription/v1",
+    catalogPath: join(root, "models.json"),
+    authSource: auth,
+    model: "gpt-fixture",
+    modelProvider: "gateway_http",
+    supportsWebsockets: false,
+  });
+  const config = await readFile(join(home, "config.toml"), "utf8");
+  assert.match(config, /^model_provider = "gateway_http"$/m);
+  assert.match(config, /^\[model_providers\.gateway_http\]$/m);
+  assert.match(config, /^requires_openai_auth = true$/m);
+  assert.match(config, /^supports_websockets = false$/m);
+  assert.doesNotMatch(config, /^openai_base_url\s*=/m);
 });
 
 test("A10 CLI child isolates HOME together with CODEX_HOME", async (t) => {

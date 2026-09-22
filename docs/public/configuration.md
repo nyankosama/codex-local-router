@@ -2,7 +2,7 @@
 
 The default configuration is stored under `~/Library/Application Support/Codex Local Router/config.json`. Override it with `CODEX_LOCAL_ROUTER_CONFIG` or `--config`.
 
-Runtime configuration remains schema 3. Configuration-space storage is schema 1 and integration state is schema 4. Ownership is explicit:
+Runtime configuration is schema 4. Configuration-space storage is schema 1 and integration state is schema 4. Ownership is explicit:
 
 - global machine layer: `listen`, `access`, `history`, `maxBodyBytes`, `maxConnections`, `timeoutMs`, and the official catalog source path;
 - versioned space layer: route mode and target choice, `providers`, `targets`, `rules`, `pluginTools`, `webSearch`, `standaloneSearch`, subscription routing, available App models, and the default Codex model.
@@ -31,7 +31,7 @@ transactions/space-switch.json     one pending/recoverable switch
 
 Names match `[a-z0-9][a-z0-9._-]{0,63}`. A revision stores credential references only: environment variable names or Keychain service/account pairs. Plaintext Provider credentials, ChatGPT tokens, `auth.json`, user MCP, Skills, Hooks, prompts, and conversation history are excluded. `official@1` is permanently retained.
 
-Within a Router space, schema 3 keeps three model-routing layers:
+Within a Router space, schema 4 keeps three model-routing layers:
 
 - `providers`: base URL, adapter, endpoint paths, credential reference, message-phase policy, timeout, and concurrency.
 - `targets`: unique target ID, provider, upstream model, protocol, context window, input modalities, tools, reasoning levels, search, compression, and Codex catalog metadata.
@@ -250,8 +250,8 @@ Built-in presets, Provider-specific commands, public examples, and their qualifi
 
 Declarations are validated rather than guessed:
 
-- `--context-window` is required by schema 3. Too small a value causes premature summarization; too large a value defers the failure to the upstream.
-- `--compression` states what the channel can do with a full history: `native` (the channel accepts the stored original directly and an explicit same-account compatibility target set is required), `summary` (one source-model summary is allowed after an explicit context-limit rejection), or `unsupported` (never lossy). `--native-migration-summary` is a separate, default-off option for a trusted official opaque compaction window; it is valid only in `summary` mode and never turns an incomplete lineage into a valid source.
+- `--context-window` is required by schema 4. It sizes migration and diagnostics; same-target native compaction remains channel-owned.
+- `--compression` states who owns same-target compaction: `native` forwards the channel's opaque checkpoint and defaults compatibility to the same account and target, `summary` explicitly authorizes one lossy Gateway summary, and `unsupported` reports that compaction is unavailable. Native failure never falls back to `summary`. `--native-migration-summary` is an independent, default-off authorization for one source-model summary when a trusted opaque or portable history cannot fit an incompatible destination; it never turns an incomplete lineage into a valid source.
 - `--input-modalities` must match the channel. `chat_completions` targets cannot accept images. An image sent to a text-only target is described by a configured source model when one exists, otherwise the request is rejected with `image_migration_unavailable`.
 - `--no-tools`, `--no-streaming`, `--freeform-tools`, and `--native-search` (Responses only) keep the declared capabilities honest. `--app-profile standard-tools|lite-search` chooses the App contract. `--search-source subscription|provider|disabled` controls standalone search; `--supports-search-tool`, `--no-supports-search-tool`, `--responses-lite`, and `--no-responses-lite` remain compatibility inputs. Contradictory profile/search/transport combinations are invalid. A chat_completions target cannot declare an App capability profile, `--native-search`, or Provider standalone search.
 - `--model-family openai-gpt|other` opts a target into the corresponding default. `--plugin-policy passthrough|third-party-gpt-default|allowlist` selects an explicit policy; `--allowed-plugins` is required with `allowlist`.

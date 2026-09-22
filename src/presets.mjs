@@ -13,7 +13,7 @@ const PRESETS = Object.freeze({
       effectiveContextWindowPercent: 95,
       outputReserveTokens: 16384,
       inputModalities: ["text", "image"],
-      compression: { mode: "summary" },
+      compression: { mode: "unsupported" },
       capabilities: {
         responses: true,
         toolCalling: true,
@@ -44,7 +44,7 @@ const PRESETS = Object.freeze({
       effectiveContextWindowPercent: 95,
       outputReserveTokens: 16384,
       inputModalities: ["text", "image"],
-      compression: { mode: "summary" },
+      compression: { mode: "native" },
       capabilities: {
         responses: true,
         toolCalling: true,
@@ -78,7 +78,7 @@ const PRESETS = Object.freeze({
       effectiveContextWindowPercent: 95,
       outputReserveTokens: 16384,
       inputModalities: ["text", "image"],
-      compression: { mode: "summary" },
+      compression: { mode: "native" },
       capabilities: {
         responses: true,
         toolCalling: true,

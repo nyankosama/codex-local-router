@@ -255,7 +255,7 @@ export async function installSpaceSwitcher(options = {}) {
     const label = `${domain()}/${SPACE_SWITCHER_LABEL}`;
     const loaded = await control(["print", label]).then(() => true, () => false);
     if (prior !== desired) {
-      if (loaded) await control(["bootout", domain(), plist]);
+      if (loaded) await control(["bootout", label]);
       await atomicWrite(plist, desired, 0o600);
     }
     if (!loaded || prior !== desired) {
@@ -295,7 +295,10 @@ export async function uninstallSpaceSwitcher(options = {}) {
   return withSpaceSwitcherLock(paths, async () => {
     const plist = spaceSwitcherLaunchAgentPath(env);
     if (!options.skipBootout)
-      await (options.launchctl ?? launchctl)(["bootout", domain(), plist]).catch(() => {});
+      await (options.launchctl ?? launchctl)([
+        "bootout",
+        `${domain()}/${SPACE_SWITCHER_LABEL}`,
+      ]).catch(() => {});
     await rm(plist, { force: true });
     await rm(paths.spaceSwitcherInstall, { force: true });
     return { removed: true };

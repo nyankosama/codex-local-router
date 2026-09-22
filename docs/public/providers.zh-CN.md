@@ -51,8 +51,8 @@ codex-local-router model probe --id my-model --live
 | Preset | Provider 路径 | 重要边界 |
 |---|---|---|
 | `opencode-go/deepseek-v4.1-flash` | OpenCode Go Responses | 保留已接受的 legacy 路径；通用模板、直接 Code mode 和直接多代理元数据尚未准出 |
-| `feei/gpt-5.6-sol` | ai.feei Responses | 使用独立 App 模型 ID；GPT 策略和可选能力仍需显式配置 |
-| `feei/gpt-6-astra` | ai.feei Responses | 使用独立 App 模型 ID；GPT 策略和可选能力仍需显式配置 |
+| `feei/gpt-5.6-sol` | ai.feei Responses | 已验收同 target 原生压缩；跨 target 迁移和可选 GPT 能力保持显式 |
+| `feei/gpt-6-astra` | ai.feei Responses | 已验收同 target 原生压缩；不与 Sol 隐式兼容 |
 
 全新 setup 可以显式使用中性本地 ID：
 
@@ -89,7 +89,7 @@ codex-local-router model add --id glm-flash \
   --protocol responses \
   --context-window 270000 \
   --input-modalities text \
-  --compression summary \
+  --compression unsupported \
   --template legacy \
   --display-name "GLM 5.3 Flash Coding Plan" \
   --reasoning-levels low,high,max \
