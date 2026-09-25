@@ -17,12 +17,49 @@ const cases = (names) => names.map((name) => ({ name, passed: true }));
 
 function receipts() {
   return {
+    deterministic: {
+      verdict: "PASS",
+      implementation: { commit },
+      checks: { cleanWorktree: true, diffCheck: true, npmTest: true, packageAudit: true },
+    },
     profiles: {
       verdict: "PASS",
       implementation: { commit },
       harness: driver,
       performance: { softHealthLinesMet: true },
       cases: cases(RELEASE_QUALIFICATION.cases.profiles),
+    },
+    compressionCapability: {
+      verdict: "PASS",
+      implementation: { commit },
+      driver,
+      budget: {
+        turns: 6, generations: 6, searchRequests: 0,
+        blockedGenerations: 0, blockedSearchRequests: 0, implicitRetries: 0,
+      },
+      cases: RELEASE_QUALIFICATION.cases.compressionCapability.map((name) => ({
+        name,
+        target: name,
+        result: "provider-unsupported",
+        passed: true,
+      })),
+    },
+    nativeCompaction: {
+      verdict: "PASS",
+      implementation: { commit },
+      driver,
+      budget: {
+        turns: 32, generations: 56, searchRequests: 0,
+        blockedGenerations: 0, blockedSearchRequests: 0, implicitRetries: 0,
+      },
+      cases: RELEASE_QUALIFICATION.cases.nativeCompaction.map((name) => ({
+        name,
+        passed: true,
+        assertions: {
+          nativeCompactionsCompleted: true,
+          gatewaySummaryCallsZero: true,
+        },
+      })),
     },
     universalSearch: {
       verdict: "PASS",
@@ -51,14 +88,38 @@ function receipts() {
       implementation: { commit },
       driver,
       budget: {
-        turns: 14, generations: 18, searchRequests: 0,
+        turns: 30, generations: 30, searchRequests: 0,
         blockedGenerations: 0, blockedSearchRequests: 0, implicitRetries: 0,
       },
       cases: cases(RELEASE_QUALIFICATION.cases.historyMigration),
       lifecycle: {
         officialHttpObservationPassed: true,
+        appSmokePassed: true,
         legacyCheckpointRecoveryPassed: true,
         summaryReusePassed: true,
+        targetCompressionPassed: true,
+        imageLifecyclePassed: true,
+        gatewayErrorFree: true,
+      },
+      equivalenceCoverage: Object.fromEntries([
+        "O->O", "O->G", "O->R", "G->O", "G->G",
+        "G->R", "R->O", "R->G", "R->R",
+      ].map((name) => [name, true])),
+    },
+    appSmoke: {
+      verdict: "PASS",
+      mode: "app-smoke",
+      implementation: { commit },
+      driver,
+      budget: {
+        turns: 12, generations: 14, searchRequests: 0,
+        blockedGenerations: 0, blockedSearchRequests: 0, implicitRetries: 0,
+      },
+      cases: cases(RELEASE_QUALIFICATION.cases.appSmoke),
+      lifecycle: {
+        appSmokePassed: true,
+        targetCompressionPassed: true,
+        imageLifecyclePassed: true,
         gatewayErrorFree: true,
       },
     },
@@ -74,8 +135,8 @@ test("release qualification covers the bounded equivalence classes", () => {
   };
   assert.equal(summary.verdict, "PASS");
   assert.deepEqual(summary.budget, {
-    turns: 19,
-    generations: 35,
+    turns: 85,
+    generations: 123,
     searchRequests: 9,
     blockedGenerations: 0,
     blockedSearchRequests: 0,
@@ -84,14 +145,32 @@ test("release qualification covers the bounded equivalence classes", () => {
   });
   assert.equal(validateReleaseQualification(summary, commit), summary);
 
+  const missingDeterministic = receipts();
+  missingDeterministic.deterministic.checks.npmTest = false;
+  assert.equal(qualifyReleaseReceipts(missingDeterministic, commit).verdict, "FAIL");
+  const missingAppSmoke = receipts();
+  missingAppSmoke.appSmoke.lifecycle.appSmokePassed = false;
+  assert.equal(qualifyReleaseReceipts(missingAppSmoke, commit).verdict, "FAIL");
   const overBudget = receipts();
   overBudget.universalSearch.budget.generations = 9;
   assert.equal(qualifyReleaseReceipts(overBudget, commit).verdict, "FAIL");
   const officialOverBudget = receipts();
   officialOverBudget.officialSearch.budget.generations = 10;
   assert.equal(qualifyReleaseReceipts(officialOverBudget, commit).verdict, "FAIL");
+  const capabilityOverBudget = receipts();
+  capabilityOverBudget.compressionCapability.budget.generations = 13;
+  assert.equal(qualifyReleaseReceipts(capabilityOverBudget, commit).verdict, "FAIL");
+  const inconclusiveCapability = receipts();
+  inconclusiveCapability.compressionCapability.cases[0].result = "inconclusive";
+  assert.equal(qualifyReleaseReceipts(inconclusiveCapability, commit).verdict, "FAIL");
+  const nativeOverBudget = receipts();
+  nativeOverBudget.nativeCompaction.budget.generations = 65;
+  assert.equal(qualifyReleaseReceipts(nativeOverBudget, commit).verdict, "FAIL");
+  const nativeSummaryFallback = receipts();
+  nativeSummaryFallback.nativeCompaction.cases[0].assertions.gatewaySummaryCallsZero = false;
+  assert.equal(qualifyReleaseReceipts(nativeSummaryFallback, commit).verdict, "FAIL");
   const historyOverBudget = receipts();
-  historyOverBudget.historyMigration.budget.generations = 37;
+  historyOverBudget.historyMigration.budget.generations = 49;
   assert.equal(qualifyReleaseReceipts(historyOverBudget, commit).verdict, "FAIL");
   const missingLifecycle = receipts();
   missingLifecycle.historyMigration.lifecycle.summaryReusePassed = false;
@@ -135,19 +214,41 @@ test("release qualification includes bounded compaction, fork and restart migrat
   assert.match(harness, /thread\/compact\/start/);
   assert.match(harness, /thread\/fork/);
   assert.match(harness, /thread\/resume/);
-  assert.match(harness, /maxTurns[^\n]+20/);
-  assert.match(harness, /maxGenerations[^\n]+36/);
+  assert.match(harness, /maxTurns[^\n]+40/);
+  assert.match(harness, /maxGenerations[^\n]+48/);
   assert.match(harness, /nativeMigrationSummary: true/);
   assert.doesNotMatch(harness, /mode: "summary", nativeMigrationSummary/);
   assert.match(harness, /appTransportObserved/);
   assert.match(harness, /officialCompactionObserved/);
   assert.match(harness, /legacyCheckpointRecovered/);
   assert.match(harness, /summaryReusePassed/);
+  assert.match(harness, /targetCompressionPassed/);
+  assert.match(harness, /imageLifecyclePassed/);
+  assert.match(harness, /equivalenceCoverage/);
+  assert.match(harness, /third-party-cross-channel/);
+  assert.match(harness, /type: "localImage"/);
+  assert.match(harness, /capability-receipt/);
+  assert.match(harness, /targetId === "deepseek" && deepseekCapability !== "supported"/);
+  assert.match(harness, /execFileAsync\("\/bin\/cat"/);
+  assert.match(harness, /type: "function_call"/);
+  assert.match(harness, /type: "function_call_output"/);
+  assert.match(harness, /toolEvidence\?\.executions === 1/);
+  assert.match(harness, /commands\.length === 0/);
+  assert.match(harness, /entry\.model === targets\[targetId\]\.model/);
+  assert.match(harness, /\["request_error", "ws_error"\]\.includes\(entry\.event\)/);
+  const sharedHarness = await readFile(resolve("scripts/e2e/lib/harness.mjs"), "utf8");
+  assert.match(sharedHarness, /input: input \?\? \[\{ type: "text"/);
   assert.match(harness, /gatewayErrorFree/);
   assert.match(harness, /noReconnectRetries/);
-  assert.match(harness, /configureHome\(home, gateway, officialModel, "http"\)/);
   assert.match(harness, /transport: "websocket"/);
   assert.match(harness, /runHttpObservation/);
+  assert.match(harness, /officialHttpTurn/);
+  assert.match(harness, /include: \["reasoning\.encrypted_content"\]/);
+  assert.match(harness, /reasoning: \{ effort: "low", summary: "auto" \}/);
+  assert.match(harness, /"x-codex-turn-metadata": JSON\.stringify\(turnMetadata\)/);
+  assert.match(harness, /\.\.\.\(seedTurn\.output \?\? \[\]\)/);
+  assert.match(harness, /type: "compaction_trigger"/);
+  assert.match(harness, /migrationSummariesAfterReuse === 1/);
   assert.match(harness, /officialHttpObservationPassed/);
   assert.match(harness, /hydrate: true/);
   assert.match(harness, /persistedCheckpoints > 0/);
@@ -158,6 +259,40 @@ test("release qualification includes bounded compaction, fork and restart migrat
   assert.match(harness, /gateway_http/);
   const releaseHarness = await readFile(resolve("scripts/e2e/release-qualification.mjs"), "utf8");
   assert.match(releaseHarness, /history-migration-acceptance\.mjs/);
+  assert.match(releaseHarness, /compression-capability\.mjs/);
+});
+
+test("compression capability probe is bounded, isolated and conclusive-only", async () => {
+  const harness = await readFile(resolve("scripts/e2e/compression-capability.mjs"), "utf8");
+  assert.match(harness, /maxGenerations[^\n]+12/);
+  assert.match(harness, /maxTurns[^\n]+10/);
+  assert.match(harness, /mode: "native"/);
+  assert.match(harness, /provider-unsupported/);
+  assert.match(harness, /previous_response_id: normalTurn\.body\?\.id/);
+  assert.match(harness, /State the exact synthetic fact from the previous response and end with CONTINUE_OK/);
+  assert.match(harness, /providerEndpoint\(provider, "responses"\)/);
+  assert.match(harness, /typeof item\?\.content === "string"/);
+  assert.match(harness, /\[400, 404, 405, 422, 501\]/);
+  assert.match(harness, /compaction_unsupported/);
+  assert.match(harness, /no502/);
+  assert.match(harness, /\/v1\/responses/);
+  assert.match(harness, /gateway-defect/);
+  assert.match(harness, /inconclusive/);
+  assert.match(harness, /CONTINUE_OK/);
+  assert.match(harness, /implicitRetries/);
+  assert.match(harness, /post-restart-continuation/);
+  assert.match(harness, /transportCode/);
+  assert.match(harness, /error\?\.cause\?\.code/);
+  assert.match(harness, /summary_started/);
+  assert.match(harness, /previous_response_id/);
+  assert.match(harness, /gateway\.archive\.history/);
+  assert.match(harness, /restartHistoryFactPreserved/);
+  assert.match(harness, /responseLineageContinued/);
+  assert.doesNotMatch(harness, /archivePath, seed \+ 100/);
+  assert.match(harness, /startIsolatedGateway/);
+  assert.doesNotMatch(harness, /writeConfigTransaction|beginSpaceSwitch|gracefulRestart/);
+  const budget = await readFile(resolve("scripts/e2e/lib/focused-budget.mjs"), "utf8");
+  assert.match(budget, /responses\/compact/);
 });
 
 test("native compaction qualification is bounded and rejects Gateway summaries", async () => {

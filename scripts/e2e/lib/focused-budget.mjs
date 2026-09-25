@@ -35,7 +35,11 @@ export class FocusedAcceptanceBudget {
     }
     // Compressed official requests may not expose a decoded model to the harness.
     // Count every Responses send unless it is positively identified as prewarm.
-    if (!event.path.endsWith("/responses") || event.generate === false)
+    if (
+      (!event.path.endsWith("/responses") &&
+        !event.path.endsWith("/responses/compact")) ||
+      event.generate === false
+    )
       return;
     this.generationAttempts++;
     if (event.requestFingerprint && this.generationFingerprints?.has(event.requestFingerprint)) {

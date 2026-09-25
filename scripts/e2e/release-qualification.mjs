@@ -37,15 +37,72 @@ await mkdir(output, { mode: 0o700 });
 const sha256 = (data) => createHash("sha256").update(data).digest("hex");
 const receipts = {};
 const minute = 60 * 1000;
+const capabilityReceipt = join(output, "compressionCapability.json");
 const stages = [
   ["profiles", "profile-qualification.mjs", [], 15 * minute],
+  ["compressionCapability", "compression-capability.mjs",
+    ["--run", "--max-generations", "12"], 30 * minute],
+  ["appSmoke", "history-migration-acceptance.mjs",
+    ["--run", "--app-smoke-only", "--max-generations", "24"],
+    25 * minute],
+  ["nativeCompaction", "native-compaction-acceptance.mjs",
+    ["--run", "--max-generations", "64"], 45 * minute],
   ["universalSearch", "universal-search-acceptance.mjs", ["--run", "--max-generations", "8"], 15 * minute],
   ["officialSearch", "official-search-acceptance.mjs", ["--run"], 15 * minute],
-  ["historyMigration", "history-migration-acceptance.mjs", ["--run", "--max-generations", "18"], 30 * minute],
+  ["historyMigration", "history-migration-acceptance.mjs",
+    [
+      "--run",
+      "--max-generations",
+      "48",
+      "--capability-receipt",
+      capabilityReceipt,
+    ],
+    45 * minute],
 ];
 let harnessError = null;
 
+const deterministicReceipt = join(output, "deterministic.json");
+const checks = {
+  cleanWorktree: false,
+  diffCheck: false,
+  npmTest: false,
+  packageAudit: false,
+};
+try {
+  const head = (await exec("git", ["rev-parse", "HEAD"], { cwd: projectRoot })).stdout.trim();
+  const status = (await exec("git", ["status", "--porcelain"], { cwd: projectRoot })).stdout.trim();
+  if (head !== commit) throw Error("commit_mismatch");
+  if (status) throw Error("worktree_not_clean");
+  checks.cleanWorktree = true;
+  await exec("git", ["show", "--check", "--oneline", "HEAD"], { cwd: projectRoot });
+  checks.diffCheck = true;
+  await exec("npm", ["test"], {
+    cwd: projectRoot,
+    timeout: 15 * minute,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  checks.npmTest = true;
+  await exec("npm", ["run", "audit:package"], {
+    cwd: projectRoot,
+    timeout: 5 * minute,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  checks.packageAudit = true;
+} catch (error) {
+  harnessError = { stage: "deterministic", type: error?.code ?? error?.message ?? "stage_failed" };
+}
+receipts.deterministic = {
+  verdict: Object.values(checks).every(Boolean) ? "PASS" : "FAIL",
+  implementation: { commit },
+  checks,
+};
+await writeFile(deterministicReceipt, `${JSON.stringify(receipts.deterministic, null, 2)}\n`, {
+  flag: "wx",
+  mode: 0o600,
+});
+
 for (const [name, script, args, timeout] of stages) {
+  if (harnessError) break;
   const receipt = join(output, `${name}.json`);
   try {
     await exec(process.execPath, [join(import.meta.dirname, script), ...args, "--out", receipt], {
@@ -60,7 +117,10 @@ for (const [name, script, args, timeout] of stages) {
     if (!receipts[name]) {
       try { receipts[name] = JSON.parse(await readFile(receipt, "utf8")); } catch {}
     }
-    harnessError = { stage: name, type: error?.code ?? "release_qualification_stage_failed" };
+    harnessError = {
+      stage: name,
+      type: receipts[name]?.harnessError?.type ?? error?.code ?? "release_qualification_stage_failed",
+    };
     break;
   }
 }
@@ -80,7 +140,7 @@ const summary = {
   harnessError,
   appUi: "not-tested",
 };
-if (!harnessError) validateReleaseQualification(summary, commit);
+if (summary.verdict === "PASS") validateReleaseQualification(summary, commit);
 await writeFile(join(output, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`, {
   flag: "wx",
   mode: 0o600,

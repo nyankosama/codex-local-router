@@ -23,6 +23,10 @@ import { isSubstantiveResponseEvent } from "../../../src/response-stream.mjs";
 
 const exec = promisify(execFile);
 export const APP_CORE = "/Applications/ChatGPT.app/Contents/Resources/codex";
+// app-server turns clientInfo.name into the originator and User-Agent that the
+// Gateway forwards to Codex-aware relays. Present the core binary's own Codex
+// CLI identity so live runs match real client traffic; case labels stay local.
+export const CODEX_CLIENT_NAME = "codex_cli_rs";
 
 export function finalizeTransportFailure(metadata, error, observedAt = Date.now()) {
   metadata.error = error?.type ?? "transport_error";
@@ -98,7 +102,12 @@ export function isolatedChildEnv(home, overrides = {}) {
     if (
       SENSITIVE_ENV_NAMES.has(name) ||
       /^(?:HTTP|HTTPS|ALL|NO)_PROXY$/i.test(name) ||
-      /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|SECRET|PASSWORD)$/.test(name)
+      /(?:API_KEY|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|SECRET|PASSWORD)$/.test(name) ||
+      // The invoking agent's host identity must not reach the Codex core: it
+      // becomes part of the User-Agent/originator seen by Codex-aware relays.
+      /^(?:TERM_PROGRAM|LC_TERMINAL)(?:_VERSION)?$/.test(name) ||
+      /^PI_/.test(name) ||
+      name === "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"
     ) delete env[name];
   }
   // HOME/CODEX_HOME are always authoritative for the run.  Caller overrides
@@ -1064,7 +1073,7 @@ export function startAppServer({ corePath, home, cwd }) {
       pending.set(id, { resolve, reject });
       child.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     });
-  const request = (threadId, model, text, { timeoutMs = 600000 } = {}) => {
+  const request = (threadId, model, text, { timeoutMs = 600000, input } = {}) => {
     const record = {
       threadId,
       model,
@@ -1100,7 +1109,11 @@ export function startAppServer({ corePath, home, cwd }) {
         });
       };
       threads.set(threadId, record);
-      rpc("turn/start", { threadId, model, input: [{ type: "text", text, text_elements: [] }] }).then(
+      rpc("turn/start", {
+        threadId,
+        model,
+        input: input ?? [{ type: "text", text, text_elements: [] }],
+      }).then(
         (started) => {
           record.turnId = started?.turn?.id;
         },
@@ -1116,8 +1129,11 @@ export function startAppServer({ corePath, home, cwd }) {
     rpc,
     request,
     notifications,
-    async initialize(name) {
-      await rpc("initialize", { clientInfo: { name, version: "1.0" }, capabilities: { experimentalApi: true } });
+    get exited() {
+      return exited;
+    },
+    async initialize(_caseLabel) {
+      await rpc("initialize", { clientInfo: { name: CODEX_CLIENT_NAME, version: "1.0" }, capabilities: { experimentalApi: true } });
       child.stdin.write('{"method":"initialized"}\n');
     },
     async close() {

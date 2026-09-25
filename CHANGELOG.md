@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.23 - 2026-09-25
+
+- Carry Gateway-projected history across a target switch before a native compaction: the destination compacts a portable view that keeps the compaction trigger (and, for the subscription target, current tool declarations), and a successful native compaction replaces the source view with the returned compaction window.
+- Add `e2e:compression-capability`, which probes DeepSeek and GLM Main once through the standard `/responses/compact` endpoint and freezes `supported` or `provider-unsupported`; unsupported targets must reject compaction locally and still pass continuation and restart.
+- Extend the default Release qualification to a 3×3 official / third-party GPT / other third-party switching matrix with compaction, legacy metadata-only checkpoint recovery, an independent App-server smoke run, and deterministic, app-smoke and capability stages bound to one commit and Codex core.
+- Drive live E2E with the Codex CLI client identity (`codex_cli_rs` / `codex_exec`) and strip host-agent terminal and `PI_*` variables, so Codex-aware relays see the same client as a real CLI or App.
+- Record per-request payload markers in history-migration receipts and use a synthetic tool fact, making restatement failures attributable without loosening the assertion.
+
 ## 0.5.22 - 2026-09-22
 
 - Make same-target compression native-first: channel-owned opaque checkpoints pass through HTTP and App WebSocket without Gateway summary fallback or token-estimate blocking, and trusted native continuation survives restart without a portable original.
