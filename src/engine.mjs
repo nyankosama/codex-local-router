@@ -1398,6 +1398,7 @@ export class Engine {
         correlation,
         lease.rule,
         startedAt,
+        previousTarget,
       );
       return;
     }
@@ -2277,6 +2278,7 @@ export class Engine {
     correlation,
     rule,
     startedAt,
+    previousTarget,
   ) {
     const mode =
       target.compression?.mode ??
@@ -2362,10 +2364,23 @@ export class Engine {
       const expanded = expandCheckpoints(this.state, ctx, body.input, target, {
         diagnostics: checkpointDiagnostics,
       });
+      const crossTargetProjectedHistory =
+        previousTarget?.id != null &&
+        previousTarget.id !== target.id &&
+        hasGatewayProjectedHistory(expanded.input);
+      const input = crossTargetProjectedHistory
+        ? portableItems(expanded.input, {
+            preserveCompaction: true,
+            preserveCompactionTrigger: true,
+            preserveAdditionalTools: target.provider === "chatgpt-subscription",
+          })
+        : expanded.input;
+      if (crossTargetProjectedHistory)
+        original = input.filter((item) => item.type !== "compaction_trigger");
       for await (const event of this.sample(
         config,
         target,
-        { ...body, input: expanded.input },
+        { ...body, input },
         ctx,
         signal,
         { correlation },
@@ -2397,6 +2412,7 @@ export class Engine {
     const items = response?.output?.filter(isCompaction) ?? [];
     if (response?.status !== "completed" || items.length !== 1)
       throw fail("invalid_compaction_response", 502);
+    if (native) view = compactionWindow(response.output, items[0]);
     const historyVersion = this.saveResponse(
       ctx,
       response,

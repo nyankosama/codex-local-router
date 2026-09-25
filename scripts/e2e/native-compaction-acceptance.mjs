@@ -71,10 +71,14 @@ async function compact(app, threadId) {
   try {
     await app.rpc("thread/compact/start", { threadId });
     const terminal = await waitForNotification(app, "turn/completed", threadId, after);
-    if (terminal.turnStatus !== "completed" ||
-        !hasCompactionEvidence(app.notifications, threadId, after))
+    const observed = hasCompactionEvidence(app.notifications, threadId, after);
+    if (terminal.turnStatus !== "completed" || !observed)
       throw Object.assign(Error("native compaction did not complete"), {
         code: "native_compaction_incomplete",
+        terminalStatus: terminal.turnStatus,
+        compactionObserved: observed,
+        notificationTypes: app.notifications.slice(after).map((entry) =>
+          [entry.method, entry.itemType, entry.turnStatus].filter(Boolean).join(":")),
       });
   } finally {
     budget.activeAbort = null;
@@ -202,8 +206,12 @@ async function runTarget(targetId, profile, seed) {
     });
     threadId = thread.thread.id;
     stage = `${caseName}:seed-turn`;
-    await turn(app, threadId, model,
+    const seedTurn = await turn(app, threadId, model,
       `Remember the exact synthetic fact ${fact}. Reply only ACK1. Do not call tools.`);
+    if (seedTurn.status !== "completed")
+      throw Object.assign(Error("seed turn did not complete"), {
+        code: "seed_turn_incomplete",
+      });
     await compact(app, threadId);
     stage = `${caseName}:tool-turn`;
     toolTurn = await turn(app, threadId, model,
@@ -393,6 +401,22 @@ try {
     type: error?.type ?? error?.code ?? error?.name ?? "acceptance_error",
     stage,
     message: safeMessage,
+    terminalStatus: error?.terminalStatus ?? null,
+    compactionObserved: error?.compactionObserved ?? null,
+    notificationTypes: error?.notificationTypes?.slice(-20) ?? [],
+    gatewayEvents: gateways.flatMap((entry) => entry.logs)
+      .filter((entry) => /compaction|request_error|ws_error|provider_error/.test(entry.event))
+      .slice(-12).map((entry) => ({
+        event: entry.event,
+        type: entry.type ?? null,
+        status: entry.status ?? null,
+        mode: entry.mode ?? null,
+      })),
+    outboundStatuses: gateways.flatMap((entry) => entry.outbound)
+      .slice(-8).map((entry) => ({
+        status: entry.status ?? null,
+        responseComplete: entry.responseComplete ?? null,
+      })),
   };
 } finally {
   await Promise.allSettled(gateways.map((entry) => entry.close()));

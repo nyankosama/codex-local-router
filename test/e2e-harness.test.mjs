@@ -261,7 +261,14 @@ test("A10 child environment strips credentials and forces isolated roots", () =>
     https_proxy: "http://127.0.0.1:65535",
     NO_PROXY: "fixture.invalid",
     SAFE_FIXTURE_VALUE: "kept",
+    TERM_PROGRAM: "pi-agent-board",
+    TERM_PROGRAM_VERSION: "1.0",
+    LC_TERMINAL: "fixture-terminal",
+    PI_SESSION_ID: "fixture-session",
+    CODEX_INTERNAL_ORIGINATOR_OVERRIDE: "fixture-originator",
   });
+  for (const name of ["TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LC_TERMINAL", "PI_SESSION_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE"])
+    assert.equal(name in env, false, name);
   assert.equal(env.HOME, "/tmp/router-isolated");
   assert.equal(env.CODEX_HOME, "/tmp/router-isolated");
   assert.equal(env.SAFE_FIXTURE_VALUE, "kept");

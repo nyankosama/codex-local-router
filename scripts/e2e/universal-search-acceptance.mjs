@@ -22,6 +22,7 @@ import { FocusedAcceptanceBudget } from "./lib/focused-budget.mjs";
 const argv = process.argv.slice(2);
 const exec = promisify(execFile);
 const flag = (name) => argv.includes(`--${name}`);
+const nonFeeiOnly = flag("non-feei-only");
 const value = (name) => {
   const index = argv.indexOf(`--${name}`);
   return index < 0 ? undefined : argv[index + 1];
@@ -30,7 +31,7 @@ if (!flag("run")) {
   console.error("Universal search acceptance makes real GLM, ai.feei, OpenAI and Tavily requests. Re-run with --run after reviewing docs/public/acceptance.md.");
   process.exit(2);
 }
-if (!process.env.TAVILY_API_KEY)
+if (!nonFeeiOnly && !process.env.TAVILY_API_KEY)
   throw Object.assign(Error("TAVILY_API_KEY is required"), { code: "tavily_credential_missing" });
 
 const projectRoot = resolve(import.meta.dirname, "..", "..");
@@ -95,20 +96,23 @@ function mutate(config) {
   const source = liveSource;
   config.providers = {
     "bigmodel-coding": structuredClone(source.providers["bigmodel-coding"]),
-    feei: structuredClone(source.providers.feei),
   };
   config.targets = {
     "glm-flash": normalizeTarget(source.targets["glm-flash"], { bridge: true }),
-    "feei-sol": normalizeTarget(source.targets["feei-sol"], { bridge: true }),
   };
+  if (!nonFeeiOnly) {
+    config.providers.feei = structuredClone(source.providers.feei);
+    config.targets["feei-sol"] = normalizeTarget(source.targets["feei-sol"], { bridge: true });
+  }
   config.defaultTarget = "glm-flash";
   config.rules = [];
   config.subscription.enabled = true;
   config.subscription.catalogPath = sourceCatalog;
   config.subscription.customModels = {
     [config.targets["glm-flash"].app.modelId]: "glm-flash",
-    [config.targets["feei-sol"].app.modelId]: "feei-sol",
   };
+  if (!nonFeeiOnly)
+    config.subscription.customModels[config.targets["feei-sol"].app.modelId] = "feei-sol";
 }
 
 function appExtra({ tavily = false } = {}) {
@@ -345,28 +349,31 @@ try {
   implementation = await verifyAcceptanceRevision(projectRoot, process.env.ACCEPTANCE_COMMIT);
   await mkdir(workspace, { recursive: true, mode: 0o700 });
   await mkdir(registryHome, { recursive: true, mode: 0o700 });
-  const tavilyPrefix = join(root, "tavily-mcp");
-  await exec("npm", [
-    "install", "--prefix", tavilyPrefix, "--ignore-scripts", "--no-audit", "--no-fund",
-    "tavily-mcp@0.2.21",
-  ], { timeout: 120000, maxBuffer: 1024 * 1024 });
-  tavilyCommand = join(tavilyPrefix, "node_modules", ".bin", "tavily-mcp");
-  const tavilyTools = await exec(tavilyCommand, ["--list-tools"], {
-    env: { ...process.env, TAVILY_API_KEY: process.env.TAVILY_API_KEY },
-    timeout: 20000,
-  });
-  if (!tavilyTools.stdout.includes("tavily_search"))
-    throw Object.assign(Error("Tavily MCP preflight did not expose tavily_search"), {
-      code: "tavily_mcp_preflight_failed",
+  if (!nonFeeiOnly) {
+    const tavilyPrefix = join(root, "tavily-mcp");
+    await exec("npm", [
+      "install", "--prefix", tavilyPrefix, "--ignore-scripts", "--no-audit", "--no-fund",
+      "tavily-mcp@0.2.21",
+    ], { timeout: 120000, maxBuffer: 1024 * 1024 });
+    tavilyCommand = join(tavilyPrefix, "node_modules", ".bin", "tavily-mcp");
+    const tavilyTools = await exec(tavilyCommand, ["--list-tools"], {
+      env: { ...process.env, TAVILY_API_KEY: process.env.TAVILY_API_KEY },
+      timeout: 20000,
     });
-  await writeFile(join(registryHome, "config.toml"), [
-    "[mcp_servers.tavily]",
-    `command = ${JSON.stringify(tavilyCommand)}`,
-    "",
-  ].join("\n"), { mode: 0o600 });
+    if (!tavilyTools.stdout.includes("tavily_search"))
+      throw Object.assign(Error("Tavily MCP preflight did not expose tavily_search"), {
+        code: "tavily_mcp_preflight_failed",
+      });
+    await writeFile(join(registryHome, "config.toml"), [
+      "[mcp_servers.tavily]",
+      `command = ${JSON.stringify(tavilyCommand)}`,
+      "",
+    ].join("\n"), { mode: 0o600 });
+  }
   liveSource = JSON.parse(await readFile(sourceConfig, "utf8"));
-  if (!liveSource.providers?.["bigmodel-coding"] || !liveSource.providers?.feei ||
-      !liveSource.targets?.["glm-flash"] || !liveSource.targets?.["feei-sol"])
+  if (!liveSource.providers?.["bigmodel-coding"] ||
+      !liveSource.targets?.["glm-flash"] ||
+      (!nonFeeiOnly && (!liveSource.providers?.feei || !liveSource.targets?.["feei-sol"])))
     throw Object.assign(Error("required source providers or targets are missing"), { code: "source_configuration_incomplete" });
   const configPath = join(root, "gateway.json");
   const base = JSON.parse(await readFile(join(projectRoot, "config", "gateway.example.json"), "utf8"));
@@ -395,25 +402,27 @@ try {
     reasoningEffort: "max",
   });
   requirePassed();
-  await runCliCase({
-    name: "feei-sol-cli-subscription-bridge",
-    model: gateway.config.targets["feei-sol"].app.modelId,
-    host: new URL(gateway.config.providers.feei.baseUrl).host,
-    kind: "bridge",
-    webSearch: null,
-    marker: "FEEI_SUBSCRIPTION_SEARCH_OK",
-  });
-  requirePassed();
-  await runAppCase({
-    name: "feei-sol-app-tavily",
-    model: gateway.config.targets["feei-sol"].app.modelId,
-    host: new URL(gateway.config.providers.feei.baseUrl).host,
-    kind: "mcp",
-    tavily: true,
-    webSearch: "disabled",
-    marker: "FEEI_TAVILY_OK",
-  });
-  requirePassed();
+  if (!nonFeeiOnly) {
+    await runCliCase({
+      name: "feei-sol-cli-subscription-bridge",
+      model: gateway.config.targets["feei-sol"].app.modelId,
+      host: new URL(gateway.config.providers.feei.baseUrl).host,
+      kind: "bridge",
+      webSearch: null,
+      marker: "FEEI_SUBSCRIPTION_SEARCH_OK",
+    });
+    requirePassed();
+    await runAppCase({
+      name: "feei-sol-app-tavily",
+      model: gateway.config.targets["feei-sol"].app.modelId,
+      host: new URL(gateway.config.providers.feei.baseUrl).host,
+      kind: "mcp",
+      tavily: true,
+      webSearch: "disabled",
+      marker: "FEEI_TAVILY_OK",
+    });
+    requirePassed();
+  }
 } catch (error) {
   harnessError = {
     type: error?.type ?? error?.code ?? error?.name ?? "acceptance_error",
@@ -428,9 +437,12 @@ try {
 const observedBudget = budget.snapshot();
 const externalMcpSearches = cases.reduce((count, item) => count + item.counts.clientMcpCalls, 0);
 const summary = {
-  verdict: !harnessError && cases.length === 3 && cases.every((item) => item.passed)
+  verdict: !harnessError && cases.length === (nonFeeiOnly ? 1 : 3) &&
+    cases.every((item) => item.passed)
     ? "PASS"
     : "FAIL",
+  mode: nonFeeiOnly ? "non-feei-search" : "full-search",
+  scope: nonFeeiOnly ? { excludedTargets: ["feei-sol"], defaultReleaseGateSatisfied: false } : null,
   implementation,
   driver: core ? { source: core.source, version: core.version, sha256: core.sha256 } : null,
   budget: {

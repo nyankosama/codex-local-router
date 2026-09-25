@@ -1237,6 +1237,78 @@ test("cross-provider pre-turn compaction migrates before target-native compactio
     event.fixed_tokens >= event.input_budget));
 });
 
+test("third-party native compaction keeps a source view for later summary migration", async () => {
+  const next = config();
+  const sourceModel = "source-native-model";
+  const targetModel = "target-summary-model";
+  next.providers.source = { baseUrl: "http://127.0.0.1:9001" };
+  next.providers.target = { baseUrl: "http://127.0.0.1:9002" };
+  next.targets.source = {
+    ...structuredClone(next.targets.go),
+    id: "source",
+    provider: "source",
+    model: sourceModel,
+    compression: {
+      mode: "native",
+      compatibility: { accountScope: "same", targets: ["source"] },
+      nativeMigrationSummary: true,
+    },
+  };
+  next.targets.target = {
+    ...structuredClone(next.targets.go),
+    id: "target",
+    provider: "target",
+    model: targetModel,
+    contextWindow: 4000,
+    maxContextWindow: 4000,
+    outputReserveTokens: 100,
+    compression: { mode: "summary", nativeMigrationSummary: true },
+  };
+  next.subscription.customModels = {
+    [sourceModel]: "source",
+    [targetModel]: "target",
+  };
+  const native = {
+    type: "compaction",
+    encrypted_content: "third-party-native-source-view",
+  };
+  const seen = [];
+  const engine = new Engine(next, {
+    send: async (_, request) => {
+      seen.push(request.body);
+      if (request.body.input.some((item) => item.type === "compaction_trigger"))
+        return json(result([native]));
+      if (request.body.instructions?.startsWith("Create one factual"))
+        return json(result([msg("assistant", "MIGRATED_NATIVE_WINDOW")]));
+      return json(result([msg("assistant", "continued")]));
+    },
+  });
+  const compacted = await call(
+    engine,
+    sourceModel,
+    "source-compact",
+    [
+      msg("user", "SOURCE_FACT " + "x".repeat(20_000)),
+      { type: "compaction_trigger" },
+    ],
+    "compaction",
+  );
+  await call(engine, targetModel, "target-turn", [
+    ...compacted.output,
+    msg("user", "continue"),
+  ]);
+
+  const summary = seen.find((body) =>
+    body.instructions?.startsWith("Create one factual"));
+  assert.equal(summary.model, sourceModel);
+  assert.deepEqual(summary.input[0], native);
+  assert.match(JSON.stringify(seen.at(-1).input), /MIGRATED_NATIVE_WINDOW/);
+  assert.doesNotMatch(
+    JSON.stringify(seen.at(-1).input),
+    /third-party-native-source-view/,
+  );
+});
+
 test("cross-provider turn summarizes completed tail but preserves the current user request", async () => {
   const next = config();
   next.targets.go.contextWindow = 4000;
@@ -2326,6 +2398,91 @@ test("large native compaction calls the official backend once, resumes after res
   assert.equal(seen.length, 4);
   await assert.rejects(call(restarted, DS, "switch", again.output), /no portable source/);
   await assert.rejects(call(restarted, GPT, "virtual", [{type: "compaction", encrypted_content: "gateway-checkpoint-v1:missing"}]), /Compacted history/);
+});
+
+test("native compaction canonicalizes only cross-target gateway-projected history", async () => {
+  const seen = [];
+  const engine = new Engine(config(), {
+    send: async (_, options) => {
+      seen.push(options.body);
+      return json(result([opaque]));
+    },
+  });
+  const priorCtx = identity("subscription", headers, {
+    input: [],
+    client_metadata: metadata("projected-native-prior"),
+  });
+  engine.state.set(
+    "last-target:" + priorCtx.owner,
+    { ...config().targets.go },
+    priorCtx,
+  );
+  const projectedCall = {
+    type: "function_call",
+    id: "item_gateway_projected_call",
+    call_id: "call_projected",
+    name: "exec_command",
+    arguments: "{}",
+  };
+  const projectedOutput = {
+    type: "function_call_output",
+    id: "item_gateway_projected_output",
+    call_id: projectedCall.call_id,
+    output: "done",
+  };
+  const compacted = await call(
+    engine,
+    GPT,
+    "projected-native-compact",
+    [
+      { ...msg("assistant", "projected"), id: "item_gateway_projected_message" },
+      projectedCall,
+      projectedOutput,
+      { type: "compaction_trigger" },
+    ],
+    "compaction",
+  );
+
+  assert.equal(seen.length, 1);
+  assert.doesNotMatch(JSON.stringify(seen[0].input), /item_gateway_/);
+  assert.ok(seen[0].input.some((item) => item.type === "compaction_trigger"));
+  assert.equal(
+    seen[0].input.find((item) => item.type === "function_call")?.call_id,
+    projectedCall.call_id,
+  );
+  const ctx = identity("subscription", headers, {
+    input: compacted.output,
+    client_metadata: metadata("projected-native-resume"),
+  });
+  const checkpoint = checkpointFor(engine.state, ctx, compacted.output[0]);
+  assert.doesNotMatch(JSON.stringify(checkpoint.checkpoint.original), /item_gateway_/);
+
+  const sameTargetConfig = config();
+  sameTargetConfig.targets.go.compression = { mode: "native" };
+  const sameTargetSeen = [];
+  const sameTargetEngine = new Engine(sameTargetConfig, {
+    send: async (_, options) => {
+      sameTargetSeen.push(options.body);
+      return json(result([opaque]));
+    },
+  });
+  const sameTargetCtx = identity("subscription", headers, {
+    input: [],
+    client_metadata: metadata("projected-native-same-target"),
+  });
+  sameTargetEngine.state.set(
+    "last-target:" + sameTargetCtx.owner,
+    { ...sameTargetConfig.targets.go },
+    sameTargetCtx,
+  );
+  await call(
+    sameTargetEngine,
+    DS,
+    "projected-native-same-target",
+    [projectedCall, projectedOutput, { type: "compaction_trigger" }],
+    "compaction",
+  );
+  assert.match(JSON.stringify(sameTargetSeen[0].input), /item_gateway_/);
 });
 
 test("custom native compaction owns oversized context and metadata-only continuation", async () => {

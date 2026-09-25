@@ -11,6 +11,7 @@
 - [E2E 规范](./e2e/goal-spec.md)：E2E 验收执行规范、判据与 patch loop 契约。
 - [E2E 绊线](./e2e/thresholds.json)：异常绊线唯一来源（改动属 B 类，须批准）。
 - [E2E 验收记录](./e2e/acceptance.md)：本轮结论、归因、patch 记录与人工签核。
+- [三类渠道切换与压缩 E2E](./e2e/cross-channel-compaction.md)：3×3 切换矩阵与压缩准出的 Spec、收据与复现方式。
 - [验收工具链（公开）](./public/acceptance.md)：随包发布的 `npm run e2e*` 使用说明。
 
 ## 解释优先级
