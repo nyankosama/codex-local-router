@@ -68,6 +68,6 @@
   "dependencies": {
     "proxy-agent": "8.0.2",
     "proxy-from-env": "2.1.0",
-    "ws": "8.21.3"
+    "ws": "8.22.0"
   }
 }
